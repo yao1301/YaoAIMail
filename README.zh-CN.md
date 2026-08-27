@@ -1,146 +1,137 @@
 <p align="center">
-  <img src="src/assets/app-icon.png" alt="Pebble logo" width="120">
+  <img src="public/yao-logo.png" alt="YaoAIMail logo" width="120">
 </p>
 
-<h1 align="center">Pebble</h1>
+<h1 align="center">YaoAIMail（老妖 AI 外贸邮）</h1>
 
 <p align="center">
-  一个本地优先的桌面邮件客户端，让收件箱更安静、更清晰，也更可控。
+  一个装着懂外贸 AI 的 Windows 邮件客户端：收发邮件、AI 写信、客户管理、开发客户、资信调研，一个软件干完。
 </p>
 
 <p align="center">
   <a href="README.md">English</a>
   ·
-  <a href="https://github.com/QingJ01/Pebble/releases">发布版本</a>
+  <a href="https://github.com/yao1301/YaoAIMail/releases">发布版本</a>
   ·
   <a href="LICENSE">许可证</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/QingJ01/Pebble/releases"><img src="https://img.shields.io/github/v/release/QingJ01/Pebble?style=flat-square&color=d4714e" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square" alt="License"></a>
-  <a href="https://github.com/QingJ01/Pebble/actions"><img src="https://img.shields.io/github/actions/workflow/status/QingJ01/Pebble/ci.yml?style=flat-square&label=build" alt="Build"></a>
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform">
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey?style=flat-square" alt="Platform">
+  <img src="https://img.shields.io/badge/models-OpenAI%20%7C%20DeepSeek%20%7C%20Gemini%20%7C%20custom-orange?style=flat-square" alt="Models">
 </p>
 
-## 项目简介
+---
 
-Pebble 是一个使用 Rust、Tauri 和 React 构建的桌面邮件客户端。它默认把邮件数据、搜索索引、附件、规则和应用设置保存在本机。
+## 它解决什么问题
 
-Pebble 的设计目标很直接：
+外贸业务员每天要回不同国家客户的邮件。过去的工作流是这样：
 
-- 邮箱应该清晰、快速、安静。
-- 邮件工作流应该本地优先，而不是被云端仪表盘绑住。
-- 隐私控制应该明确可见，并且可以按单封邮件临时放宽。
-- 搜索、稍后提醒、规则和看板应该协同工作，而不是散落在不同工具里。
+> Foxmail/Outlook 看客户邮件 → 打开网页 AI → 复制过去 → 输入要求 → 生成 → 复制回来 → 手工检查 → 发送
 
-Pebble 目前支持 Gmail、IMAP、POP3，以及实验性的 Outlook 账户。
+这条链有四个绕不过去的坑：
 
-## 主要特性
+1. **网页 AI 不懂这个客户** —— 不知道你们聊到哪一步、上封确认过什么、起订量多少、定金怎么谈。
+2. **写出来不像你** —— 标准商务英语，客户聊了大半年一眼看出换人了。
+3. **它敢编** —— 价格、交期、承诺都敢替你编，外贸这行编错一个价格赔一单。
+4. **来回切换太累** —— 一天几十封邮件，全是复制粘贴的体力活。
 
-### 本地优先与隐私
+**YaoAIMail 让 AI 直接住在邮箱里**：打开客户邮件的那一刻，它就知道这是谁、聊到哪、该用什么语气回。
 
-- 使用本地 SQLite 数据库存储邮件、文件夹、标签、规则和设置。
-- 使用本地 Tantivy 全文索引提供快速搜索。
-- 附件保存在应用数据目录下。
-- OAuth token 和账号凭据会使用设备本地密钥加密。
-- 不包含遥测。
-- 网络请求只发生在你启用的功能中：邮件同步、翻译、可选的 WebDAV 设置备份。
+---
 
-### 邮件处理
+## 核心功能
 
-- 多账户聚合收件箱。
-- 支持 Gmail、IMAP、POP3 和实验性的 Outlook。
-- 支持线程视图和普通邮件列表视图。
-- 支持归档、删除、星标、标记已读、批量操作和恢复。
-- 支持邮件稍后提醒。
-- 支持全文搜索和高级过滤。
-- 支持规则引擎，自动整理邮件。
-- 邮件 CSS 渲染，支持内嵌样式。
-- 可选允许无效 TLS 证书，兼容自建邮件服务器。
+### 1. AI 写邮件与回复 —— 读全上下文，不是复制粘贴
+- AI 读的是**当前邮件、整个线程和这个客户的往来记录**，不是手动复制的一小段。
+- 多轮对话：生成第一版后继续提要求，改到满意为止。
+- 多语言自动判断，新联系人跟随你的选择语言，不擅自编造。
+- **直写草稿**：结果直接进草稿编辑区，支持撤销对比；**AI 碰不到发送按钮**，所有内容先停在草稿箱。
+- 指令框可拖入邮件、附件、文件、图片和资料中心的资料。
 
-### 效率工具
+### 2. 写作风格系统 —— 让 AI 写得像你本人
+- **从你的已发送邮件学习**真实风格：句子长短、段落节奏、称呼、开场、结尾、直接程度。
+- **自动脱敏**：学习前清掉引用、签名、联系方式、价格、订单号，不把旧客户旧价格带出来。
+- 给欧美客户一套正式的、给老客户一套随意的，按账号分配。
+- 硬边界：AI 只能用风格改表达方式，不能从历史里带出旧承诺。
 
-- 看板视图，包含 Todo、Waiting、Done 三列。
-- 命令面板和键盘优先导航。
-- 内置翻译能力，支持双语阅读和自定义快捷键（`T` 翻译选中文字，`Ctrl+Shift+T` 切换双语对照）。
-- 深色和浅色主题，支持壁纸背景。
-- 内置英文和中文界面。
-- 可选的 WebDAV 备份，用于同步设置、规则、看板卡片和看板备注。
-- 支持自动定时 WebDAV 备份，间隔可配置。
+### 3. 首页 AI 工作台 —— 对着自己的邮箱提问
+- 一个 AI 指令框为核心：总结邮件、查资料、回答问题、写邮件、开发客户、资信调研，自动识别意图。
+- 邮件总结综合读收件箱、已发送和其他文件夹，不是只看收件箱。
+- 对话自动生成摘要标题并保存历史，可搜索回看；引用可点击直达原文。
 
-### 平台集成
+### 4. 产品与资料中心 —— 把报价参数喂给 AI
+- 导入 PDF、Word、Excel、CSV、TXT、Markdown、JSON、HTML、XML；PDF 保留页码、Excel 保留工作表定位。
+- 本地混合检索 + 自然语言问答，直接问「X 产品的付款方式是什么」。
+- **有依据才回答**：引用资料名称和位置；资料库里没有就明说没找到，不猜价格不承诺。
 
-- macOS 原生红绿灯窗口控制按钮。
-- Windows 端可注册为默认邮件客户端（设置 > 通用）。
-- 托盘模式：窗口隐藏时仍会保持邮件同步运行。
-- 支持启动时隐藏到系统托盘。
-- 支持 `mailto:` 协议，可从外部应用唤起写信。
+### 5. 地址本与客户管理 —— 客户资料归到一处
+- 联系人角色标签（客户、工厂、供应商、服务商等）、公司级客户画像、客户分层。
+- 邮件往来 + 人工跟进记录统一显示；电话、WhatsApp、微信、展会、样品都能记。
+- AI 下一步建议：「这周该跟进谁」。
 
-## 截图
+### 6. AI 开发客户 —— 找客户、找邮箱、写开发信
+- 用自然语言描述产品、市场、客户类型，模型驱动**多渠道公开网络研究**：官网、公司页、当地语言、目录、协会、展会、地图。
+- 结果严格区分**已验证 / 待验证 / 格式推测 / 公共邮箱 / 未找到**；域名对不上公司身份的直接丢弃。
+- 开发信按「短（50–100 词）、三四个核心句、只给一个低门槛钩子」的写法生成，不群发。
+- 搜索引用的资料会**继承到开发信**，不会跑偏；支持预览、AI 调整、多邮箱队列。
 
-<table>
-  <tr>
-    <td><img src="site/screenshots/inbox.png" alt="收件箱"><br><b>收件箱</b></td>
-    <td><img src="site/screenshots/kanban.png" alt="看板"><br><b>看板</b></td>
-  </tr>
-  <tr>
-    <td><img src="site/screenshots/dark.png" alt="深色模式"><br><b>深色模式</b></td>
-    <td><img src="site/screenshots/settings.png" alt="设置"><br><b>设置</b></td>
-  </tr>
-</table>
+### 7. 资信调研 —— 买家的底，先摸一遍
+- 输入公司名、域名或联系人即可发起，综合官网、公开企业信息、行业、新闻、展会等来源。
+- 输出概况、主营、客户匹配、规模线索、风险、机会、联系人、建议动作。
+- **诚实标注**：每条标来源和时效；查不到、核不实的明确标「待核实」，不装作知道。
 
-## 技术栈
+### 8. 发送防呆 —— 防止把成本单发给客户
+- 客户/供应商/服务商五层自动分类，冲突组合发送前拦截：「仍然发送」才放行。
+- 零延迟，发信路径不调 AI，不额外等待。
+- 服务商标识别：给货代发订舱邮件不会误报。
 
-| 层级 | 技术 |
-| --- | --- |
-| 桌面框架 | Tauri 2 |
-| 后端 | Rust |
-| 前端 | React 19、TypeScript |
-| 状态管理 | Zustand、TanStack Query |
-| 数据库 | SQLite / rusqlite |
-| 搜索 | Tantivy |
-| 样式 | Tailwind CSS 和应用 CSS |
-| 国际化 | i18next |
+### 9. 外贸工具箱 + 文字翻译
+- HS 编码、税费估算、物流轨迹、汇率（人民币基准）、多时区、装柜计算。
+- 选中文字即翻译，浮窗显示，默认中文，可调目标语言。
 
-## 开始使用
+---
+
+## 特色
+
+- **AI 懂上下文**：看到的是线程 + 客户档案 + 往来记录 + 资料库，不是复制粘贴的一段字。
+- **写得像本人**：从已发送邮件学风格，学之前自动脱敏。
+- **AI 只碰草稿**：发送权永远在你手里，不替你猜价格和承诺。
+- **查不到就说查不到**：每条结果标来源，核不实的标「待核实」，不编造。
+- **数据在自己电脑上**：本地优先，没有云端账号体系，AI 只收当前任务需要的内容。
+- **外贸全流程闭环**：从收件、理解、写作、跟进，到开发客户、资信调研、客户沉淀，原生串起来。
+- **发送防呆**：把发错对象的事故防在发送前，通用邮件客户端和 AI 工具都没有。
+- **中文界面 + 模型自由 + 国内可用**：可选 DeepSeek / OpenAI / Gemini 或任意兼容接口，支持 SOCKS5 代理，钥匙在自己手里。
+
+---
+
+## 数据与隐私
+
+- 邮件、附件、客户记录、资料库、风格档案和搜索索引优先保存在本地。
+- AI 写作默认只发送当前邮件上下文、用户指令、主动选择的资料和少量脱敏风格样本；不会因为用一次 AI 就把整个邮箱传上去。
+- 生成邮件始终先进草稿，用户确认后才发送。
+- 分享包本身不带任何账号信息、邮箱数据、数据库、日志和个人路径。
+
+---
+
+## 快速开始
 
 ### 安装
+Windows 10/11 桌面软件，提供安装版和绿色版。从 [发布版本](https://github.com/yao1301/YaoAIMail/releases) 下载。
 
-你可以从 [发布版本](https://github.com/QingJ01/Pebble/releases) 页面下载预构建的桌面安装包。
+### 使用顺序（三步就能用起来）
+1. **加邮箱**：支持 IMAP / POP3，Gmail、Outlook 有对应的登录或授权方式。
+2. **配模型**：内置 OpenAI、DeepSeek、Gemini 预设，选好服务商只填一个 API Key；也支持自定义接口和 SOCKS5 代理。
+3. **试 AI 写作**：导入产品资料，在真实邮件上试用。
 
-Arch Linux 用户可以通过 AUR 安装 `pebble-bin`：
+> AI 功能需要你自己配置模型 API Key（费用按用量付给模型服务商）；基础邮件收发可以零配置使用。
 
-```bash
-yay -S pebble-bin
-# 或者
-paru -S pebble-bin
-```
-
-### 环境要求
-
-- Rust stable
-- Node.js 18 或更新版本
-- pnpm 8 或更新版本
-- 当前平台所需的 Tauri 系统依赖
-
-### 配置文件存储
-
-默认情况下，Pebble 会把数据库、搜索索引、附件、日志、导入的背景图以及本地界面偏好存放在系统应用数据目录下。
-
-你可以在 Pebble 启动前选择自定义或便携配置目录：
-
-- 设置 `PEBBLE_PROFILE_DIR` 为一个绝对路径。
-- 在 `pebble.exe` 旁边放置 `pebble-profile.txt`；第一行可以是绝对路径，也可以是相对于可执行文件目录的路径。
-- 在 `pebble.exe` 旁边创建 `pebble-profile` 目录，让 Pebble 数据保存在应用旁边。
-
-选中的目录会在下次启动时生效。
-
-### 开发环境
+### 从源码开发
 
 ```bash
-git clone https://github.com/QingJ01/Pebble.git
-cd Pebble
+git clone https://github.com/yao1301/YaoAIMail.git
+cd YaoAIMail
 
 pnpm install
 cp .env.example .env
@@ -148,131 +139,88 @@ cp .env.example .env
 pnpm dev
 ```
 
-`pnpm dev` 会启动 Vite 前端开发服务，并运行 Tauri 桌面应用。
-
-### 构建
+前端检查与后端检查：
 
 ```bash
-pnpm build
-pnpm build:windows
-pnpm build:macos
-pnpm build:linux
+npx tsc --noEmit   # 前端类型检查
+cargo check        # 后端编译检查
 ```
 
-桌面端构建产物会输出到 `target/release/` 和 `target/release/bundle/`。
-macOS 构建产物默认不签名，除非你自行配置签名流程。
-将未签名的 macOS 构建复制到 `/Applications` 后，请先执行下面的命令再打开应用：
+> 注意：本项目在 Windows 上使用 GNU toolchain + MinGW 构建，静态链接配置见 `.cargo/config.toml`。
 
-```bash
-sudo xattr -cr /Applications/Pebble.app
-```
+---
 
-## OAuth 配置
+## 技术栈
 
-Pebble 可以通过 OAuth 连接 Gmail 和 Outlook。IMAP 账户使用应用内配置的 IMAP/SMTP 凭据。
-
-复制 `.env.example` 为 `.env`，然后填写你需要的提供商配置。
-
-| 变量 | 说明 |
+| 层 | 技术 |
 | --- | --- |
-| `GOOGLE_CLIENT_ID` | Google OAuth 客户端 ID，推荐使用 Desktop app 类型。 |
-| `GOOGLE_CLIENT_SECRET` | 可选。若 Google 登录时报 `client_secret is missing`，再填写该项。 |
-| `MICROSOFT_CLIENT_ID` | Microsoft public/native app 客户端 ID。 |
-| `MICROSOFT_CLIENT_SECRET` | 可选。public/native Microsoft 应用通常应留空。 |
+| 桌面壳 | Tauri 2 |
+| 后端 | Rust |
+| 前端 | React 19, TypeScript |
+| 状态 | Zustand, TanStack Query |
+| 数据库 | SQLite (rusqlite) |
+| 搜索 | Tantivy |
+| 本地化 | i18next（中英） |
 
-## 常用命令
-
-| 命令 | 用途 |
-| --- | --- |
-| `pnpm dev` | 以开发模式运行 Tauri 桌面应用。 |
-| `pnpm dev:frontend` | 只启动 Vite 前端开发服务。 |
-| `pnpm test` | 使用 Vitest 运行前端测试。 |
-| `pnpm build:frontend` | 类型检查并构建前端。 |
-| `pnpm build` | 为当前平台构建桌面应用。 |
-| `pnpm build:windows` | 构建 Windows NSIS 安装包。 |
-| `pnpm build:macos` | 构建未签名的 macOS `.app` 和 `.dmg` 包。 |
-| `pnpm build:linux` | 构建 Linux `.AppImage`、`.deb` 和 `.rpm` 包。 |
-| `cargo test -p pebble-mail` | 运行邮件模块测试。 |
-| `cargo check` | 检查 Rust 工作区。 |
+---
 
 ## 项目结构
 
 ```text
-Pebble/
+YaoAIMail/
 |-- src/                    React 前端
 |   |-- components/         通用 UI 组件
-|   |-- features/           收件箱、写信、搜索、看板、设置等功能
-|   |-- hooks/              React hooks 和查询工具
-|   |-- lib/                IPC API、i18n、通用工具
-|   `-- stores/             Zustand 状态管理
-|-- src-tauri/              Tauri 应用和 IPC 命令
-|-- crates/                 Rust 工作区
-|   |-- pebble-core/        共享类型和错误定义
+|   |-- features/           收件箱、写信、搜索、客户画像、开发客户、资信调研、设置
+|   |-- hooks/              React hooks 和查询助手
+|   |-- lib/                IPC API、i18n、工具
+|   `-- stores/             Zustand store
+|-- src-tauri/              Tauri 应用与 IPC 命令
+|-- crates/                 Rust 工作区 crates
+|   |-- pebble-core/        共享类型与错误
 |   |-- pebble-store/       SQLite 持久化
-|   |-- pebble-mail/        邮件提供商和同步逻辑
+|   |-- pebble-mail/        邮件提供方与同步
 |   |-- pebble-search/      Tantivy 搜索索引
 |   |-- pebble-crypto/      凭据加密
-|   |-- pebble-oauth/       OAuth 2.0 和 PKCE
+|   |-- pebble-oauth/       OAuth 2.0 与 PKCE
 |   |-- pebble-rules/       规则引擎
-|   |-- pebble-translate/   翻译提供商
-|   `-- pebble-privacy/     HTML 清理和追踪保护
+|   |-- pebble-translate/   翻译提供方
+|   `-- pebble-privacy/     HTML 清洗与追踪控制
 |-- tests/                  前端测试
-`-- site/                   静态项目站点和截图
+`-- public/                 logo 等静态资源
 ```
 
-## 快捷键
+---
 
-| 快捷键 | 操作 |
-| --- | --- |
-| `J` / `K` | 在邮件列表中上下移动 |
-| `Enter` | 打开选中的邮件 |
-| `E` | 归档 |
-| `S` | 切换星标 |
-| `R` | 回复 |
-| `A` | 回复全部 |
-| `F` | 转发 |
-| `C` | 写新邮件 |
-| `/` | 聚焦搜索 |
-| `T` | 翻译选中文字 |
-| `Ctrl+Shift+T` | 切换双语对照 |
-| `Esc` | 关闭、取消或返回 |
+## 关于本 Fork
 
-快捷键可以在设置中查看和自定义。
+**YaoAIMail（老妖 AI 外贸邮）** 是基于开源邮件客户端 [QingJ01/Pebble](https://github.com/QingJ01/Pebble) 二次开发的增强版，专为 B2B 跨境外贸卖家打造。
 
-## Pebble Web
+在上游 Pebble（稳定的邮件客户端地基：多账户、IMAP/POP3、全文搜索、标签页、规则引擎、本地优先）之上，本 fork 增加了上文列出的完整外贸 AI 能力：AI 写作、风格学习、客户画像、开发客户、资信调研、发送防呆和外贸工具箱。
 
-想要自托管的网页版？**[Pebble Web](https://github.com/QingJ01/Pebble-Web)** 提供与桌面版相同的功能，通过 Docker 部署，任何浏览器即可访问。
+本项目及其所有修改均遵循 **AGPL-3.0** 协议发布，原作者的版权声明和许可证原文保持不变。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/QingJ01/Pebble-Web/main/docker-compose.yml -o docker-compose.yml && docker compose up -d
-```
+---
 
-Pebble Web 共享相同的 Rust 核心代码和 React 前端。部署到你自己的服务器，随时随地访问邮件。
+## 诚实边界
 
-## 当前状态
+- **AI 生成的内容必须人工检查**，尤其是价格、交期、订单号、付款条件和承诺。软件防的是流程错误，不替你做业务决定。
+- **发送防呆防不了所有错**：防不了「该发客户 A 却发给了客户 B」，也依赖联系人角色标得准。
+- **外贸工具箱是 AI 参谋，不是海关数据库**：HS 编码、税费、物流结果是参考性质，报关级别决策必须人工核实。
+- **资信调研不是信用报告**：组合公开来源做参考，不等同于法律、财务或信用担保。
+- **开发客户的邮箱有边界**：分已验证和推测，公开网页数据可能过期，LinkedIn 只用公开索引。
+- **系统要求**：Windows 10/11 最稳，依赖 WebView2；Windows 7 不保证；目前无 Mac 版。
+- **需要自己配模型**：有自己的 API Key 是使用 AI 功能的前提，费用按用量付给服务商。
 
-Pebble 正在持续开发中。它可以用于日常测试，但邮件客户端会处理敏感数据，不同邮件服务商的行为也存在差异。测试新版本时，请为重要邮件保留备份，并在服务商网页端核对关键操作。
+---
 
-## 参与贡献
+## License
 
-欢迎提交 issue 和 pull request。
+本项目基于 [AGPL-3.0](LICENSE) 协议发布。
 
-代码改动请尽量保持聚焦；涉及行为变化时，请补充相应测试。提交前建议运行相关检查：
-
-```bash
-pnpm test
-pnpm build:frontend
-cargo check
-```
-
-## 许可证
-
-Pebble 使用 [GNU Affero General Public License v3.0](LICENSE) 许可证。
+*Based on [QingJ01/Pebble](https://github.com/QingJ01/Pebble), licensed under AGPL-3.0. The original author's copyright notice is preserved unchanged.*
 
 ---
 
 <p align="center">
-  由 <a href="https://github.com/QingJ01">QingJ</a> 构建。
-  <br>
-  友情链接：<a href="https://linux.do">LINUX DO</a>
+  由 <a href="https://github.com/yao1301">yao1301</a>（老妖）维护 · 一个十几年 B2B 外贸从业者做给自己、也做给同行用的工具。
 </p>

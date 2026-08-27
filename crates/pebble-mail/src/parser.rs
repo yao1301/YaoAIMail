@@ -139,7 +139,11 @@ pub fn parse_raw_email(raw: &[u8]) -> Result<ParsedMessage> {
             let is_inline = part
                 .content_disposition()
                 .map(|d| d.ctype() == "inline")
-                .unwrap_or(false);
+                .unwrap_or(false)
+                // Many mail clients omit Content-Disposition on CID parts.
+                // Content-ID is the reliable signal that the MIME part is
+                // intended to be rendered inside the HTML body.
+                || content_id.is_some();
             let data = part.contents().to_vec();
             AttachmentData {
                 meta: AttachmentMeta {
@@ -154,7 +158,10 @@ pub fn parse_raw_email(raw: &[u8]) -> Result<ParsedMessage> {
         })
         .collect();
 
-    let has_attachments = !attachments.is_empty();
+    // has_attachments 只统计"真正的附件"（disposition: attachment）。
+    // 正文内嵌图（disposition: inline，被 <img> 引用）不算附件，
+    // 否则"正文带图"的邮件会错误显示回形针附件图标。
+    let has_attachments = attachments.iter().any(|a| !a.meta.is_inline);
 
     Ok(ParsedMessage {
         message_id_header,
@@ -226,6 +233,33 @@ mod tests {
         assert!(!parsed.body_text.is_empty());
         assert!(!parsed.body_html.is_empty());
         assert!(parsed.body_html.contains("HTML part") || parsed.body_text.contains("Plain text"));
+    }
+
+    #[test]
+    fn test_content_id_part_without_disposition_is_inline() {
+        let raw = b"From: Sender <sender@example.com>\r\n\
+                    To: Recipient <recv@example.com>\r\n\
+                    Subject: Inline logo\r\n\
+                    MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/related; boundary=related42\r\n\
+                    \r\n\
+                    --related42\r\n\
+                    Content-Type: text/html; charset=utf-8\r\n\
+                    \r\n\
+                    <p>Hello</p><img alt=\"Image\" src=\"cid:logo.png\">\r\n\
+                    --related42\r\n\
+                    Content-Type: image/png; name=\"logo.png\"\r\n\
+                    Content-ID: <logo.png>\r\n\
+                    Content-Transfer-Encoding: base64\r\n\
+                    \r\n\
+                    iVBORw0KGgo=\r\n\
+                    --related42--\r\n";
+
+        let parsed = parse_raw_email(raw).unwrap();
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].meta.content_id.as_deref(), Some("logo.png"));
+        assert!(parsed.attachments[0].meta.is_inline);
+        assert!(!parsed.has_attachments);
     }
 
     #[test]

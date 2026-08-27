@@ -1,7 +1,9 @@
 import { useState } from "react";
-import { Search, SlidersHorizontal, X } from "lucide-react";
+import { Search, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useUIStore } from "@/stores/ui.store";
+import SearchFilterDropdown from "./SearchFilterDropdown";
+import type { AdvancedSearchQuery } from "@/lib/api";
 
 interface Props {
   onSearch: (query: string) => void;
@@ -13,12 +15,18 @@ export default function SearchBar({ onSearch, onClear }: Props) {
   const [value, setValue] = useState("");
   const setActiveView = useUIStore((s) => s.setActiveView);
 
+  /** 跳转搜索页：query + 可选筛选条件一起带过去。 */
+  function navigateToSearch(query: string, filters: AdvancedSearchQuery = {}) {
+    useUIStore.getState().setSearchQuery(query);
+    useUIStore.getState().setPendingSearchFilters(filters);
+    setActiveView("search");
+  }
+
   function handleSubmit(e: React.SyntheticEvent<HTMLFormElement>) {
     e.preventDefault();
     if (value.trim()) {
       onSearch(value.trim());
-      useUIStore.getState().setSearchQuery(value.trim());
-      useUIStore.getState().setActiveView("search");
+      navigateToSearch(value.trim());
     }
   }
 
@@ -50,15 +58,11 @@ export default function SearchBar({ onSearch, onClear }: Props) {
           <X size={14} />
         </button>
       )}
-      <button
-        type="button"
-        onClick={() => setActiveView("search")}
-        title={t("search.advanced", "Advanced search")}
-        aria-label={t("search.advanced", "Advanced search")}
-        className="inbox-toolbar-button"
-      >
-        <SlidersHorizontal size={14} />
-      </button>
+      {/* 内联筛选下拉：范围切换 + 快捷条件，点一下立即搜索 */}
+      <SearchFilterDropdown
+        query={value}
+        onSearch={({ query, filters }) => navigateToSearch(query, filters)}
+      />
     </form>
   );
 }

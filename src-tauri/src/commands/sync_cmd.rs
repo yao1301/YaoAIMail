@@ -685,6 +685,21 @@ pub async fn trigger_sync(
     reason: String,
 ) -> std::result::Result<(), PebbleError> {
     let trigger = SyncTrigger::from_reason(&reason);
+    info!("Manual sync trigger requested for account {} (reason: {})", account_id, reason);
+
+    // Manual receive is an explicit recovery action. If the long-lived
+    // worker is stuck in an old IMAP connection or its trigger receiver has
+    // become unusable, merely enqueueing a trigger makes the UI look like it
+    // worked while no mail is fetched. Restart the worker for manual receive;
+    // the new worker performs the recent sync and then remains alive for
+    // normal polling/IDLE updates.
+    if trigger == SyncTrigger::Manual {
+        stop_sync_inner(&state, &account_id).await;
+        info!("Starting fresh worker for manual sync of account {}", account_id);
+        start_sync_inner(&app, &state, account_id, Some(3)).await?;
+        return Ok(());
+    }
+
     let should_start_one_shot = {
         let mut handles = state.sync_handles.lock().await;
         match handles.get(&account_id) {
@@ -701,6 +716,9 @@ pub async fn trigger_sync(
                     );
                     handles.remove(&account_id);
                 }
+                if !send_failed {
+                    info!("Sync trigger queued for account {}", account_id);
+                }
                 should_drop_trigger_handle(false, send_failed)
             }
             None => true,
@@ -708,6 +726,7 @@ pub async fn trigger_sync(
     };
 
     if should_start_one_shot {
+        info!("Starting/restarting one-shot sync worker for account {}", account_id);
         start_sync_inner(&app, &state, account_id, Some(0)).await?;
     }
     Ok(())

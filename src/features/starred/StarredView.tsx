@@ -7,12 +7,15 @@ import { useMailStore } from "@/stores/mail.store";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import MessageItem from "@/components/MessageItem";
 import MessageDetail from "@/components/MessageDetail";
+import { deleteMessage } from "@/lib/api";
+import { useToastStore } from "@/stores/toast.store";
 
 const EMPTY_REMOVED_IDS = new Set<string>();
 
 export default function StarredView() {
   const { t } = useTranslation();
   const activeAccountId = useMailStore((s) => s.activeAccountId);
+  const addToast = useToastStore((s) => s.addToast);
   const [stateAccountId, setStateAccountId] = useState(activeAccountId);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [removedIds, setRemovedIds] = useState<Set<string>>(() => new Set());
@@ -46,14 +49,30 @@ export default function StarredView() {
     measureElement: (el) => el.getBoundingClientRect().height,
     overscan: 5,
   });
+  const virtualItems = virtualizer.getVirtualItems();
+  const lastVisibleIndex = virtualItems.length > 0
+    ? virtualItems[virtualItems.length - 1].index
+    : -1;
 
   function handleOpen(messageId: string) {
     setSelectedId(messageId);
   }
 
-  const handleLoadMore = useCallback(() => {
-    if (hasNextPage && !isFetchingNextPage) fetchNextPage();
-  }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
+  useEffect(() => {
+    if (
+      hasNextPage
+      && !isFetchingNextPage
+      && lastVisibleIndex >= Math.max(0, visibleMessages.length - 5)
+    ) {
+      fetchNextPage();
+    }
+  }, [
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    lastVisibleIndex,
+    visibleMessages.length,
+  ]);
 
   const handleToggleStar = useCallback((messageId: string, newStarred: boolean) => {
     if (newStarred) return;
@@ -68,6 +87,23 @@ export default function StarredView() {
   }, [scopedSelectedId]);
 
   const totalCount = visibleMessages.length;
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Delete" || !scopedSelectedId) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, [contenteditable='true'], select")) return;
+      event.preventDefault();
+      const id = scopedSelectedId;
+      void deleteMessage(id).then(() => {
+        setRemovedIds((old) => new Set(old).add(id));
+        setSelectedId(null);
+        addToast({ message: "邮件已移到废纸篓", type: "success" });
+      }).catch((error) => addToast({ message: `删除失败：${extractErrorMessage(error)}`, type: "error" }));
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [addToast, scopedSelectedId]);
 
   if (error && messages.length === 0) {
     return (
@@ -148,7 +184,7 @@ export default function StarredView() {
 
         <div ref={parentRef} className="scroll-region starred-list-scroll" style={{ flex: 1, overflow: "auto" }}>
           <div style={{ height: `${virtualizer.getTotalSize()}px`, width: "100%", position: "relative" }}>
-            {virtualizer.getVirtualItems().map((virtualItem) => {
+            {virtualItems.map((virtualItem) => {
               const msg = visibleMessages[virtualItem.index];
               return (
                 <div
@@ -175,29 +211,16 @@ export default function StarredView() {
           </div>
         </div>
 
-        {hasNextPage && (
+        {hasNextPage && isFetchingNextPage && (
           <div style={{
             borderTop: "1px solid var(--color-border)",
             padding: "10px 16px",
             display: "flex",
             justifyContent: "center",
           }}>
-            <button
-              onClick={handleLoadMore}
-              disabled={isFetchingNextPage}
-              style={{
-                padding: "6px 14px",
-                borderRadius: "4px",
-                border: "1px solid var(--color-border)",
-                backgroundColor: "transparent",
-                color: "var(--color-accent)",
-                fontSize: "13px",
-                cursor: isFetchingNextPage ? "default" : "pointer",
-                opacity: isFetchingNextPage ? 0.7 : 1,
-              }}
-            >
-              {t("common.loadMore", "Load More")}
-            </button>
+            <span role="status" style={{ color: "var(--color-text-secondary)", fontSize: "12px" }}>
+              {t("common.loading", "Loading...")}
+            </span>
           </div>
         )}
       </div>

@@ -1,6 +1,6 @@
 use pebble_core::{Attachment, Message, MessageSummary, PebbleError, Result};
-use rusqlite::{params, OptionalExtension, Row};
-use std::collections::HashMap;
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use std::collections::{HashMap, HashSet};
 
 use crate::Store;
 
@@ -103,6 +103,7 @@ fn row_to_message_summary(row: &Row) -> rusqlite::Result<MessageSummary> {
         cc_list: serde_json::from_str(&cc_json).unwrap_or_default(),
         bcc_list: serde_json::from_str(&bcc_json).unwrap_or_default(),
         has_attachments: has_attachments != 0,
+        has_replies: false,
         is_read: is_read != 0,
         is_starred: is_starred != 0,
         is_draft: is_draft != 0,
@@ -115,7 +116,109 @@ fn row_to_message_summary(row: &Row) -> rusqlite::Result<MessageSummary> {
     })
 }
 
+/// Mark list items that already have a locally stored, non-draft reply. This
+/// checks the whole account database rather than only the currently visible
+/// folder, so an Inbox message is still marked when its reply is in Sent.
+fn annotate_replies(conn: &Connection, messages: &mut [MessageSummary]) -> rusqlite::Result<()> {
+    let headers: Vec<String> = messages
+        .iter()
+        .filter_map(|message| message.message_id_header.clone())
+        .collect();
+    if headers.is_empty() {
+        return Ok(());
+    }
+
+    let placeholders = (1..=headers.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT DISTINCT in_reply_to, account_id
+         FROM messages
+         WHERE is_deleted = 0 AND is_draft = 0 AND in_reply_to IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let values: Vec<&dyn rusqlite::types::ToSql> = headers
+        .iter()
+        .map(|header| header as &dyn rusqlite::types::ToSql)
+        .collect();
+    let rows = stmt.query_map(values.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let replied_to: HashSet<(String, String)> = rows.collect::<rusqlite::Result<_>>()?;
+
+    for message in messages.iter_mut() {
+        message.has_replies = message
+            .message_id_header
+            .as_ref()
+            .is_some_and(|header| replied_to.contains(&(header.clone(), message.account_id.clone())));
+    }
+    Ok(())
+}
+
 impl Store {
+    /// Insert a batch of messages in one SQLite transaction.
+    ///
+    /// Sync callers should prefer this over calling `insert_message` once per
+    /// message. SQLite has a single writer; committing every message turns a
+    /// network batch into hundreds of serialized fsync/lock cycles.
+    pub fn insert_messages_batch(&self, messages: &[(Message, Vec<String>)]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            for (msg, folder_ids) in messages {
+                let to_json = serde_json::to_string(&msg.to_list)
+                    .map_err(|e| PebbleError::Storage(e.to_string()))?;
+                let cc_json = serde_json::to_string(&msg.cc_list)
+                    .map_err(|e| PebbleError::Storage(e.to_string()))?;
+                let bcc_json = serde_json::to_string(&msg.bcc_list)
+                    .map_err(|e| PebbleError::Storage(e.to_string()))?;
+
+                tx.execute(
+                    "INSERT INTO messages (id, account_id, remote_id, message_id_header, in_reply_to,
+                     references_header, thread_id, subject, snippet, from_address, from_name,
+                     to_list, cc_list, bcc_list, body_text, body_html_raw,
+                     has_attachments, is_read, is_starred, is_draft,
+                     date, remote_version, is_deleted, deleted_at, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                             ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                    params![
+                        msg.id, msg.account_id, msg.remote_id, msg.message_id_header,
+                        msg.in_reply_to, msg.references_header, msg.thread_id, msg.subject,
+                        msg.snippet, msg.from_address, msg.from_name, to_json, cc_json,
+                        bcc_json, msg.body_text, msg.body_html_raw,
+                        msg.has_attachments as i32, msg.is_read as i32, msg.is_starred as i32,
+                        msg.is_draft as i32, msg.date, msg.remote_version,
+                        msg.is_deleted as i32, msg.deleted_at, msg.created_at, msg.updated_at,
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                     VALUES (?1, 'index', ?2)",
+                    params![msg.id, msg.updated_at],
+                )?;
+                for folder_id in folder_ids {
+                    tx.execute(
+                        "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
+                        params![msg.id, folder_id],
+                    )?;
+                }
+                if msg.remote_version.as_deref() == Some("headers-only") {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO body_download_jobs
+                         (message_id, account_id, status, priority, attempts, next_attempt_at, created_at, updated_at)
+                         VALUES (?1, ?2, 'pending', 100, 0, 0, ?3, ?3)",
+                        params![msg.id, msg.account_id, msg.created_at],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn insert_message(&self, msg: &Message, folder_ids: &[String]) -> Result<()> {
         self.with_write(|conn| {
             let to_json = serde_json::to_string(&msg.to_list).map_err(|e| PebbleError::Storage(e.to_string()))?;
@@ -161,10 +264,23 @@ impl Store {
                 ],
             )?;
 
+            tx.execute(
+                "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                 VALUES (?1, 'index', ?2)",
+                params![msg.id, msg.updated_at],
+            )?;
             for folder_id in folder_ids {
                 tx.execute(
                     "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
                     params![msg.id, folder_id],
+                )?;
+            }
+            if msg.remote_version.as_deref() == Some("headers-only") {
+                tx.execute(
+                    "INSERT OR IGNORE INTO body_download_jobs
+                     (message_id, account_id, status, priority, attempts, next_attempt_at, created_at, updated_at)
+                     VALUES (?1, ?2, 'pending', 100, 0, 0, ?3, ?3)",
+                    params![msg.id, msg.account_id, msg.created_at],
                 )?;
             }
 
@@ -186,6 +302,8 @@ impl Store {
 
             let tx = conn.unchecked_transaction()?;
 
+            // 先清掉该 message 的旧附件（SQLite 默认不级联，否则反复 replace 会累积重复附件）
+            tx.execute("DELETE FROM attachments WHERE message_id = ?1", params![msg.id])?;
             tx.execute("DELETE FROM messages WHERE id = ?1", params![msg.id])?;
             tx.execute(
                 "INSERT INTO messages (id, account_id, remote_id, message_id_header, in_reply_to,
@@ -263,7 +381,7 @@ impl Store {
             let sql = format!(
                 "SELECT m.{} FROM messages m
                  WHERE m.account_id = ?1 AND m.is_starred = 1 AND m.is_deleted = 0
-                 ORDER BY m.date DESC
+                 ORDER BY m.date DESC, m.id ASC
                  LIMIT ?2 OFFSET ?3",
                 MSG_SUMMARY_SELECT.replace(", ", ", m.")
             );
@@ -274,6 +392,7 @@ impl Store {
             for row in rows {
                 messages.push(row?);
             }
+            annotate_replies(conn, &mut messages)?;
             Ok(messages)
         })
     }
@@ -289,7 +408,7 @@ impl Store {
                 "SELECT m.{} FROM messages m
                  JOIN message_folders mf ON m.id = mf.message_id
                  WHERE mf.folder_id = ?1 AND m.is_deleted = 0
-                 ORDER BY m.date DESC
+                 ORDER BY m.date DESC, m.id ASC
                  LIMIT ?2 OFFSET ?3",
                 MSG_SUMMARY_SELECT.replace(", ", ", m.")
             );
@@ -299,7 +418,63 @@ impl Store {
             for row in rows {
                 messages.push(row?);
             }
+            annotate_replies(conn, &mut messages)?;
             Ok(messages)
+        })
+    }
+
+    /// Cursor-based folder pagination. The cursor is the last `(date, id)`
+    /// returned by the previous page, matching the stable sort above.
+    pub fn list_messages_by_folder_cursor(
+        &self,
+        folder_id: &str,
+        limit: u32,
+        cursor: Option<(i64, String)>,
+    ) -> Result<Vec<MessageSummary>> {
+        self.with_read(|conn| {
+            let sql = format!(
+                "SELECT m.{} FROM messages m
+                 JOIN message_folders mf ON m.id = mf.message_id
+                 WHERE mf.folder_id = ?1 AND m.is_deleted = 0
+                   AND (?2 IS NULL OR m.date < ?2 OR (m.date = ?2 AND m.id > ?3))
+                 ORDER BY m.date DESC, m.id ASC
+                 LIMIT ?4",
+                MSG_SUMMARY_SELECT.replace(", ", ", m.")
+            );
+            let (cursor_date, cursor_id) = cursor
+                .map(|(date, id)| (Some(date), id))
+                .unwrap_or((None, String::new()));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![folder_id, cursor_date, cursor_id, limit],
+                row_to_message_summary,
+            )?;
+            let mut messages = Vec::new();
+            for row in rows {
+                messages.push(row?);
+            }
+            annotate_replies(conn, &mut messages)?;
+            Ok(messages)
+        })
+    }
+
+    /// Snapshot the IDs in a folder before a bulk operation starts.
+    ///
+    /// Bulk rules may move or archive messages while they run. Paging the
+    /// live folder with OFFSET in that situation skips rows as the result set
+    /// shrinks. Taking an ID snapshot makes the operation deterministic.
+    pub fn list_message_ids_by_folder(&self, folder_id: &str) -> Result<Vec<String>> {
+        self.with_read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT m.id
+                 FROM messages m
+                 JOIN message_folders mf ON mf.message_id = m.id
+                 WHERE mf.folder_id = ?1 AND m.is_deleted = 0
+                 ORDER BY m.date DESC, m.id ASC",
+            )?;
+            let rows = stmt.query_map(params![folder_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
         })
     }
 
@@ -315,7 +490,7 @@ impl Store {
                 "SELECT m.{} FROM messages m
                  JOIN message_folders mf ON m.id = mf.message_id
                  WHERE mf.folder_id = ?1 AND m.is_deleted = 0
-                 ORDER BY m.date DESC
+                 ORDER BY m.date DESC, m.id ASC
                  LIMIT ?2 OFFSET ?3",
                 MSG_SELECT.replace(", ", ", m.")
             );
@@ -416,7 +591,7 @@ impl Store {
                 "SELECT DISTINCT m.{} FROM messages m
                  JOIN message_folders mf ON m.id = mf.message_id
                  WHERE mf.folder_id IN ({}) AND m.is_deleted = 0
-                 ORDER BY m.date DESC
+                 ORDER BY m.date DESC, m.id ASC
                  LIMIT ?{} OFFSET ?{}",
                 MSG_SUMMARY_SELECT.replace(", ", ", m."),
                 placeholders.join(", "),
@@ -439,6 +614,32 @@ impl Store {
             for row in rows {
                 messages.push(row?);
             }
+            annotate_replies(conn, &mut messages)?;
+            Ok(messages)
+        })
+    }
+
+    /// 全部账户的未读邮件（"所有未读"视图），按日期倒序分页。
+    pub fn list_unread_messages(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<MessageSummary>> {
+        self.with_read(|conn| {
+            let sql = format!(
+                "SELECT m.{} FROM messages m
+                 WHERE m.is_read = 0 AND m.is_deleted = 0
+                 ORDER BY m.date DESC, m.id ASC
+                 LIMIT ?1 OFFSET ?2",
+                MSG_SUMMARY_SELECT.replace(", ", ", m.")
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![limit, offset], row_to_message_summary)?;
+            let mut messages = Vec::new();
+            for row in rows {
+                messages.push(row?);
+            }
+            annotate_replies(conn, &mut messages)?;
             Ok(messages)
         })
     }
@@ -450,6 +651,230 @@ impl Store {
                 .query_row(&sql, params![id], row_to_message)
                 .optional()?;
             Ok(result)
+        })
+    }
+
+    pub fn update_message_content(
+        &self,
+        message_id: &str,
+        body_text: &str,
+        body_html_raw: &str,
+        snippet: &str,
+        has_attachments: bool,
+        remote_version: Option<&str>,
+    ) -> Result<()> {
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE messages SET body_text = ?1, body_html_raw = ?2, snippet = ?3, has_attachments = ?4, remote_version = ?5, updated_at = ?6 WHERE id = ?7",
+                params![
+                    body_text,
+                    body_html_raw,
+                    snippet,
+                    has_attachments as i32,
+                    remote_version,
+                    pebble_core::now_timestamp(),
+                    message_id
+                ],
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                 VALUES (?1, 'index', ?2)",
+                params![message_id, pebble_core::now_timestamp()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_messages_by_folders_cursor(
+        &self,
+        folder_ids: &[String],
+        limit: u32,
+        cursor: Option<(i64, String)>,
+    ) -> Result<Vec<MessageSummary>> {
+        if folder_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if folder_ids.len() == 1 {
+            return self.list_messages_by_folder_cursor(&folder_ids[0], limit, cursor);
+        }
+        self.with_read(|conn| {
+            let placeholders: Vec<String> =
+                (1..=folder_ids.len()).map(|i| format!("?{i}")).collect();
+            let date_param = folder_ids.len() + 1;
+            let id_param = folder_ids.len() + 2;
+            let limit_param = folder_ids.len() + 3;
+            let sql = format!(
+                "SELECT DISTINCT m.{} FROM messages m
+                 JOIN message_folders mf ON m.id = mf.message_id
+                 WHERE mf.folder_id IN ({}) AND m.is_deleted = 0
+                   AND (?{} IS NULL OR m.date < ?{} OR (m.date = ?{} AND m.id > ?{}))
+                 ORDER BY m.date DESC, m.id ASC
+                 LIMIT ?{}",
+                MSG_SUMMARY_SELECT.replace(", ", ", m."),
+                placeholders.join(", "),
+                date_param,
+                date_param,
+                date_param,
+                id_param,
+                limit_param,
+            );
+            let (cursor_date, cursor_id) = cursor
+                .map(|(date, id)| (Some(date), id))
+                .unwrap_or((None, String::new()));
+            let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = folder_ids
+                .iter()
+                .map(|id| Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            values.push(Box::new(cursor_date));
+            values.push(Box::new(cursor_id));
+            values.push(Box::new(limit));
+            let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(refs.as_slice(), row_to_message_summary)?;
+            let mut messages = Vec::new();
+            for row in rows {
+                messages.push(row?);
+            }
+            annotate_replies(conn, &mut messages)?;
+            Ok(messages)
+        })
+    }
+
+    /// Atomically claim ready body downloads for one account. The claim is
+    /// durable, so a crash cannot cause an already completed message to be
+    /// downloaded again; abandoned claims are reclaimable after 15 minutes.
+    /// Returns (message_id, folder_id, folder_remote_id, remote_uid).
+    pub fn claim_body_download_jobs(
+        &self,
+        account_id: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let now = pebble_core::now_timestamp();
+            let stale_before = now - 15 * 60;
+            let mut stmt = tx.prepare(
+                "SELECT j.message_id, mf.folder_id, f.remote_id, m.remote_id
+                 FROM body_download_jobs j
+                 JOIN messages m ON m.id = j.message_id
+                 JOIN message_folders mf ON mf.message_id = m.id
+                 JOIN folders f ON f.id = mf.folder_id
+                 WHERE j.account_id = ?1
+                   AND m.remote_version = 'headers-only'
+                   AND m.is_deleted = 0
+                   AND f.remote_id NOT LIKE '__local\\_%' ESCAPE '\\'
+                   AND ((j.status IN ('pending', 'retry', 'unavailable') AND j.next_attempt_at <= ?2)
+                        OR (j.status = 'unavailable' AND EXISTS (
+                            SELECT 1
+                            FROM messages old
+                            WHERE old.account_id = m.account_id
+                              AND old.message_id_header = m.message_id_header
+                              AND old.id <> m.id
+                              AND old.is_deleted = 1
+                              AND old.remote_version IS NULL
+                        ))
+                        OR (j.status = 'downloading' AND j.updated_at < ?3))
+                 GROUP BY j.message_id
+                 ORDER BY j.priority ASC, m.date DESC, m.id ASC
+                 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(params![account_id, now, stale_before, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let jobs: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
+            for (message_id, _, _, _) in &jobs {
+                tx.execute(
+                    "UPDATE body_download_jobs
+                     SET status = 'downloading', attempts = attempts + 1, updated_at = ?1
+                     WHERE message_id = ?2",
+                    params![now, message_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(jobs)
+        })
+    }
+
+    pub fn complete_body_download_job(&self, message_id: &str) -> Result<()> {
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE body_download_jobs SET status = 'done', updated_at = ?1 WHERE message_id = ?2",
+                params![pebble_core::now_timestamp(), message_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn fail_body_download_job(&self, message_id: &str, error: &str) -> Result<()> {
+        self.with_write(|conn| {
+            let now = pebble_core::now_timestamp();
+            let attempts: i64 = conn
+                .query_row(
+                    "SELECT attempts FROM body_download_jobs WHERE message_id = ?1",
+                    params![message_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            // A successful UID FETCH that returns no matching message normally
+            // means IMAP MOVE assigned a new UID in the destination mailbox.
+            // Allow a few transient server races, then park the job until
+            // header sync discovers and rebinds the destination UID.
+            let unavailable = error.contains("has no body") && attempts >= 3;
+            let retry_delay = 60_i64.saturating_mul(1_i64 << attempts.clamp(0, 6));
+            let retry_at = now + retry_delay;
+            conn.execute(
+                "UPDATE body_download_jobs
+                 SET status = ?1, next_attempt_at = ?2, last_error = ?3, updated_at = ?4
+                 WHERE message_id = ?5",
+                params![if unavailable { "unavailable" } else { "retry" }, retry_at, error, now, message_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Park a body job whose UID was authoritatively absent from a successful
+    /// RFC822.SIZE response. Header sync will reset it after rebinding the
+    /// message to the destination mailbox's new UID.
+    pub fn mark_body_download_job_unavailable(&self, message_id: &str, error: &str) -> Result<()> {
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE body_download_jobs
+                 SET status = 'unavailable', next_attempt_at = ?1, last_error = ?2, updated_at = ?3
+                 WHERE message_id = ?4",
+                params![pebble_core::now_timestamp() + 3600, error, pebble_core::now_timestamp(), message_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Return a group of claimed body jobs to retryable state in one
+    /// transaction. This is used when a shared IMAP connection fails before
+    /// the claimed batch can be processed; leaving them as `downloading`
+    /// would otherwise make them invisible until the stale-claim timeout.
+    pub fn retry_body_download_jobs(&self, message_ids: &[String], error: &str) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let now = pebble_core::now_timestamp();
+            let retry_at = now + 60;
+            for message_id in message_ids {
+                tx.execute(
+                    "UPDATE body_download_jobs
+                     SET status = 'retry', next_attempt_at = ?1, last_error = ?2, updated_at = ?3
+                     WHERE message_id = ?4 AND status = 'downloading'",
+                    params![retry_at, error, now, message_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -535,6 +960,44 @@ impl Store {
         })
     }
 
+    /// Apply the same flag change to many messages in one write transaction.
+    pub fn update_message_flags_batch(
+        &self,
+        ids: &[String],
+        is_read: Option<bool>,
+        is_starred: Option<bool>,
+    ) -> Result<u32> {
+        if ids.is_empty() || (is_read.is_none() && is_starred.is_none()) {
+            return Ok(0);
+        }
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let now = pebble_core::now_timestamp();
+            let mut changed = 0u32;
+            for id in ids {
+                let mut sets = Vec::new();
+                let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                if let Some(read) = is_read {
+                    sets.push(format!("is_read = ?{}", values.len() + 1));
+                    values.push(Box::new(read as i32));
+                }
+                if let Some(starred) = is_starred {
+                    sets.push(format!("is_starred = ?{}", values.len() + 1));
+                    values.push(Box::new(starred as i32));
+                }
+                sets.push(format!("updated_at = ?{}", values.len() + 1));
+                values.push(Box::new(now));
+                values.push(Box::new(id.clone()));
+                let id_idx = values.len();
+                let sql = format!("UPDATE messages SET {} WHERE id = ?{}", sets.join(", "), id_idx);
+                let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+                changed += tx.execute(&sql, params.as_slice())? as u32;
+            }
+            tx.commit()?;
+            Ok(changed)
+        })
+    }
+
     /// Move a message from its current folder(s) to a target folder.
     /// Clears any soft-delete flag so the message is visible in the new folder.
     pub fn move_message_to_folder(&self, message_id: &str, target_folder_id: &str) -> Result<()> {
@@ -559,9 +1022,44 @@ impl Store {
                 "UPDATE messages SET is_deleted = 0, deleted_at = NULL, updated_at = ?1 WHERE id = ?2",
                 params![now, message_id],
             )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                 VALUES (?1, 'index', ?2)",
+                params![message_id, now],
+            )?;
 
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    /// Move many messages to one folder in one SQLite transaction.
+    pub fn move_messages_to_folder_batch(&self, ids: &[String], target_folder_id: &str) -> Result<u32> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let now = pebble_core::now_timestamp();
+            let mut changed = 0u32;
+            for id in ids {
+                tx.execute("DELETE FROM message_folders WHERE message_id = ?1", params![id])?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
+                    params![id, target_folder_id],
+                )?;
+                changed += tx.execute(
+                    "UPDATE messages SET is_deleted = 0, deleted_at = NULL, updated_at = ?1 WHERE id = ?2",
+                    params![now, id],
+                )? as u32;
+                tx.execute(
+                    "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                     VALUES (?1, 'index', ?2)",
+                    params![id, now],
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
         })
     }
 
@@ -637,6 +1135,11 @@ impl Store {
                 "UPDATE messages SET is_deleted = 1, deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
                 params![now, id],
             )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                 VALUES (?1, 'remove', ?2)",
+                params![id, now],
+            )?;
             Ok(())
         })
     }
@@ -672,6 +1175,381 @@ impl Store {
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(PebbleError::Storage(e.to_string())),
             }
+        })
+    }
+
+    /// Find an IMAP message by UID within one mailbox.
+    ///
+    /// IMAP UIDs are only unique inside a mailbox, so an account-wide lookup
+    /// can return the wrong message when (for example) INBOX and Sent both
+    /// contain the same numeric UID.
+    pub fn find_message_id_by_remote_in_folder(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        remote_id: &str,
+    ) -> Result<Option<String>> {
+        self.with_read(|conn| {
+            let result = conn.query_row(
+                "SELECT m.id
+                 FROM messages m
+                 JOIN message_folders mf ON mf.message_id = m.id
+                 WHERE m.account_id = ?1
+                   AND mf.folder_id = ?2
+                   AND m.remote_id = ?3
+                   AND m.is_deleted = 0
+                 LIMIT 1",
+                params![account_id, folder_id, remote_id],
+                |row| row.get(0),
+            );
+            match result {
+                Ok(id) => Ok(Some(id)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(PebbleError::Storage(e.to_string())),
+            }
+        })
+    }
+
+    /// List messages that still only have headers (remote_version =
+    /// 'headers-only') and are eligible for background full-body backfill.
+    ///
+    /// Returns (message_id, folder_id, folder_remote_id, remote_uid_string)
+    /// ordered oldest-first so the deepest history is hydrated first. Local
+    /// folders (`__local_*`, e.g. POP3 本地文件夹) are excluded because they
+    /// have no server UID to fetch from.
+    pub fn list_header_only_messages(
+        &self,
+        account_id: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        self.with_read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT m.id, mf.folder_id, f.remote_id, m.remote_id
+                 FROM messages m
+                 JOIN message_folders mf ON mf.message_id = m.id
+                 JOIN folders f ON f.id = mf.folder_id
+                 WHERE m.account_id = ?1
+                   AND m.remote_version = 'headers-only'
+                   AND m.is_deleted = 0
+                   AND f.remote_id NOT LIKE '__local\\_%' ESCAPE '\\'
+                 -- Newest mail becomes searchable first; repeated passes still
+                 -- move steadily toward the oldest message until the queue is
+                 -- empty. This is more useful than starving recent mail behind
+                 -- years of historical backfill.
+                 ORDER BY m.date DESC, m.id ASC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![account_id, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 统计某账号还有多少封只有邮件头（正文尚未下载）的邮件。
+    /// 用于前端显示"正文下载中"的进度提示。
+    pub fn count_header_only_messages(&self, account_id: &str) -> Result<u32> {
+        self.with_read(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*)
+                 FROM messages m
+                 LEFT JOIN body_download_jobs j ON j.message_id = m.id
+                 WHERE m.account_id = ?1
+                   AND m.remote_version = 'headers-only'
+                   AND m.is_deleted = 0
+                   AND COALESCE(j.status, 'pending') <> 'unavailable'",
+                params![account_id],
+                |row| row.get::<_, u32>(0),
+            )
+            .map_err(|e| PebbleError::Storage(e.to_string()))
+        })
+    }
+
+    /// Rebind a locally moved IMAP message to the UID assigned by its
+    /// destination mailbox. Legacy duplicate rows with the same Message-ID in
+    /// that folder are soft-deleted in the same transaction, and a parked body
+    /// job is made runnable again.
+    pub fn rebind_message_remote_id_by_header_in_folder(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        message_id_header: &str,
+        new_remote_id: &str,
+        preferred_message_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        if message_id_header.trim().is_empty() {
+            return Ok(None);
+        }
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let candidates = {
+                let mut stmt = tx.prepare(
+                    "SELECT m.id, m.remote_version
+                     FROM messages m
+                     JOIN message_folders mf ON mf.message_id = m.id
+                     WHERE m.account_id = ?1
+                       AND mf.folder_id = ?2
+                       AND m.message_id_header = ?3
+                       AND (m.is_deleted = 0 OR m.id = ?4)
+                     ORDER BY CASE WHEN m.id = ?4 THEN 0 ELSE 1 END,
+                              CASE WHEN m.remote_version IS NULL THEN 0 ELSE 1 END,
+                              m.created_at ASC, m.id ASC",
+                )?;
+                let rows = stmt.query_map(
+                    params![account_id, folder_id, message_id_header, preferred_message_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let Some((canonical_id, remote_version)) = candidates.first().cloned() else {
+                return Ok(None);
+            };
+            let now = pebble_core::now_timestamp();
+            tx.execute(
+                "UPDATE messages
+                 SET remote_id = ?1, is_deleted = 0, deleted_at = NULL, updated_at = ?2
+                 WHERE id = ?3",
+                params![new_remote_id, now, canonical_id],
+            )?;
+            if remote_version.as_deref() == Some("headers-only") {
+                tx.execute(
+                    "INSERT INTO body_download_jobs
+                     (message_id, account_id, status, priority, attempts, next_attempt_at, created_at, updated_at)
+                     VALUES (?1, ?2, 'pending', 0, 0, 0, ?3, ?3)
+                     ON CONFLICT(message_id) DO UPDATE SET
+                       status = 'pending', priority = 0, attempts = 0,
+                       next_attempt_at = 0, last_error = NULL, updated_at = excluded.updated_at",
+                    params![canonical_id, account_id, now],
+                )?;
+            }
+            for (duplicate_id, _) in candidates.iter().skip(1) {
+                tx.execute(
+                    "UPDATE messages SET is_deleted = 1, deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
+                    params![now, duplicate_id],
+                )?;
+                tx.execute(
+                    "UPDATE body_download_jobs SET status = 'done', updated_at = ?1 WHERE message_id = ?2",
+                    params![now, duplicate_id],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                     VALUES (?1, 'remove', ?2)",
+                    params![duplicate_id, now],
+                )?;
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                 VALUES (?1, 'index', ?2)",
+                params![canonical_id, now],
+            )?;
+            tx.commit()?;
+            Ok(Some(canonical_id))
+        })
+    }
+
+    /// Finish an IMAP move even when sync has already replaced the original
+    /// local row or temporarily associated the complete row with the source
+    /// folder again. The best local copy is retained, moved into the
+    /// destination folder, and rebound to the destination UID atomically.
+    pub fn reconcile_moved_message_by_header(
+        &self,
+        account_id: &str,
+        destination_folder_id: &str,
+        message_id_header: &str,
+        destination_remote_id: &str,
+        preferred_message_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        if message_id_header.trim().is_empty() {
+            return Ok(None);
+        }
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let candidates = {
+                let mut stmt = tx.prepare(
+                    "SELECT m.id, m.remote_version
+                     FROM messages m
+                     WHERE m.account_id = ?1
+                       AND m.message_id_header = ?2
+                     ORDER BY CASE WHEN m.remote_version IS NULL THEN 0 ELSE 1 END,
+                              CASE WHEN m.is_deleted = 0 THEN 0 ELSE 1 END,
+                              CASE WHEN m.id = ?3 THEN 0 ELSE 1 END,
+                              CASE WHEN EXISTS (
+                                  SELECT 1 FROM message_folders mf
+                                  WHERE mf.message_id = m.id AND mf.folder_id = ?4
+                              ) THEN 0 ELSE 1 END,
+                              m.updated_at DESC, m.id ASC",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        account_id,
+                        message_id_header,
+                        preferred_message_id,
+                        destination_folder_id
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let Some((canonical_id, remote_version)) = candidates.first().cloned() else {
+                return Ok(None);
+            };
+
+            let now = pebble_core::now_timestamp();
+            tx.execute(
+                "DELETE FROM message_folders WHERE message_id = ?1",
+                params![canonical_id],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
+                params![canonical_id, destination_folder_id],
+            )?;
+            tx.execute(
+                "UPDATE messages
+                 SET remote_id = ?1, is_deleted = 0, deleted_at = NULL, updated_at = ?2
+                 WHERE id = ?3",
+                params![destination_remote_id, now, canonical_id],
+            )?;
+            if remote_version.as_deref() == Some("headers-only") {
+                tx.execute(
+                    "INSERT INTO body_download_jobs
+                     (message_id, account_id, status, priority, attempts, next_attempt_at, created_at, updated_at)
+                     VALUES (?1, ?2, 'pending', 0, 0, 0, ?3, ?3)
+                     ON CONFLICT(message_id) DO UPDATE SET
+                       status = 'pending', priority = 0, attempts = 0,
+                       next_attempt_at = 0, last_error = NULL, updated_at = excluded.updated_at",
+                    params![canonical_id, account_id, now],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE body_download_jobs SET status = 'done', updated_at = ?1 WHERE message_id = ?2",
+                    params![now, canonical_id],
+                )?;
+            }
+            for (duplicate_id, _) in candidates.iter().skip(1) {
+                tx.execute(
+                    "UPDATE messages SET is_deleted = 1, deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
+                    params![now, duplicate_id],
+                )?;
+                tx.execute(
+                    "UPDATE body_download_jobs SET status = 'done', updated_at = ?1 WHERE message_id = ?2",
+                    params![now, duplicate_id],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                     VALUES (?1, 'remove', ?2)",
+                    params![duplicate_id, now],
+                )?;
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                 VALUES (?1, 'index', ?2)",
+                params![canonical_id, now],
+            )?;
+            tx.commit()?;
+            Ok(Some(canonical_id))
+        })
+    }
+
+    /// Recover a header-only live row from an older complete local copy with
+    /// the same Message-ID. The complete row itself is resurrected so its
+    /// attachment records and on-disk paths remain valid; folder membership
+    /// and remote UID are taken from the current live row.
+    pub fn restore_complete_local_duplicate(&self, message_id: &str) -> Result<Option<String>> {
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let target = tx
+                .query_row(
+                    "SELECT account_id, message_id_header, remote_id
+                     FROM messages
+                     WHERE id = ?1 AND is_deleted = 0 AND remote_version = 'headers-only'",
+                    params![message_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((account_id, Some(message_id_header), remote_id)) = target else {
+                return Ok(None);
+            };
+            let source_id = tx
+                .query_row(
+                    "SELECT old.id
+                     FROM messages old
+                     WHERE old.account_id = ?1
+                       AND old.message_id_header = ?2
+                       AND old.id <> ?3
+                       AND old.is_deleted = 1
+                       AND old.remote_version IS NULL
+                     ORDER BY old.has_attachments DESC,
+                              (length(old.body_text) + length(old.body_html_raw)) DESC,
+                              old.updated_at DESC
+                     LIMIT 1",
+                    params![account_id, message_id_header, message_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(source_id) = source_id else {
+                return Ok(None);
+            };
+            let folder_ids = {
+                let mut stmt = tx.prepare(
+                    "SELECT folder_id FROM message_folders WHERE message_id = ?1",
+                )?;
+                let rows = stmt.query_map(params![message_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if folder_ids.is_empty() {
+                return Ok(None);
+            }
+
+            let now = pebble_core::now_timestamp();
+            tx.execute("DELETE FROM message_folders WHERE message_id = ?1", params![source_id])?;
+            for folder_id in &folder_ids {
+                tx.execute(
+                    "INSERT OR IGNORE INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
+                    params![source_id, folder_id],
+                )?;
+            }
+            tx.execute(
+                "UPDATE messages
+                 SET remote_id = ?1, is_deleted = 0, deleted_at = NULL, updated_at = ?2
+                 WHERE id = ?3",
+                params![remote_id, now, source_id],
+            )?;
+            tx.execute(
+                "UPDATE messages SET is_deleted = 1, deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
+                params![now, message_id],
+            )?;
+            tx.execute(
+                "UPDATE body_download_jobs SET status = 'done', updated_at = ?1
+                 WHERE message_id IN (?2, ?3)",
+                params![now, message_id, source_id],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                 VALUES (?1, 'remove', ?2)",
+                params![message_id, now],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                 VALUES (?1, 'index', ?2)",
+                params![source_id, now],
+            )?;
+            tx.commit()?;
+            Ok(Some(source_id))
         })
     }
 
@@ -737,8 +1615,7 @@ impl Store {
                    AND m.remote_id IN ({})
                    AND m.is_deleted = 0",
                 placeholders.join(", ")
-            );
-            let mut stmt = conn.prepare(&sql)?;
+            );            let mut stmt = conn.prepare(&sql)?;
             let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
                 Vec::with_capacity(remote_ids.len() + 2);
             params_vec.push(Box::new(account_id.to_string()));
@@ -750,6 +1627,48 @@ impl Store {
                 params_vec.iter().map(|p| p.as_ref()).collect();
             let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))?;
 
+            let mut result = HashSet::new();
+            for row in rows {
+                result.insert(row?);
+            }
+            Ok(result)
+        })
+    }
+
+    /// 返回本地已存在（未删除）的 Message-ID 集合（按 message_id_header 匹配）。
+    /// 用于同步去重：本地"已发送"的 local-sent 副本与服务器 Sent 副本 Message-ID 相同，
+    /// 同步时跳过服务器副本，避免"已发送"出现两封一模一样的邮件。
+    pub fn get_existing_message_ids(
+        &self,
+        account_id: &str,
+        message_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        use std::collections::HashSet;
+        if message_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        self.with_read(|conn| {
+            let placeholders: Vec<String> = (0..message_ids.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect();
+            let sql = format!(
+                "SELECT DISTINCT m.message_id_header
+                 FROM messages m
+                 WHERE m.account_id = ?1
+                   AND m.message_id_header IN ({})
+                   AND m.is_deleted = 0",
+                placeholders.join(", ")
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+                Vec::with_capacity(message_ids.len() + 1);
+            params_vec.push(Box::new(account_id.to_string()));
+            for mid in message_ids {
+                params_vec.push(Box::new(mid.clone()));
+            }
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))?;
             let mut result = HashSet::new();
             for row in rows {
                 result.insert(row?);
@@ -859,6 +1778,27 @@ impl Store {
         })
     }
 
+    /// Return remote message IDs for a folder without loading MIME bodies.
+    /// Used by the one-time remote move repair pass.
+    pub fn list_message_remote_ids_by_folder(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        self.with_read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.remote_id
+                 FROM messages m
+                 JOIN message_folders mf ON mf.message_id = m.id
+                 WHERE mf.folder_id = ?1 AND m.is_deleted = 0
+                   AND m.remote_id IS NOT NULL AND m.remote_id <> ''",
+            )?;
+            let rows = stmt.query_map(params![folder_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        })
+    }
+
     /// Batch update flags for multiple messages in a transaction.
     pub fn bulk_update_flags(
         &self,
@@ -915,7 +1855,15 @@ impl Store {
                 .map(|i| format!("?{}", i + 2))
                 .collect();
             let sql = format!(
-                "UPDATE messages SET is_deleted = 1, deleted_at = ?1, updated_at = ?1 WHERE id IN ({})",
+                "UPDATE messages
+                 SET is_deleted = 1, deleted_at = ?1, updated_at = ?1
+                 WHERE id IN ({})
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pending_mail_ops p
+                       WHERE p.message_id = messages.id
+                         AND p.status IN ('pending', 'in_progress', 'failed')
+                         AND p.op_type IN ('move_to_folder', 'archive', 'unarchive', 'restore')
+                   )",
                 placeholders.join(", ")
             );
             let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(message_ids.len() + 1);
@@ -1422,6 +2370,220 @@ mod remote_id_scope_tests {
         assert!(
             matches!(err, PebbleError::Internal(message) if message.contains("missing-message"))
         );
+    }
+
+    #[test]
+    fn destination_uid_rebind_collapses_legacy_duplicates_and_wakes_body_job() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        store.insert_account(&account).unwrap();
+        let target = make_folder(&account.id, "Target", FolderRole::Archive, 0);
+        store.insert_folder(&target).unwrap();
+
+        let mut first = make_message(&account.id, "old-source-uid");
+        first.message_id_header = Some("<moved@example.com>".to_string());
+        first.remote_version = Some("headers-only".to_string());
+        first.body_text.clear();
+        let mut duplicate = first.clone();
+        duplicate.id = new_id();
+        duplicate.remote_id = "another-stale-uid".to_string();
+        store
+            .insert_message(&first, std::slice::from_ref(&target.id))
+            .unwrap();
+        store
+            .insert_message(&duplicate, std::slice::from_ref(&target.id))
+            .unwrap();
+
+        let canonical = store
+            .rebind_message_remote_id_by_header_in_folder(
+                &account.id,
+                &target.id,
+                "<moved@example.com>",
+                "777",
+                None,
+            )
+            .unwrap()
+            .expect("the local moved message should be rebound");
+
+        assert_eq!(
+            store
+                .find_message_id_by_remote_in_folder(&account.id, &target.id, "777")
+                .unwrap(),
+            Some(canonical)
+        );
+        assert_eq!(store.list_messages_by_folder(&target.id, 50, 0).unwrap().len(), 1);
+        assert_eq!(store.count_header_only_messages(&account.id).unwrap(), 1);
+    }
+
+    #[test]
+    fn destination_uid_rebind_prefers_pending_move_row_over_sync_duplicate() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        store.insert_account(&account).unwrap();
+        let target = make_folder(&account.id, "Target", FolderRole::Archive, 0);
+        store.insert_folder(&target).unwrap();
+
+        let mut pending_move = make_message(&account.id, "old-source-uid");
+        pending_move.message_id_header = Some("<concurrent-move@example.com>".to_string());
+        store
+            .insert_message(&pending_move, std::slice::from_ref(&target.id))
+            .unwrap();
+        store.soft_delete_message(&pending_move.id).unwrap();
+
+        let mut sync_duplicate = pending_move.clone();
+        sync_duplicate.id = new_id();
+        sync_duplicate.remote_id = "new-destination-uid".to_string();
+        sync_duplicate.is_deleted = false;
+        sync_duplicate.deleted_at = None;
+        sync_duplicate.remote_version = Some("headers-only".to_string());
+        sync_duplicate.body_text.clear();
+        store
+            .insert_message(&sync_duplicate, std::slice::from_ref(&target.id))
+            .unwrap();
+
+        let canonical = store
+            .rebind_message_remote_id_by_header_in_folder(
+                &account.id,
+                &target.id,
+                "<concurrent-move@example.com>",
+                "new-destination-uid",
+                Some(&pending_move.id),
+            )
+            .unwrap();
+
+        assert_eq!(canonical.as_deref(), Some(pending_move.id.as_str()));
+        let restored = store.get_message(&pending_move.id).unwrap().unwrap();
+        assert!(!restored.is_deleted);
+        assert_eq!(restored.remote_id, "new-destination-uid");
+        assert!(store
+            .get_message(&sync_duplicate.id)
+            .unwrap()
+            .unwrap()
+            .is_deleted);
+        assert_eq!(store.list_messages_by_folder(&target.id, 50, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn moved_message_reconciliation_keeps_complete_replacement_and_moves_it_to_destination() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        store.insert_account(&account).unwrap();
+        let source = make_folder(&account.id, "Sent", FolderRole::Sent, 0);
+        let target = make_folder(&account.id, "Watch GEC", FolderRole::Archive, 1);
+        store.insert_folder(&source).unwrap();
+        store.insert_folder(&target).unwrap();
+
+        let mut original = make_message(&account.id, "source-uid");
+        original.message_id_header = Some("<completed-move@example.com>".to_string());
+        original.remote_version = Some("headers-only".to_string());
+        original.body_text.clear();
+        store
+            .insert_message(&original, std::slice::from_ref(&source.id))
+            .unwrap();
+        store.soft_delete_message(&original.id).unwrap();
+
+        let mut complete_replacement = original.clone();
+        complete_replacement.id = new_id();
+        complete_replacement.remote_version = None;
+        complete_replacement.body_text = "complete local body".to_string();
+        complete_replacement.is_deleted = false;
+        complete_replacement.deleted_at = None;
+        store
+            .insert_message(&complete_replacement, std::slice::from_ref(&source.id))
+            .unwrap();
+
+        let mut destination_header = original.clone();
+        destination_header.id = new_id();
+        destination_header.remote_id = "destination-uid".to_string();
+        store
+            .insert_message(&destination_header, std::slice::from_ref(&target.id))
+            .unwrap();
+
+        let canonical = store
+            .reconcile_moved_message_by_header(
+                &account.id,
+                &target.id,
+                "<completed-move@example.com>",
+                "destination-uid",
+                Some(&original.id),
+            )
+            .unwrap();
+
+        assert_eq!(canonical.as_deref(), Some(complete_replacement.id.as_str()));
+        let restored = store
+            .get_message(&complete_replacement.id)
+            .unwrap()
+            .unwrap();
+        assert!(!restored.is_deleted);
+        assert_eq!(restored.remote_id, "destination-uid");
+        assert_eq!(restored.body_text, "complete local body");
+        assert!(store.list_messages_by_folder(&source.id, 50, 0).unwrap().is_empty());
+        assert_eq!(store.list_messages_by_folder(&target.id, 50, 0).unwrap().len(), 1);
+        assert!(store.get_message(&original.id).unwrap().unwrap().is_deleted);
+        assert!(store
+            .get_message(&destination_header.id)
+            .unwrap()
+            .unwrap()
+            .is_deleted);
+    }
+
+    #[test]
+    fn restores_complete_local_duplicate_without_redownloading_body_or_attachments() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        store.insert_account(&account).unwrap();
+        let target_folder = make_folder(&account.id, "Rain", FolderRole::Archive, 0);
+        store.insert_folder(&target_folder).unwrap();
+
+        let mut complete = make_message(&account.id, "old-folder-uid");
+        complete.message_id_header = Some("<already-local@example.com>".to_string());
+        complete.body_text = "complete local body".to_string();
+        complete.has_attachments = true;
+        store
+            .insert_message(&complete, std::slice::from_ref(&target_folder.id))
+            .unwrap();
+        let attachment = Attachment {
+            id: new_id(),
+            message_id: complete.id.clone(),
+            filename: "quotation.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            size: 42,
+            local_path: Some("C:\\mail-data\\quotation.pdf".to_string()),
+            content_id: None,
+            is_inline: false,
+        };
+        store.insert_attachment(&attachment).unwrap();
+        store.soft_delete_message(&complete.id).unwrap();
+
+        let mut header_only = make_message(&account.id, "new-destination-uid");
+        header_only.message_id_header = complete.message_id_header.clone();
+        header_only.remote_version = Some("headers-only".to_string());
+        header_only.body_text.clear();
+        header_only.has_attachments = false;
+        store
+            .insert_message(&header_only, std::slice::from_ref(&target_folder.id))
+            .unwrap();
+
+        let restored_id = store
+            .restore_complete_local_duplicate(&header_only.id)
+            .unwrap()
+            .expect("the existing complete local copy should be restored");
+
+        assert_eq!(restored_id, complete.id);
+        let restored = store.get_message(&restored_id).unwrap().unwrap();
+        assert!(!restored.is_deleted);
+        assert_eq!(restored.remote_id, "new-destination-uid");
+        assert_eq!(restored.body_text, "complete local body");
+        assert_eq!(
+            store.get_message_folder_ids(&restored_id).unwrap(),
+            vec![target_folder.id.clone()]
+        );
+        assert!(store.get_message(&header_only.id).unwrap().unwrap().is_deleted);
+        let attachments = store.list_attachments_by_message(&restored_id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].local_path, attachment.local_path);
+        assert_eq!(store.count_header_only_messages(&account.id).unwrap(), 0);
+        assert_eq!(store.list_messages_by_folder(&target_folder.id, 50, 0).unwrap().len(), 1);
     }
 
     #[test]

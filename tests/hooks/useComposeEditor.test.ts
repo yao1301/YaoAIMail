@@ -96,6 +96,18 @@ describe("buildComposeEditorContent", () => {
     expect(appendReplyQuoteHtml("<p>Reply</p>", "")).toBe("<p>Reply</p>");
   });
 
+  it("keeps a captured reply quote available after the live reply target changes", () => {
+    const captured = buildReplyQuoteHtml({
+      composeReplyTo: makeMessage({ body_text: "Original incoming message" }),
+      t,
+    });
+
+    // This mirrors the compose contract: later rendering may lose the live
+    // target, but sending still receives the captured quote.
+    expect(appendReplyQuoteHtml("<p>Second-round reply</p>", captured))
+      .toContain("Original incoming message");
+  });
+
   it("does not re-apply generated content after the editor was initialized", () => {
     expect(shouldApplyInitialEditorContent({
       editorExists: true,

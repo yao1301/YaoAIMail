@@ -114,7 +114,9 @@ export default function KanbanView() {
   }
 
   return (
-    <div style={{ display: "flex", gap: "8px", padding: "16px", height: "100%", overflow: "hidden" }}>
+    <div
+      style={{ display: "flex", gap: "8px", padding: "16px", height: "100%", overflow: "auto" }}
+    >
       <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
         {COLUMN_IDS.map((col) => (
           <KanbanColumn

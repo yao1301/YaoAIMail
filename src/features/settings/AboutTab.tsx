@@ -126,7 +126,7 @@ export default function AboutTab() {
             type="button"
             onClick={handleDiagnosticIconClick}
             aria-label={t("about.openDiagnosticLog", "Open diagnostic log")}
-            title="Pebble"
+            title="YaoAIMail"
             style={{
               width: "56px",
               height: "56px",
@@ -147,7 +147,7 @@ export default function AboutTab() {
           </button>
           <div>
             <div style={{ fontSize: "17px", fontWeight: 600, color: "var(--color-text-primary)" }}>
-              Pebble
+              YaoAIMail
             </div>
             <div style={{ fontSize: "13px", color: "var(--color-text-secondary)", marginTop: "2px" }}>
               {t("about.version", "Version")} {appVersion || "..."}
@@ -169,6 +169,11 @@ export default function AboutTab() {
         </p>
         <p style={{ fontSize: "12px", color: "var(--color-text-tertiary, var(--color-text-secondary))", lineHeight: 1.5, margin: 0 }}>
           {t("about.license", "Open source under AGPL-3.0 license.")}
+        </p>
+        <p style={{ fontSize: "12px", color: "var(--color-text-tertiary, var(--color-text-secondary))", lineHeight: 1.5, margin: "8px 0 0" }}>
+          本产品（YaoAIMail）基于开源项目 Pebble（AGPL-3.0，原作者 QingJ01）二次开发而来，
+          保留原项目版权；本产品在原项目基础上新增外贸业务功能（客户管理、开发客户、AI 写作、
+          地址本/客户按账号归属等），修改代码同样遵循 AGPL-3.0 协议开源。
         </p>
       </div>
 

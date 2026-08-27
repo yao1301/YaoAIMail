@@ -2,17 +2,20 @@
 @source "../**/*.{ts,tsx}";
 
 :root {
+  --app-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --app-font-scale: 1;
   --color-sidebar-bg: #f8f7f5;
   --color-sidebar-hover: #eeedeb;
-  --color-sidebar-active: #e5e4e2;
+  --color-sidebar-active: #f4d8cb;
   --color-titlebar-bg: #f8f7f5;
   --color-main-bg: #ffffff;
   --color-statusbar-bg: #f8f7f5;
-  --color-border: #e5e4e2;
+  --color-border: #d5d2cf;
   --color-text-primary: #1a1a1a;
   --color-text-secondary: #6b6b6b;
   --color-accent: #d4714e;
   --color-bg: #ffffff;
+  --color-bg-primary: #ffffff;
   --color-bg-hover: rgba(0,0,0,0.05);
   --color-bg-secondary: rgba(0,0,0,0.06);
   --color-scrollbar-track: transparent;
@@ -20,18 +23,89 @@
   --color-scrollbar-thumb-hover: rgba(26, 26, 26, 0.38);
 }
 
+[data-theme="warm"] {
+  --color-sidebar-bg: #f7efe5;
+  --color-sidebar-hover: #efe0cf;
+  --color-sidebar-active: #f0cda8;
+  --color-titlebar-bg: #f7efe5;
+  --color-main-bg: #fffaf3;
+  --color-statusbar-bg: #f7efe5;
+  --color-border: #d2bba0;
+  --color-text-primary: #3c2c22;
+  --color-text-secondary: #806b5d;
+  --color-accent: #b85f35;
+  --color-bg: #fffaf3;
+  --color-bg-primary: #fffaf3;
+  --color-bg-hover: rgba(125, 75, 42, 0.08);
+  --color-bg-secondary: rgba(125, 75, 42, 0.1);
+}
+
+[data-theme="ocean"] {
+  --color-sidebar-bg: #eaf3f8;
+  --color-sidebar-hover: #dbeaf2;
+  --color-sidebar-active: #b3d9ec;
+  --color-titlebar-bg: #eaf3f8;
+  --color-main-bg: #f7fbfd;
+  --color-statusbar-bg: #eaf3f8;
+  --color-border: #b0ccd9;
+  --color-text-primary: #193746;
+  --color-text-secondary: #5e7885;
+  --color-accent: #247ba0;
+  --color-bg: #f7fbfd;
+  --color-bg-primary: #f7fbfd;
+  --color-bg-hover: rgba(36, 123, 160, 0.08);
+  --color-bg-secondary: rgba(36, 123, 160, 0.1);
+}
+
+[data-theme="forest"] {
+  --color-sidebar-bg: #edf3ec;
+  --color-sidebar-hover: #dfeadd;
+  --color-sidebar-active: #b6d6ad;
+  --color-titlebar-bg: #edf3ec;
+  --color-main-bg: #f9fcf8;
+  --color-statusbar-bg: #edf3ec;
+  --color-border: #b4c9ae;
+  --color-text-primary: #243b2b;
+  --color-text-secondary: #64786a;
+  --color-accent: #4f7d59;
+  --color-bg: #f9fcf8;
+  --color-bg-primary: #f9fcf8;
+  --color-bg-hover: rgba(79, 125, 89, 0.08);
+  --color-bg-secondary: rgba(79, 125, 89, 0.1);
+}
+
+[data-theme="highContrast"] {
+  --color-sidebar-bg: #111111;
+  --color-sidebar-hover: #292929;
+  --color-sidebar-active: #4a4a4a;
+  --color-titlebar-bg: #111111;
+  --color-main-bg: #000000;
+  --color-statusbar-bg: #111111;
+  --color-border: #777777;
+  --color-text-primary: #ffffff;
+  --color-text-secondary: #dddddd;
+  --color-accent: #ffb000;
+  --color-bg: #000000;
+  --color-bg-primary: #000000;
+  --color-bg-hover: rgba(255, 255, 255, 0.12);
+  --color-bg-secondary: rgba(255, 255, 255, 0.16);
+  --color-scrollbar-thumb: rgba(255, 255, 255, 0.55);
+  --color-scrollbar-thumb-hover: rgba(255, 255, 255, 0.8);
+}
+
 [data-theme="dark"] {
   --color-sidebar-bg: #1e1e1e;
   --color-sidebar-hover: #2a2a2a;
-  --color-sidebar-active: #333333;
+  --color-sidebar-active: #3f3f3f;
   --color-titlebar-bg: #1e1e1e;
   --color-main-bg: #141414;
   --color-statusbar-bg: #1e1e1e;
-  --color-border: #2e2e2e;
+  --color-border: #3a3a3a;
   --color-text-primary: #e0e0e0;
   --color-text-secondary: #aaaaaa;
   --color-accent: #d4714e;
   --color-bg: #1a1a1a;
+  --color-bg-primary: #1a1a1a;
   --color-bg-hover: rgba(255,255,255,0.06);
   --color-bg-secondary: rgba(255,255,255,0.08);
   --color-scrollbar-track: transparent;
@@ -42,16 +116,64 @@
 html, body, #root {
   height: 100%;
   margin: 0;
+  /* 文档本身不能滚动，否则 Windows 缩放后会把自绘标题栏一起卷走。 */
   overflow: hidden;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family: var(--app-font-family);
   color: var(--color-text-primary);
   background: var(--color-main-bg);
+}
+
+/* 全局滚动条（含字号放大后出现的滚动）保持明显可见 */
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-text-secondary) 45%, transparent);
+  border-radius: 6px;
+  border: 2px solid var(--color-main-bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-text-secondary) 70%, transparent);
+}
+
+/* 所有可输入区域默认白色背景（浅色主题），深色主题保持深色 */
+input, textarea, select {
+  background-color: #ffffff !important;
+  color: var(--color-text-primary) !important;
+  border-color: var(--color-border) !important;
+}
+[data-theme="dark"] input,
+[data-theme="dark"] textarea,
+[data-theme="dark"] select,
+[data-theme="highContrast"] input,
+[data-theme="highContrast"] textarea,
+[data-theme="highContrast"] select {
+  background-color: #1a1a1a !important;
+  color: #e0e0e0 !important;
+}
+
+/* 字号缩放：整页 zoom（让字号调整真正生效，包括 px 字体）。
+   放大后若固定宽度的侧栏/右面板超出窗口，允许横向+纵向滚动查看，
+   避免右侧任务栏、标题栏关闭按钮、左下角设置入口被裁掉。默认 scale=1 无任何影响。 */
+body {
+  overflow: hidden;
 }
 
 .app-shell {
   position: relative;
   background: var(--color-main-bg);
   isolation: isolate;
+  zoom: var(--app-font-scale);
+  /* zoom 会放大盒子本身。同步缩小逻辑尺寸，放大后仍精确占满窗口，
+     不会把底部设置或邮件列表裁掉，也不会制造一个会卷走标题栏的文档滚动。 */
+  /* WebView 的 zoom 已经会参与宽度布局；宽度再除以缩放比例会在右侧制造空白。 */
+  width: 100%;
+  height: calc(100vh / var(--app-font-scale));
+  overflow: hidden;
 }
 
 .app-background-layer {
@@ -127,7 +249,11 @@ option {
 [data-theme="dark"] input,
 [data-theme="dark"] textarea,
 [data-theme="dark"] select,
-[data-theme="dark"] option {
+[data-theme="dark"] option,
+[data-theme="highContrast"] input,
+[data-theme="highContrast"] textarea,
+[data-theme="highContrast"] select,
+[data-theme="highContrast"] option {
   color-scheme: dark;
 }
 
@@ -151,10 +277,26 @@ option {
 .scroll-region {
   min-width: 0;
   min-height: 0;
-  overscroll-behavior: contain;
+  /* 允许滚轮在当前区域到达边界后继续交给父页面，避免 Windows 缩放时滚轮被吞掉。 */
+  overscroll-behavior: auto;
   scrollbar-color: var(--color-scrollbar-thumb) var(--color-scrollbar-track);
   scrollbar-gutter: stable;
   scrollbar-width: thin;
+}
+
+/* The view owns its scroll area. Keeping the shell hidden prevents a second
+   percentage-height scroll container from stealing wheel/track events when
+   Windows display scaling is above 100%. */
+.app-main-scroll > * {
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+}
+
+/* 看板列：允许滚动链（列内容不溢出时，滚轮继续传给外层页面），
+   否则 overscroll-behavior: contain 会把滚轮事件吞掉，导致首页滚不动。 */
+.kanban-column-scroll {
+  overscroll-behavior: auto;
 }
 
 .scroll-region::-webkit-scrollbar {
@@ -260,6 +402,7 @@ option {
 .message-list-row[aria-selected="true"],
 .thread-list-row[aria-selected="true"] {
   background: var(--color-sidebar-active);
+  box-shadow: inset 3px 0 0 var(--color-accent);
 }
 
 .message-list-row[aria-selected="false"]:hover,
@@ -331,12 +474,14 @@ textarea:focus-visible {
 
 .compose-form-shell {
   width: 100%;
-  max-width: 920px;
+  max-width: 100%;
   min-height: 0;
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
   margin: 0 auto;
+  padding: 0 32px;
+  box-sizing: border-box;
 }
 
 .compose-editor-toolbar-row {
@@ -347,6 +492,11 @@ textarea:focus-visible {
   padding: 7px 12px;
   border-bottom: 1px solid var(--color-border);
   background: color-mix(in srgb, var(--color-bg) 96%, var(--color-bg-secondary));
+  /* 保持一行，避免窗口较窄时按钮竖排；超出时横向滚动 */
+  flex-wrap: nowrap;
+  position: relative;
+  z-index: 30;
+  overflow: visible;
 }
 
 .compose-toolbar-tools {
@@ -372,7 +522,8 @@ textarea:focus-visible {
 
 .compose-format-toolbar {
   min-width: 0;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  overflow: visible;
 }
 
 .compose-format-toolbar-slot {
@@ -474,7 +625,7 @@ textarea:focus-visible {
 
 .compose-editor-area {
   position: relative;
-  min-height: 340px;
+  min-height: 0;
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
@@ -484,8 +635,8 @@ textarea:focus-visible {
 }
 
 .compose-editor-surface {
-  min-height: 320px;
-  flex: 1 1 auto;
+  min-height: 90px;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -500,19 +651,37 @@ textarea:focus-visible {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 13%, transparent);
 }
 
+/* 回复模式：草稿栏保持矮小（最低可拖动），让下方的原邮件引用区显示更多。
+   子元素的 min-height 320px 会把父容器撑高，这里必须用 !important 覆盖。 */
+.compose-editor-area--reply {
+  min-height: 0;
+}
+
+.compose-editor-surface--reply {
+  min-height: 140px !important;
+  max-height: 55vh;
+}
+
+.compose-editor-surface--reply .compose-editor-content,
+.compose-editor-surface--reply .compose-source-input {
+  min-height: 0 !important;
+}
+
 .compose-editor-content,
 .compose-source-input,
 .compose-preview-split {
   width: 100%;
   height: 100%;
-  min-height: 320px;
+  min-height: 90px;
   box-sizing: border-box;
 }
 
 .compose-editor-content {
   flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   padding: 18px 22px;
   color: var(--color-text-primary);
   font-size: 14px;
@@ -521,7 +690,8 @@ textarea:focus-visible {
 
 .compose-editor-content .ProseMirror {
   flex: 1 1 auto;
-  min-height: 284px;
+  min-height: 0;
+  overflow-y: auto;
   outline: 0;
 }
 
@@ -534,12 +704,23 @@ textarea:focus-visible {
   margin-top: 0;
 }
 
+/* 段落间距：AI 草稿切段后靠这里的段距形成"每段空一行"的阅读效果。
+   不再依赖空行占位段落（那会造成双空行）。 */
+.compose-editor-content .ProseMirror p {
+  margin: 0 0 0.7em;
+}
+.compose-editor-content .ProseMirror p:last-child {
+  margin-bottom: 0;
+}
+
 .compose-source-input {
   flex: 1 1 auto;
+  min-height: 0;
   display: block;
   padding: 18px 22px;
   border: 0;
   resize: none;
+  overflow-y: auto;
   background: transparent;
   color: var(--color-text-primary);
   font: inherit;
@@ -628,14 +809,19 @@ textarea:focus-visible {
 }
 
 .compose-quoted-reply-content {
-  max-height: 240px;
-  overflow: auto;
+  max-height: none;
+  overflow: visible;
   padding: 12px 14px;
   border-top: 1px solid var(--color-border);
   color: var(--color-text-secondary);
   font-size: 13px;
   line-height: 1.55;
   user-select: text;
+}
+
+/* 回复页使用外层 compose-scroll 的唯一滚动条，避免草稿、AI 指令和原文各自滚动。 */
+.compose-scroll .compose-quoted-reply--page-scroll {
+  overflow: visible;
 }
 
 .compose-quoted-reply-content blockquote {
@@ -652,7 +838,7 @@ textarea:focus-visible {
   margin-bottom: 0;
 }
 
-@media (max-width: 720px) {
+@media (max-width: 480px) {
   .compose-editor-toolbar-row,
   .compose-toolbar-tools {
     flex-wrap: wrap;
@@ -691,6 +877,62 @@ textarea:focus-visible {
   padding: 12px 18px;
   border-bottom: 1px solid var(--color-border);
   background: color-mix(in srgb, var(--color-bg) 94%, var(--color-bg-secondary));
+}
+
+.search-toolbar-wrap {
+  position: relative;
+  z-index: 20;
+}
+
+.search-suggestions-menu {
+  position: absolute;
+  top: calc(100% - 4px);
+  left: 12px;
+  width: min(430px, calc(100% - 24px));
+  background: var(--color-bg, #fff);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, .15);
+  overflow: hidden;
+  z-index: 30;
+}
+
+.search-suggestion-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-text-secondary);
+  text-align: left;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.search-suggestion-item:last-child { border-bottom: 0; }
+.search-suggestion-item:hover { background: var(--color-bg-hover); color: var(--color-text-primary); }
+.search-suggestion-item strong { margin-left: auto; color: var(--color-text-primary); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-smart-suggestions--legacy { display: none; }
+
+.search-filter-popover {
+  position: absolute;
+  top: calc(100% - 2px);
+  right: 12px;
+  width: min(720px, calc(100% - 24px));
+  max-height: min(70vh, 520px);
+  overflow: auto;
+  z-index: 25;
+  border-radius: 8px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, .15);
+}
+
+.search-filter-popover .search-filters-panel {
+  margin: 0;
+  border-radius: 8px;
+  background: var(--color-bg, #fff);
 }
 
 .search-input-shell {
@@ -745,6 +987,39 @@ textarea:focus-visible {
 
 .search-input::placeholder {
   color: color-mix(in srgb, var(--color-text-secondary) 82%, transparent);
+}
+
+.search-smart-suggestions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 7px 18px;
+  border-bottom: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-accent) 3%, var(--color-bg));
+}
+
+.search-smart-suggestions__label {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
+.search-smart-suggestions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 4px 9px;
+  background: var(--color-bg);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.search-smart-suggestions button:hover {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
 }
 
 .inbox-toolbar-row {
@@ -1047,4 +1322,95 @@ textarea:focus-visible {
   .search-filter-toggle {
     width: 100%;
   }
+}
+.home-summary-grid {
+  display: grid;
+  /* 自适应列数：右面板打开后主区变窄时自动换行，不再把右侧卡片挤出去 */
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+@media (max-width: 1050px) {
+  .home-summary-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Rendered AI / research output (markdown converted to readable HTML) */
+.markdown-body {
+  font-size: 13px;
+  line-height: 1.75;
+  color: var(--color-text-primary);
+  word-break: break-word;
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  margin: 12px 0 6px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.markdown-body h1 { font-size: 18px; }
+.markdown-body h2 { font-size: 16px; }
+.markdown-body p {
+  margin: 6px 0;
+}
+.markdown-body ul,
+.markdown-body ol {
+  margin: 6px 0;
+  padding-left: 22px;
+}
+.markdown-body li {
+  margin: 3px 0;
+}
+.markdown-body code {
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+.markdown-body pre {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+  padding: 10px;
+  overflow: auto;
+  margin: 8px 0;
+}
+.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+}
+.markdown-body blockquote {
+  margin: 8px 0;
+  padding: 2px 12px;
+  border-left: 3px solid var(--color-accent);
+  color: var(--color-text-secondary);
+}
+.markdown-body a {
+  color: var(--color-accent);
+  text-decoration: underline;
+}
+.markdown-body strong {
+  font-weight: 600;
+}
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid var(--color-border);
+  padding: 5px 9px;
+}
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--color-border);
+  margin: 10px 0;
 }

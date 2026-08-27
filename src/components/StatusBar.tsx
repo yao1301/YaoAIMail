@@ -1,17 +1,26 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { listen } from "@tauri-apps/api/event";
-import { AlertCircle, AppWindow, Clock, RefreshCw } from "lucide-react";
+import { AlertCircle, AppWindow, Clock, Mail, RefreshCw } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useUIStore, type RealtimeStatus } from "../stores/ui.store";
 import { useMailStore } from "@/stores/mail.store";
-import { stopSync } from "@/lib/api";
+import { useToastStore } from "@/stores/toast.store";
+import { listFolders, stopSync } from "@/lib/api";
 import { useSyncMutation } from "@/hooks/mutations/useSyncMutation";
 import {
   pendingMailOpsSummaryQueryKey,
+  useAccountsQuery,
+  useFoldersForAccountsQuery,
   usePendingMailOpsSummary,
 } from "@/hooks/queries";
+import { useFolderUnreadCountsForAccounts } from "@/hooks/queries/useFolderUnreadCounts";
+import { allAccountsFolderId, unreadCountForFolder } from "@/lib/folderAggregation";
+import {
+  currentFolderCacheRevision,
+  setFolderCacheIfCurrent,
+} from "@/lib/folderCache";
 
 interface MailErrorPayload {
   error_type: string;
@@ -31,9 +40,11 @@ interface MailNewPayload {
 
 interface SyncProgressPayload {
   account_id?: string;
-  status?: "started" | "completed" | "error";
+  status?: "started" | "completed" | "error" | "progress";
   phase?: string;
   message?: string | null;
+  total?: number | null;
+  received?: number | null;
 }
 
 interface SyncCompletePayload {
@@ -56,7 +67,14 @@ export default function StatusBar() {
   const syncMutation = useSyncMutation();
   const queryClient = useQueryClient();
   const { data: pendingOpsSummary } = usePendingMailOpsSummary(activeAccountId);
+  const { data: accounts = [] } = useAccountsQuery();
+  const accountIds = accounts.map((a) => a.id);
+  const { data: folders = [] } = useFoldersForAccountsQuery(accountIds);
+  const { data: unreadCounts = {} } = useFolderUnreadCountsForAccounts(accountIds);
+  const totalUnread = unreadCountForFolder(allAccountsFolderId("inbox"), folders, unreadCounts);
+  const [newMailFlash, setNewMailFlash] = useState(0);
   const syncStatusRef = useRef(syncStatus);
+  const [syncProgress, setSyncProgress] = useState<{ total: number; received: number } | null>(null);
 
   useEffect(() => {
     syncStatusRef.current = syncStatus;
@@ -71,19 +89,47 @@ export default function StatusBar() {
   useEffect(() => {
     const unlisten = listen<MailErrorPayload>("mail:error", (event) => {
       setLastMailError(event.payload.message);
+      useToastStore.getState().addToast({
+        message: t("status.mailErrorDetail", {
+          defaultValue: "Mail sync failed: {{message}}",
+          message: event.payload.message,
+        }),
+        type: "error",
+        duration: 12_000,
+      });
       // Auto-clear error after 10 seconds
       setTimeout(() => setLastMailError(null), 10_000);
     });
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [setLastMailError]);
+  }, [setLastMailError, t]);
 
-  function refreshMailQueries() {
+  async function refreshFolderCache(accountId?: string | null) {
+    const ids = accountId ? [accountId] : accountIds;
+    await Promise.all(
+      ids.map(async (id) => {
+        try {
+          const revision = currentFolderCacheRevision(id);
+          // Write the freshly-read list directly into the exact per-account
+          // cache used by the sidebar. This avoids leaving a multi-account
+          // tree on an old parent_id after a server-side folder rename.
+          const freshFolders = await listFolders(id);
+          setFolderCacheIfCurrent(queryClient, id, freshFolders, revision);
+        } catch {
+          // The existing invalidation path remains the fallback when the
+          // account is temporarily offline.
+        }
+      }),
+    );
+  }
+
+  function refreshMailQueries(accountId?: string | null) {
     queryClient.invalidateQueries({ queryKey: ["folders"] });
     queryClient.invalidateQueries({ queryKey: ["messages"] });
     queryClient.invalidateQueries({ queryKey: ["threads"] });
     queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
+    void refreshFolderCache(accountId);
   }
 
   function isActiveAccountEvent(accountId?: string | null) {
@@ -97,7 +143,7 @@ export default function StatusBar() {
       if (syncStatusRef.current !== "error") {
         updateSyncStatus("idle");
       }
-      refreshMailQueries();
+      void refreshMailQueries(event.payload?.account_id);
     });
     return () => { unlisten.then((fn) => fn()); };
   }, [activeAccountId, setSyncStatus, queryClient]);
@@ -106,14 +152,22 @@ export default function StatusBar() {
   // UI "syncing" must track a concrete pass rather than worker lifetime.
   useEffect(() => {
     const unlisten = listen<SyncProgressPayload>("mail:sync-progress", (event) => {
-      const { account_id, status, message } = event.payload;
+      const { account_id, status, message, total, received } = event.payload;
       if (!isActiveAccountEvent(account_id)) return;
       if (status === "started") {
+        setSyncProgress(null);
         updateSyncStatus("syncing");
+      } else if (status === "progress") {
+        updateSyncStatus("syncing");
+        if (typeof total === "number" && typeof received === "number" && total > 0) {
+          setSyncProgress({ total, received });
+        }
       } else if (status === "completed") {
+        setSyncProgress(null);
         updateSyncStatus("idle");
-        refreshMailQueries();
+        void refreshMailQueries(account_id);
       } else if (status === "error") {
+        setSyncProgress(null);
         updateSyncStatus("error");
         if (message) {
           setLastMailError(message);
@@ -123,7 +177,7 @@ export default function StatusBar() {
     return () => { unlisten.then((fn) => fn()); };
   }, [activeAccountId, setLastMailError, setSyncStatus, queryClient]);
 
-  // Listen for new mail events: incremental data refresh
+  // Listen for new mail events: incremental data refresh + flash badge
   useEffect(() => {
     const unlisten = listen<MailNewPayload>("mail:new", (event) => {
       queryClient.invalidateQueries({ queryKey: ["messages"] });
@@ -132,7 +186,26 @@ export default function StatusBar() {
         queryClient.invalidateQueries({ queryKey: ["folders", event.payload.account_id] });
         queryClient.invalidateQueries({ queryKey: ["folder-unread-counts", event.payload.account_id] });
       }
+      queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
+      setNewMailFlash((n) => n + 1);
     });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [queryClient]);
+
+  // Listen for bulk flag changes (mark_all_read etc.) so the UI reflects the
+  // new is_read state without waiting for the next sync cycle.
+  useEffect(() => {
+    const unlisten = listen<{ account_id?: string; folder_id?: string; kind?: string; count?: number }>(
+      "mail:flags-changed",
+      (event) => {
+        queryClient.invalidateQueries({ queryKey: ["messages"] });
+        queryClient.invalidateQueries({ queryKey: ["threads"] });
+        if (event.payload.account_id) {
+          queryClient.invalidateQueries({ queryKey: ["folder-unread-counts", event.payload.account_id] });
+        }
+        queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
+      },
+    );
     return () => { unlisten.then((fn) => fn()); };
   }, [queryClient]);
 
@@ -221,6 +294,11 @@ export default function StatusBar() {
       ) : (
         <>
           <span role="status" aria-live="polite" aria-atomic="true">{syncText}</span>
+          {syncProgress && syncProgress.total > 0 && (
+            <span role="status" aria-live="polite" aria-atomic="true" style={{ color: "var(--color-accent)" }}>
+              历史同步 {Math.min(syncProgress.received, syncProgress.total).toLocaleString()} / {syncProgress.total.toLocaleString()}
+            </span>
+          )}
           {realtimeStatusText && (
             <span
               role="status"
@@ -291,7 +369,45 @@ export default function StatusBar() {
         </span>
       )}
 
-      <span className="ml-auto flex items-center gap-1">
+      <span className="ml-auto flex items-center gap-2">
+        {/* Unread mail indicator */}
+        <button
+          type="button"
+          onClick={() => useUIStore.getState().setActiveView("inbox")}
+          aria-label={totalUnread > 0 ? `${totalUnread} 封未读邮件` : "没有未读邮件"}
+          title={
+            totalUnread > 0
+              ? `${totalUnread} 封未读邮件，点击查看所有未读`
+              : "没有未读邮件"
+          }
+          style={{
+            position: "relative",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "1px 5px 1px 4px",
+            border: "1px solid color-mix(in srgb, var(--color-border) 80%, transparent)",
+            borderRadius: 10,
+            background: totalUnread > 0
+              ? newMailFlash > 0
+                ? "rgba(37,99,235,0.18)"
+                : "color-mix(in srgb, var(--color-accent) 10%, transparent)"
+              : "transparent",
+            color: totalUnread > 0 ? "var(--color-accent)" : "var(--color-text-secondary)",
+            cursor: "pointer",
+            transition: "background-color 0.4s",
+            fontSize: 11,
+            fontWeight: 600,
+            lineHeight: 1.4,
+            minWidth: 32,
+            height: 20,
+          }}
+        >
+          <Mail aria-hidden="true" size={12} />
+          <span style={{ marginLeft: 4 }}>
+            {totalUnread > 0 ? totalUnread.toLocaleString() : "0"}
+          </span>
+        </button>
         <button
           type="button"
           onClick={() => setKeepRunningInBackground(!keepRunningInBackground)}

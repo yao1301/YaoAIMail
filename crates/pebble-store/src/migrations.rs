@@ -2,7 +2,10 @@ use pebble_core::{build_snippet, PebbleError, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 
-const CURRENT_VERSION: u32 = 14;
+// Keep this in sync with the last migration below. The project already has
+// V16-V18 migrations; leaving this at 15 makes version bookkeeping report a
+// stale schema and makes future migration behavior ambiguous.
+const CURRENT_VERSION: u32 = 22;
 const ACCOUNT_COLOR_PRESETS: [&str; 12] = [
     "#0ea5e9", "#22c55e", "#f59e0b", "#8b5cf6", "#f43f5e", "#14b8a6", "#6366f1", "#f97316",
     "#06b6d4", "#ec4899", "#84cc16", "#3b82f6",
@@ -433,6 +436,178 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 14)?;
         tx.commit()
             .map_err(|e| PebbleError::Storage(format!("Migration V14 commit failed: {e}")))?;
+    }
+
+    // V15: IMAP UIDs are unique only inside one mailbox. The V14 account-wide
+    // unique index caused different folders (for example INBOX and Sent) to
+    // collide whenever they reused the same UID. Keep a normal lookup index;
+    // folder-scoped deduplication is handled through message_folders.
+    if version < 15 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V15 begin failed: {e}")))?;
+        tx.execute_batch(
+            "DROP INDEX IF EXISTS idx_messages_account_remote_unique;
+             DROP INDEX IF EXISTS idx_messages_account_remote;
+             CREATE INDEX IF NOT EXISTS idx_messages_account_remote
+               ON messages(account_id, remote_id);",
+        )
+        .map_err(|e| PebbleError::Storage(format!("Migration V15 failed: {e}")))?;
+        set_schema_version(&tx, 15)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V15 commit failed: {e}")))?;
+    }
+
+    // V16: 附件按需下载——attachments 加 remote_part（IMAP BODY part 路径）。
+    // 大邮件不再整体拉取（45s 超时），正文与附件分离：附件元数据先入库
+    // （local_path 为空），点击时按 remote_part 从服务器拉取该 part。
+    if version < 16 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V16 begin failed: {e}")))?;
+        let has_remote_part: bool = tx
+            .prepare("SELECT remote_part FROM attachments LIMIT 0")
+            .is_ok();
+        if !has_remote_part {
+            tx.execute_batch("ALTER TABLE attachments ADD COLUMN remote_part TEXT;")
+                .map_err(|e| PebbleError::Storage(format!("Migration V16 failed: {e}")))?;
+        }
+        set_schema_version(&tx, 16)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V16 commit failed: {e}")))?;
+    }
+
+    if version < 17 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V17 begin failed: {e}")))?;
+        // 修复历史 bug：IMAP 文件夹发现曾把文件夹一律硬编码 is_system=1，
+        // 导致用户自定义文件夹（Alibaba/RSG/WASH GEC/Trash 子文件夹等）
+        // 被当成系统文件夹，右键菜单无法删除/重命名。
+        // 只有带系统角色（inbox/sent/trash 等）的文件夹才算系统文件夹。
+        tx.execute_batch("UPDATE folders SET is_system = 0 WHERE is_system = 1 AND role IS NULL;")
+            .map_err(|e| PebbleError::Storage(format!("Migration V17 failed: {e}")))?;
+        set_schema_version(&tx, 17)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V17 commit failed: {e}")))?;
+    }
+
+    if version < 18 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V18 begin failed: {e}")))?;
+        // 规则按账号管理：rules 表加 account_id 列（NULL=所有账号兼容旧数据），
+        // 同步新增 trigger_when 字段（暂存 JSON 文本，类型由前端定义）。
+        let has_account_id: bool = tx
+            .prepare("SELECT account_id FROM rules LIMIT 0")
+            .is_ok();
+        if !has_account_id {
+            tx.execute_batch("ALTER TABLE rules ADD COLUMN account_id TEXT;")
+                .map_err(|e| PebbleError::Storage(format!("Migration V18 failed: {e}")))?;
+        }
+        let has_trigger_when: bool = tx
+            .prepare("SELECT trigger_when FROM rules LIMIT 0")
+            .is_ok();
+        if !has_trigger_when {
+            tx.execute_batch("ALTER TABLE rules ADD COLUMN trigger_when TEXT NOT NULL DEFAULT '[]';")
+                .map_err(|e| PebbleError::Storage(format!("Migration V18 trigger_when failed: {e}")))?;
+        }
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_rules_account_id ON rules(account_id);")
+            .map_err(|e| PebbleError::Storage(format!("Migration V18 index failed: {e}")))?;
+        set_schema_version(&tx, 18)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V18 commit failed: {e}")))?;
+    }
+
+    // V19: durable full-body hydration queue. The old implementation inferred
+    // pending work from messages.remote_version = 'headers-only'. Keep that
+    // field for compatibility, but persist attempts, priority and retry time
+    // so a restart cannot lose the download backlog or repeatedly hammer a
+    // failing mailbox.
+    if version < 19 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V19 begin failed: {e}")))?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS body_download_jobs (
+                message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                account_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority INTEGER NOT NULL DEFAULT 100,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_body_jobs_ready
+                ON body_download_jobs(account_id, status, priority, next_attempt_at);
+            INSERT OR IGNORE INTO body_download_jobs
+                (message_id, account_id, status, priority, attempts, next_attempt_at, created_at, updated_at)
+                SELECT id, account_id, 'pending', 100, 0, 0, created_at, updated_at
+                FROM messages
+                WHERE remote_version = 'headers-only' AND is_deleted = 0;",
+        )
+        .map_err(|e| PebbleError::Storage(format!("Migration V19 failed: {e}")))?;
+        set_schema_version(&tx, 19)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V19 commit failed: {e}")))?;
+    }
+
+    // V20: reply annotation runs for every visible message page. Index the
+    // lookup columns so opening a large folder does not scan the whole table.
+    if version < 20 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V20 begin failed: {e}")))?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_account_in_reply_to
+             ON messages(account_id, in_reply_to)
+             WHERE is_deleted = 0 AND is_draft = 0;",
+        )
+        .map_err(|e| PebbleError::Storage(format!("Migration V20 failed: {e}")))?;
+        set_schema_version(&tx, 20)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V20 commit failed: {e}")))?;
+    }
+
+    // V21: IMAP MOVE assigns a new UID in the destination mailbox. A
+    // composite Message-ID lookup lets sync cheaply rebind locally moved
+    // messages to that destination UID and collapse legacy duplicate rows.
+    if version < 21 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V21 begin failed: {e}")))?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_account_message_id_live
+             ON messages(account_id, message_id_header)
+             WHERE is_deleted = 0 AND message_id_header IS NOT NULL;",
+        )
+        .map_err(|e| PebbleError::Storage(format!("Migration V21 failed: {e}")))?;
+        set_schema_version(&tx, 21)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V21 commit failed: {e}")))?;
+    }
+
+    // V22: old workers could leave body jobs active after their message was
+    // soft-deleted or hydrated through another path. They were harmless but
+    // made diagnostics noisy and could be reclaimed after a restart.
+    if version < 22 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V22 begin failed: {e}")))?;
+        tx.execute_batch(
+            "UPDATE body_download_jobs
+             SET status = 'done', updated_at = unixepoch()
+             WHERE message_id IN (
+               SELECT id FROM messages
+               WHERE is_deleted = 1 OR remote_version IS NULL OR remote_version <> 'headers-only'
+             );",
+        )
+        .map_err(|e| PebbleError::Storage(format!("Migration V22 failed: {e}")))?;
+        set_schema_version(&tx, 22)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V22 commit failed: {e}")))?;
     }
 
     Ok(())

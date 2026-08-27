@@ -57,7 +57,14 @@ pub(super) fn queue_pending_remote_op(
         &payload.to_string(),
     )?;
     state.store.mark_pending_mail_op_failed(&op_id, error)?;
-    Ok(RemoteMutationOutcome::Queued)
+    // Normal delete is safe to commit locally even when the server is temporarily
+    // unavailable: the pending operation will retry the remote move later. A
+    // permanent delete deliberately keeps the stricter error semantics.
+    if op_type == "delete" {
+        Ok(RemoteMutationOutcome::QueuedLocalCommit)
+    } else {
+        Ok(RemoteMutationOutcome::Queued)
+    }
 }
 
 pub(super) fn queue_pending_remote_op_for_local_commit(
@@ -68,8 +75,12 @@ pub(super) fn queue_pending_remote_op_for_local_commit(
     error: &str,
 ) -> std::result::Result<RemoteMutationOutcome, PebbleError> {
     let outcome = queue_pending_remote_op(state, message, op_type, payload, error)?;
-    debug_assert_eq!(outcome, RemoteMutationOutcome::Queued);
-    Ok(RemoteMutationOutcome::QueuedLocalCommit)
+    Ok(match outcome {
+        RemoteMutationOutcome::Queued | RemoteMutationOutcome::QueuedLocalCommit => {
+            RemoteMutationOutcome::QueuedLocalCommit
+        }
+        other => other,
+    })
 }
 
 pub(super) fn queued_remote_error(op_type: &str, error: &str) -> PebbleError {
@@ -216,7 +227,7 @@ pub(super) fn load_imap_config(
 }
 
 /// Resolve an IMAP connection from the account's auth data.
-pub(super) async fn connect_imap(
+pub(crate) async fn connect_imap(
     state: &AppState,
     account_id: &str,
 ) -> std::result::Result<ImapProvider, PebbleError> {
@@ -273,7 +284,7 @@ pub(super) fn find_folder_by_role(
 }
 
 /// Find the folder containing a given message (via the message_folders junction table).
-pub(super) fn find_message_folder(
+pub(crate) fn find_message_folder(
     state: &AppState,
     message_id: &str,
     account_id: &str,

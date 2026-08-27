@@ -129,9 +129,6 @@ export function useKeyboard() {
         case "toggle-view-inbox":
           confirmLeaveCompose().then((ok) => { if (ok) navigateAfterComposeConfirm("inbox"); });
           break;
-        case "toggle-view-kanban":
-          confirmLeaveCompose().then((ok) => { if (ok) navigateAfterComposeConfirm("kanban"); });
-          break;
         case "toggle-star": {
           const { selectedMessageId } = useMailStore.getState();
           if (selectedMessageId) {

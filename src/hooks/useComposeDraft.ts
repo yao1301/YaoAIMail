@@ -53,10 +53,15 @@ interface UseComposeDraftArgs {
    * true, the snapshot would compare user edits against an empty string and
    * falsely report the compose as dirty. */
   editorReady: boolean;
+  existingDraftId?: string;
+  /** 写信标签 id（多标签模式）：dirty 标记只写回对应标签。 */
+  tabId?: string;
 }
 
 export function useComposeDraft({
   to, cc, bcc, subject, rawSource, richTextHtml, editorMode, composeMode, fromAccountId, attachments, editorReady,
+  existingDraftId,
+  tabId,
 }: UseComposeDraftArgs) {
   // Snapshot the initial compose state so pre-populated reply/forward
   // fields don't immediately trigger the "unsaved draft" guard.
@@ -91,9 +96,11 @@ export function useComposeDraft({
   // Ref to track the server-side draft ID across saves.
   // Scoped per account: when the user switches From, the prior draft_id
   // belongs to a different account and must not be reused.
-  const draftIdRef = useRef<string | null>(null);
+  const draftIdRef = useRef<string | null>(existingDraftId ?? null);
   const draftAccountRef = useRef<string | null>(null);
-  const draftIdsByAccountRef = useRef<Record<string, string>>({});
+  const draftIdsByAccountRef = useRef<Record<string, string>>(
+    existingDraftId && fromAccountId ? { [fromAccountId]: existingDraftId } : {},
+  );
   const saveGenerationByAccountRef = useRef<Record<string, number>>({});
   if (draftAccountRef.current !== fromAccountId) {
     draftAccountRef.current = fromAccountId;
@@ -113,8 +120,8 @@ export function useComposeDraft({
       rawSource !== init.rawSource ||
       richTextHtml !== init.richTextHtml ||
       !attachmentsEqual(attachments, init.attachments);
-    useComposeStore.getState().setComposeDirty(userChanged);
-  }, [arraysEqual, attachments, attachmentsEqual, bcc, cc, rawSource, richTextHtml, subject, to, editorReady]);
+    useComposeStore.getState().setComposeDirty(userChanged, tabId);
+  }, [arraysEqual, attachments, attachmentsEqual, bcc, cc, rawSource, richTextHtml, subject, to, editorReady, tabId]);
 
   // Auto-save draft to backend (debounced 3s). Do not persist plaintext draft
   // data in WebView storage.

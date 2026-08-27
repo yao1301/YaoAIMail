@@ -30,13 +30,15 @@ export function useComposeRecipients({
   // Prefer the draft's original accountId when available — the draft body was
   // authored under that account, so restoring it under the active account
   // would silently misattribute the message.
-  const [fromAccountId, setFromAccountId] = useState(restoredDraft?.accountId || activeAccountId || "");
+  const [fromAccountId, setFromAccountId] = useState(
+    restoredDraft?.accountId || composeReplyTo?.account_id || activeAccountId || "",
+  );
   const currentAccount = accounts.find((a) => a.id === fromAccountId);
   const myEmail = currentAccount?.email || "";
 
   const [to, setTo] = useState<string[]>(() => {
     if (restoredDraft) return restoredDraft.to ?? [];
-    if (composePrefill) return composePrefill.to ?? [];
+    if (composePrefill?.to) return composePrefill.to;
     if (!composeReplyTo) return [];
     if (composeMode === "reply") return [composeReplyTo.from_address];
     if (composeMode === "reply-all") {
@@ -48,7 +50,7 @@ export function useComposeRecipients({
 
   const [cc, setCc] = useState<string[]>(() => {
     if (restoredDraft) return restoredDraft.cc ?? [];
-    if (composePrefill) return composePrefill.cc ?? [];
+    if (composePrefill?.cc) return composePrefill.cc;
     if (composeMode === "reply-all" && composeReplyTo) {
       return composeReplyTo.cc_list.map((a) => a.address).filter((addr) => addr !== myEmail);
     }
@@ -56,8 +58,9 @@ export function useComposeRecipients({
   });
 
   const [bcc, setBcc] = useState<string[]>(restoredDraft?.bcc ?? composePrefill?.bcc ?? []);
-  const [showCc, setShowCc] = useState(() => cc.length > 0);
-  const [showBcc, setShowBcc] = useState(false);
+  // 抄送/密送默认展开，方便检查
+  const [showCc, setShowCc] = useState(() => cc.length > 0 || true);
+  const [showBcc, setShowBcc] = useState(true);
 
   // Re-calculate from/to/cc once accounts data loads (fixes reply-all with async data)
   useEffect(() => {

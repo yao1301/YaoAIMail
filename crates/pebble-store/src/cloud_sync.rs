@@ -307,7 +307,7 @@ impl Store {
             })
             .collect();
 
-        let rules = self.list_rules()?;
+        let rules = self.list_rules("")?;
         let kanban_cards = self.list_kanban_cards(None)?;
         // Redact translate config — never export API keys or encrypted secrets
         let translate_config = self.get_translate_config()?.map(|mut tc| {
@@ -646,6 +646,8 @@ mod tests {
             conditions: r#"{"from":"noreply@example.com"}"#.to_string(),
             actions: r#"["archive"]"#.to_string(),
             is_enabled: true,
+            account_id: String::new(),
+            trigger_when: "[]".to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -685,7 +687,7 @@ mod tests {
         assert_eq!(accounts[0].email, "test@example.com");
         assert_eq!(accounts[0].color.as_deref(), Some("#22c55e"));
 
-        let rules = store2.list_rules().unwrap();
+        let rules = store2.list_rules("").unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].name, "Auto-archive");
 
@@ -820,6 +822,8 @@ mod tests {
             conditions: "{}".to_string(),
             actions: "[]".to_string(),
             is_enabled: true,
+            account_id: String::new(),
+            trigger_when: "[]".to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -837,6 +841,8 @@ mod tests {
                 conditions: "{}".to_string(),
                 actions: "[]".to_string(),
                 is_enabled: false,
+                account_id: String::new(),
+                trigger_when: "[]".to_string(),
                 created_at: now,
                 updated_at: now,
             }],
@@ -849,7 +855,7 @@ mod tests {
         let data = serde_json::to_vec(&backup).unwrap();
         store.import_settings(&data).unwrap();
 
-        let rules = store.list_rules().unwrap();
+        let rules = store.list_rules("").unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].name, "New Rule");
     }
@@ -866,6 +872,8 @@ mod tests {
             conditions: "{}".to_string(),
             actions: "[]".to_string(),
             is_enabled: true,
+            account_id: String::new(),
+            trigger_when: "[]".to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -882,6 +890,8 @@ mod tests {
                 conditions: "{}".to_string(),
                 actions: "[]".to_string(),
                 is_enabled: false,
+                account_id: String::new(),
+                trigger_when: "[]".to_string(),
                 created_at: now,
                 updated_at: now,
             }],
@@ -909,7 +919,7 @@ mod tests {
             .to_string();
 
         assert!(err.contains("missing-account"));
-        let rules = store.list_rules().unwrap();
+        let rules = store.list_rules("").unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].name, "Old Rule");
     }

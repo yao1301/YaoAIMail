@@ -3,6 +3,51 @@ use pebble_core::{Attachment, PebbleError};
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, State};
 
+fn attachment_relative_tail(stored_path: &Path) -> Option<PathBuf> {
+    let components = stored_path.components().collect::<Vec<_>>();
+    let marker = components.iter().position(|component| {
+        component.as_os_str().to_string_lossy().eq_ignore_ascii_case("attachments")
+    })?;
+    let mut tail = PathBuf::new();
+    for component in components.into_iter().skip(marker + 1) {
+        match component {
+            std::path::Component::Normal(value) => tail.push(value),
+            _ => return None,
+        }
+    }
+    (!tail.as_os_str().is_empty()).then_some(tail)
+}
+
+fn resolve_attachment_file(attachments_dir: &Path, stored_path: &str) -> Result<(PathBuf, bool), PebbleError> {
+    let allowed_root = attachments_dir
+        .canonicalize()
+        .map_err(|error| PebbleError::Internal(format!("Attachment directory is unavailable: {error}")))?;
+    let original = Path::new(stored_path);
+    if let Ok(canonical) = original.canonicalize() {
+        if canonical.starts_with(&allowed_root) && canonical.is_file() {
+            return Ok((canonical, false));
+        }
+    }
+    let tail = attachment_relative_tail(original)
+        .ok_or_else(|| PebbleError::Internal("Attachment file not available: stored path cannot be relocated".to_string()))?;
+    let relocated = allowed_root.join(tail).canonicalize()
+        .map_err(|error| PebbleError::Internal(format!("Attachment file not available: {error}")))?;
+    if !relocated.starts_with(&allowed_root) || !relocated.is_file() {
+        return Err(PebbleError::Validation("Attachment path is outside the local attachment directory".to_string()));
+    }
+    Ok((relocated, true))
+}
+
+fn resolve_and_repair_attachment_path(state: &AppState, attachment: &Attachment) -> Result<PathBuf, PebbleError> {
+    let stored_path = attachment.local_path.as_deref()
+        .ok_or_else(|| PebbleError::Internal("Attachment file not available".to_string()))?;
+    let (resolved, relocated) = resolve_attachment_file(&state.attachments_dir, stored_path)?;
+    if relocated {
+        state.store.update_attachment_local_path(&attachment.id, &resolved.to_string_lossy())?;
+    }
+    Ok(resolved)
+}
+
 fn is_windows_reserved_name(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_uppercase().as_str(),
@@ -310,8 +355,59 @@ pub async fn get_attachment_path(
     state: State<'_, AppState>,
     attachment_id: String,
 ) -> std::result::Result<Option<String>, PebbleError> {
-    let att = state.store.get_attachment(&attachment_id)?;
-    Ok(att.and_then(|a| a.local_path))
+    let Some(att) = state.store.get_attachment(&attachment_id)? else { return Ok(None); };
+    Ok(Some(resolve_and_repair_attachment_path(&state, &att)?.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+pub async fn get_attachment_drag_icon_path(
+    state: State<'_, AppState>,
+) -> std::result::Result<String, PebbleError> {
+    let system_dir = state.attachments_dir.join(".system");
+    std::fs::create_dir_all(&system_dir)
+        .map_err(|error| PebbleError::Internal(format!("Cannot create attachment UI directory: {error}")))?;
+    let icon_path = system_dir.join("drag-icon.png");
+    if !icon_path.is_file() {
+        std::fs::write(&icon_path, include_bytes!("../../icons/icon.png"))
+            .map_err(|error| PebbleError::Internal(format!("Cannot create attachment drag icon: {error}")))?;
+    }
+    Ok(icon_path.to_string_lossy().to_string())
+}
+
+/// Read a previously downloaded attachment's raw bytes (used when dragging an
+/// attachment into the AI writing context box). The file must live inside the
+/// local attachments directory; returns its name, MIME type and raw bytes.
+#[tauri::command]
+pub async fn read_attachment_file(
+    state: State<'_, AppState>,
+    attachment_id: String,
+) -> std::result::Result<serde_json::Value, PebbleError> {
+    let attachment = state
+        .store
+        .get_attachment(&attachment_id)?
+        .ok_or_else(|| PebbleError::Internal("Attachment not found".to_string()))?;
+    let canonical = resolve_and_repair_attachment_path(&state, &attachment)?;
+    let bytes = std::fs::read(&canonical)
+        .map_err(|error| PebbleError::Internal(format!("Failed to read attachment: {error}")))?;
+    Ok(serde_json::json!({
+        "name": attachment.filename,
+        "mime_type": attachment.mime_type,
+        "bytes": bytes,
+    }))
+}
+
+#[tauri::command]
+pub async fn open_attachment(
+    state: State<'_, AppState>,
+    attachment_id: String,
+) -> std::result::Result<(), PebbleError> {
+    let attachment = state
+        .store
+        .get_attachment(&attachment_id)?
+        .ok_or_else(|| PebbleError::Internal("Attachment not found".to_string()))?;
+    let canonical = resolve_and_repair_attachment_path(&state, &attachment)?;
+    opener::open(&canonical)
+        .map_err(|error| PebbleError::Internal(format!("Failed to open attachment: {error}")))
 }
 
 #[tauri::command]
@@ -328,9 +424,7 @@ pub async fn download_attachment(
     // Validate save path to prevent path traversal
     validate_save_path(&save_to)?;
 
-    let source = att
-        .local_path
-        .ok_or_else(|| PebbleError::Internal("Attachment file not available".to_string()))?;
+    let source = resolve_and_repair_attachment_path(&state, &att)?.to_string_lossy().to_string();
 
     let att_id = attachment_id.clone();
     // Use spawn_blocking to avoid blocking the async executor on large files
@@ -374,9 +468,179 @@ pub async fn download_attachment(
     Ok(actual_path.to_string_lossy().to_string())
 }
 
+fn resolve_local_attachment_paths(
+    state: &AppState,
+    attachment_ids: &[String],
+) -> Result<Vec<(String, PathBuf)>, PebbleError> {
+    if attachment_ids.is_empty() {
+        return Err(PebbleError::Validation("未选择附件".to_string()));
+    }
+    attachment_ids
+        .iter()
+        .map(|id| {
+            let attachment = state
+                .store
+                .get_attachment(id)?
+                .ok_or_else(|| PebbleError::Internal("Attachment not found".to_string()))?;
+            let canonical = resolve_and_repair_attachment_path(state, &attachment)?;
+            Ok((sanitize_stored_filename(&attachment.filename), canonical))
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn save_attachments_as(
+    state: State<'_, AppState>,
+    attachment_ids: Vec<String>,
+) -> Result<Vec<String>, PebbleError> {
+    let items = resolve_local_attachment_paths(&state, &attachment_ids)?;
+    if items.len() == 1 {
+        let (filename, source) = &items[0];
+        let target = rfd::FileDialog::new()
+            .set_file_name(filename)
+            .save_file()
+            .ok_or_else(|| PebbleError::Validation("已取消保存附件".to_string()))?;
+        validate_save_path(&target.to_string_lossy())?;
+        let saved = copy_attachment_file_safely(source, &target, |_copied, _total| {})?;
+        return Ok(vec![saved.to_string_lossy().to_string()]);
+    }
+
+    let folder = rfd::FileDialog::new()
+        .set_title("选择附件保存文件夹")
+        .pick_folder()
+        .ok_or_else(|| PebbleError::Validation("已取消保存附件".to_string()))?;
+    let mut saved = Vec::with_capacity(items.len());
+    for (filename, source) in items {
+        let target = folder.join(filename);
+        validate_save_path(&target.to_string_lossy())?;
+        saved.push(copy_attachment_file_safely(&source, &target, |_copied, _total| {})?
+            .to_string_lossy()
+            .to_string());
+    }
+    Ok(saved)
+}
+
+#[cfg(windows)]
+fn windows_shell_path(path: &Path) -> PathBuf {
+    let display = path.to_string_lossy();
+    if let Some(rest) = display.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = display.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
+#[cfg(windows)]
+fn copy_files_to_windows_clipboard(paths: &[PathBuf]) -> Result<(), PebbleError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::IDataObject;
+    use windows::Win32::System::Ole::{OleFlushClipboard, OleInitialize, OleSetClipboard, OleUninitialize};
+    use windows::Win32::UI::Shell::{
+        Common::ITEMIDLIST, BHID_DataObject, ILCreateFromPathW, ILFree,
+        SHCreateShellItemArrayFromIDLists,
+    };
+
+    // canonicalize() deliberately returns verbatim (\\?\) paths on Windows.
+    // They are ideal for filesystem I/O but Shell PIDL parsing expects the
+    // ordinary drive-letter or UNC spelling.
+    let owned_paths = paths.iter().map(|path| windows_shell_path(path)).collect::<Vec<_>>();
+    std::thread::spawn(move || -> Result<(), String> {
+        unsafe { OleInitialize(None) }.map_err(|error| format!("无法初始化系统剪贴板：{error}"))?;
+
+        let result = (|| -> Result<(), String> {
+            let mut pidls: Vec<*mut ITEMIDLIST> = Vec::with_capacity(owned_paths.len());
+            for path in &owned_paths {
+                let wide = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+                let pidl = unsafe { ILCreateFromPathW(PCWSTR::from_raw(wide.as_ptr())) };
+                if pidl.is_null() {
+                    for allocated in pidls.drain(..) {
+                        unsafe { ILFree(Some(allocated)) };
+                    }
+                    return Err("Windows 无法识别附件文件路径".to_string());
+                }
+                pidls.push(pidl);
+            }
+
+            let pidl_refs = pidls.iter().map(|pidl| (*pidl).cast_const()).collect::<Vec<_>>();
+            let shell_items = unsafe { SHCreateShellItemArrayFromIDLists(&pidl_refs) };
+            for pidl in pidls {
+                unsafe { ILFree(Some(pidl)) };
+            }
+            let shell_items = shell_items.map_err(|error| format!("无法创建 Windows 文件对象：{error}"))?;
+            let data_object: IDataObject = unsafe { shell_items.BindToHandler(None, &BHID_DataObject) }
+                .map_err(|error| format!("无法创建资源管理器剪贴板对象：{error}"))?;
+            unsafe { OleSetClipboard(&data_object) }
+                .map_err(|error| format!("无法写入系统剪贴板：{error}"))?;
+            unsafe { OleFlushClipboard() }
+                .map_err(|error| format!("无法保存系统剪贴板内容：{error}"))?;
+            Ok(())
+        })();
+
+        unsafe { OleUninitialize() };
+        result
+    })
+    .join()
+    .map_err(|_| PebbleError::Internal("系统剪贴板线程异常退出".to_string()))?
+    .map_err(PebbleError::Internal)
+}
+
+#[tauri::command]
+pub async fn copy_attachments_to_clipboard(
+    state: State<'_, AppState>,
+    attachment_ids: Vec<String>,
+) -> Result<(), PebbleError> {
+    let items = resolve_local_attachment_paths(&state, &attachment_ids)?;
+    #[cfg(windows)]
+    { return copy_files_to_windows_clipboard(&items.into_iter().map(|(_, path)| path).collect::<Vec<_>>()); }
+    #[cfg(not(windows))]
+    {
+        let _ = items;
+        Err(PebbleError::Validation("当前系统暂不支持复制文件到系统剪贴板".to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn converts_verbatim_paths_for_windows_shell() {
+        assert_eq!(windows_shell_path(Path::new(r"\\?\D:\MailData\attachments\file.pdf")), PathBuf::from(r"D:\MailData\attachments\file.pdf"));
+        assert_eq!(windows_shell_path(Path::new(r"\\?\UNC\server\share\file.pdf")), PathBuf::from(r"\\server\share\file.pdf"));
+    }
+
+    #[test]
+    fn relocates_an_attachment_from_an_old_profile_root() {
+        let unique = pebble_core::new_id();
+        let base = std::env::temp_dir().join(format!("pebble-attachment-relocate-{unique}"));
+        let root = base.join("attachments");
+        let actual = root.join("message-1").join("history.pdf");
+        std::fs::create_dir_all(actual.parent().unwrap()).expect("attachment dir");
+        std::fs::write(&actual, b"history").expect("attachment write");
+        let old = PathBuf::from("D:\\OldProfile\\attachments\\message-1\\history.pdf");
+
+        let (resolved, relocated) = resolve_attachment_file(&root, &old.to_string_lossy()).expect("relocate");
+
+        assert!(relocated);
+        assert_eq!(resolved, actual.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn relocation_rejects_parent_directory_components() {
+        let unique = pebble_core::new_id();
+        let base = std::env::temp_dir().join(format!("pebble-attachment-traversal-{unique}"));
+        let root = base.join("attachments");
+        std::fs::create_dir_all(&root).expect("attachment dir");
+        let old = PathBuf::from("D:\\OldProfile\\attachments\\..\\outside.txt");
+
+        assert!(resolve_attachment_file(&root, &old.to_string_lossy()).is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn copy_attachment_file_safely_uses_unique_target_when_requested_name_exists() {

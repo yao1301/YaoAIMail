@@ -46,7 +46,7 @@ export default function TitleBar() {
           className="text-sm font-semibold"
           style={{ color: "var(--color-text-primary)" }}
         >
-          Pebble
+          YaoAIMail
         </span>
       </div>
       {!isMac && (

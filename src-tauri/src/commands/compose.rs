@@ -13,6 +13,7 @@ use pebble_core::{
 use pebble_crypto::CryptoService;
 use pebble_mail::{smtp::SmtpSender, SmtpConfig};
 use pebble_mail::{GmailProvider, OutlookProvider};
+use pebble_rules::RuleTrigger;
 use pebble_store::Store;
 use tauri::{Emitter, State};
 use tracing::warn;
@@ -140,7 +141,10 @@ pub(crate) fn save_outgoing_message_locally(
         id: id.clone(),
         account_id: account.id.clone(),
         remote_id: format!("{prefix}-{id}"),
-        message_id_header: Some(format!("<{id}@pebble.local>")),
+        // 用发送时生成的真实 Message-ID（与 SMTP/服务器 Sent 副本一致），
+        // 保证同步去重能匹配，避免"已发送"出现两封。退回默认再生成一个。
+        message_id_header: outgoing.message_id.clone()
+            .or_else(|| Some(format!("<{id}@pebble.local>"))),
         in_reply_to: outgoing.in_reply_to.clone(),
         references_header: outgoing.in_reply_to.clone(),
         thread_id: None,
@@ -169,7 +173,7 @@ pub(crate) fn save_outgoing_message_locally(
     Ok(message)
 }
 
-fn save_outgoing_message_and_refresh_search(
+pub(crate) fn save_outgoing_message_and_refresh_search(
     state: &AppState,
     account: &Account,
     outgoing: &OutgoingMessage,
@@ -183,6 +187,24 @@ fn save_outgoing_message_and_refresh_search(
         outgoing_state,
         attachments_dir,
     )?;
+    if outgoing_state == LocalOutgoingState::Sent {
+        match crate::commands::rules::apply_rules_to_message_for_trigger(
+            &state.store,
+            &message,
+            RuleTrigger::Send,
+        ) {
+            Ok(applied) if applied > 0 => tracing::info!(
+                message_id = %message.id,
+                actions_applied = applied,
+                "Applied on-send rules to outgoing message"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(
+                "Failed to apply on-send rules to outgoing message {}: {error}",
+                message.id
+            ),
+        }
+    }
     if let Err(e) = refresh_search_document(state, &message.id) {
         warn!("Failed to index outgoing message {}: {e}", message.id);
     }
@@ -206,6 +228,7 @@ pub(crate) fn outgoing_message_from_stored(
         },
         in_reply_to: message.in_reply_to.clone(),
         attachment_paths,
+        message_id: None,
     }
 }
 
@@ -239,7 +262,7 @@ pub(crate) async fn send_imap_smtp_message(
     state: &AppState,
     account: &Account,
     outgoing: &OutgoingMessage,
-) -> std::result::Result<(), PebbleError> {
+) -> std::result::Result<String, PebbleError> {
     let smtp_config = load_smtp_config(&state.store, &state.crypto, &account.id)?;
 
     let sender = SmtpSender::new(
@@ -268,6 +291,15 @@ pub(crate) async fn send_imap_smtp_message(
         .map(|addr| addr.address.clone())
         .collect::<Vec<_>>();
 
+    // 生成真实 Message-ID（<时间戳-随机@发件域>），SMTP 头部与本地"已发送"
+    // 副本共用同一值，保证同步去重能按 Message-ID 匹配，避免已发送重复两封。
+    let domain = account
+        .email
+        .rsplit_once('@')
+        .map(|(_, d)| d.to_string())
+        .unwrap_or_else(|| "localhost".to_string());
+    let message_id = format!("<{}-{}@{}>", now_timestamp(), new_id(), domain);
+
     sender
         .send(
             &account.email,
@@ -279,8 +311,11 @@ pub(crate) async fn send_imap_smtp_message(
             outgoing.body_html.as_deref(),
             outgoing.in_reply_to.as_deref(),
             &outgoing.attachment_paths,
+            Some(&message_id),
         )
-        .await
+        .await?;
+
+    Ok(message_id)
 }
 
 fn should_queue_send_failure(error: &PebbleError) -> bool {
@@ -358,6 +393,7 @@ pub async fn send_email(
         body_html: body_html.clone(),
         in_reply_to: in_reply_to.clone(),
         attachment_paths: attachment_paths.clone(),
+        message_id: None,
     };
 
     if matches!(
@@ -397,11 +433,14 @@ pub async fn send_email(
     }
 
     match send_imap_smtp_message(&state, &account, &outgoing).await {
-        Ok(()) => {
+        Ok(message_id) => {
+            // 用同一个 Message-ID 存"已发送"副本，同步去重才能匹配服务器副本。
+            let mut sent_outgoing = outgoing;
+            sent_outgoing.message_id = Some(message_id);
             save_outgoing_message_and_refresh_search(
                 &state,
                 &account,
-                &outgoing,
+                &sent_outgoing,
                 LocalOutgoingState::Sent,
                 &state.attachments_dir,
             )?;
@@ -449,6 +488,7 @@ mod tests {
             body_html: Some("<p>HTML body</p>".to_string()),
             in_reply_to: Some("<parent@example.com>".to_string()),
             attachment_paths: vec![],
+            message_id: None,
         }
     }
 

@@ -4,12 +4,11 @@ use serde::Serialize;
 use std::sync::atomic::Ordering;
 use tauri::image::Image;
 use tauri::{AppHandle, Manager, Runtime, State};
-#[cfg(not(windows))]
 use tauri_plugin_notification::NotificationExt;
 use tracing::warn;
 
-const TRAY_DEFAULT_TOOLTIP: &str = "Pebble";
-const TRAY_ATTENTION_TOOLTIP: &str = "Pebble - New mail";
+const TRAY_DEFAULT_TOOLTIP: &str = "YaoAIMail";
+const TRAY_ATTENTION_TOOLTIP: &str = "YaoAIMail - 新邮件";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct NotificationStatus {
@@ -131,6 +130,16 @@ pub fn show_desktop_notification<R: Runtime>(
 
     #[cfg(windows)]
     {
+        let version = windows_version::OsVersion::current();
+        if version.major == 6 && version.minor == 1 {
+            return app
+                .notification()
+                .builder()
+                .title(title)
+                .body(body)
+                .show()
+                .map_err(|e| e.to_string());
+        }
         tauri_winrt_notification::Toast::new(&windows_notification_app_id(app))
             .title(title)
             .text1(body)
@@ -150,32 +159,76 @@ pub fn show_desktop_notification<R: Runtime>(
     }
 }
 
-fn draw_dot(
+/// Draw a small white envelope inside a red circle at the top-right of the
+/// tray icon, like a "new mail" badge on top of the logo.
+fn draw_envelope_badge(
     rgba: &mut [u8],
     width: usize,
     height: usize,
     center_x: f32,
     center_y: f32,
     radius: f32,
-    border: f32,
 ) {
+    let min_dim = width.min(height) as f32;
+    // Scale everything relative to the badge radius so it stays crisp at 16px.
+    let env_w = radius * 1.55;
+    let env_h = radius * 1.15;
+    let env_left = center_x - env_w / 2.0;
+    let env_top = center_y - env_h / 2.0;
+    let env_right = center_x + env_w / 2.0;
+    let env_bottom = center_y + env_h / 2.0;
+    let corner = env_w * 0.18;
+    let stroke = (min_dim * 0.045).clamp(0.8, 1.8);
+
     for y in 0..height {
         for x in 0..width {
-            let dx = x as f32 + 0.5 - center_x;
-            let dy = y as f32 + 0.5 - center_y;
-            let distance = (dx * dx + dy * dy).sqrt();
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
             let offset = (y * width + x) * 4;
+            let dx = fx - center_x;
+            let dy = fy - center_y;
+            let distance = (dx * dx + dy * dy).sqrt();
 
+            // 1) red circle background
             if distance <= radius {
-                rgba[offset] = 239;
-                rgba[offset + 1] = 68;
-                rgba[offset + 2] = 68;
+                rgba[offset] = 229;
+                rgba[offset + 1] = 57;
+                rgba[offset + 2] = 53;
                 rgba[offset + 3] = 255;
-            } else if distance <= radius + border {
+            }
+            // 2) white envelope body (rounded rect)
+            let in_rect = fx >= env_left && fx <= env_right && fy >= env_top && fy <= env_bottom;
+            let rounded = in_rect
+                && (fx < env_left + corner
+                    || fx > env_right - corner
+                    || fy < env_top + corner
+                    || fy > env_bottom - corner);
+            let in_corner_region = rounded;
+            let in_rounded_rect = if in_corner_region {
+                // approximate corner check
+                let cx = if fx < env_left + corner { env_left + corner } else if fx > env_right - corner { env_right - corner } else { fx };
+                let cy = if fy < env_top + corner { env_top + corner } else if fy > env_bottom - corner { env_bottom - corner } else { fy };
+                ((fx - cx).powi(2) + (fy - cy).powi(2)) <= corner * corner
+            } else {
+                in_rect
+            };
+            if in_rounded_rect && distance <= radius {
                 rgba[offset] = 255;
                 rgba[offset + 1] = 255;
                 rgba[offset + 2] = 255;
                 rgba[offset + 3] = 255;
+            }
+            // 3) envelope flap (V shape): white envelope with red V line
+            if distance <= radius && fx >= env_left && fx <= env_right && fy >= env_top && fy <= env_bottom {
+                // The V line: at each column, the flap line y = env_top + (x - left)/(right-left)*env_h*0.6
+                let t = (fx - env_left) / (env_right - env_left).max(1.0);
+                let line_y = env_top + (0.9 - 0.6 * t) * env_h * 1.0;
+                if (fy - line_y).abs() <= stroke {
+                    rgba[offset] = 229;
+                    rgba[offset + 1] = 57;
+                    rgba[offset + 2] = 53;
+                    rgba[offset + 3] = 255;
+                }
             }
         }
     }
@@ -185,22 +238,19 @@ pub fn tray_attention_icon(base: &Image<'_>) -> Image<'static> {
     let width = base.width() as usize;
     let height = base.height() as usize;
     let mut rgba = base.rgba().to_vec();
-    let radius = ((width.min(height) as f32) * 0.18).clamp(4.0, 10.0);
+    // 放大角标：占图标约 1/3，红圈更醒目（托盘图标小，原 0.20 太小看不清）
+    let radius = ((width.min(height) as f32) * 0.32).clamp(6.0, 14.0);
     let center_x = width as f32 - radius - 2.0;
     let center_y = radius + 2.0;
 
-    draw_dot(&mut rgba, width, height, center_x, center_y, radius, 1.5);
+    draw_envelope_badge(&mut rgba, width, height, center_x, center_y, radius);
     Image::new_owned(rgba, base.width(), base.height())
 }
 
 fn should_mark_attention<R: Runtime>(app: &AppHandle<R>) -> bool {
-    app.get_webview_window("main")
-        .map(|window| {
-            let visible = window.is_visible().unwrap_or(false);
-            let focused = window.is_focused().unwrap_or(false);
-            !(visible && focused)
-        })
-        .unwrap_or(true)
+    // 新邮件到达即亮托盘徽章（不依赖窗口是否在前台/聚焦）
+    let _ = app;
+    true
 }
 
 pub fn mark_attention_indicator<R: Runtime>(app: &AppHandle<R>) {

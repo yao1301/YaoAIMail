@@ -2,6 +2,55 @@ import { describe, expect, it } from "vitest";
 import { sanitizeHtml } from "../../src/lib/sanitizeHtml";
 
 describe("sanitizeHtml", () => {
+  it("restores safe inline image dimensions when sanitizing email signatures", () => {
+    const sanitized = sanitizeHtml(
+      '<img src="https://example.com/rsg.png" style="max-width: unset; width: 72.095px; height: 62.2472px">',
+    );
+
+    const template = document.createElement("template");
+    template.innerHTML = sanitized;
+    const image = template.content.querySelector("img") as HTMLImageElement;
+    expect(image.style.width).toBe("72.095px");
+    expect(image.style.height).toBe("62.2472px");
+    expect(image.getAttribute("width")).toBe("72.095");
+    expect(image.getAttribute("height")).toBe("62.2472");
+  });
+
+  it("reads image dimensions from raw style text when CSSOM exposes no dimensions", () => {
+    const styleDescriptor = Object.getOwnPropertyDescriptor(
+      HTMLImageElement.prototype,
+      "style",
+    );
+    Object.defineProperty(HTMLImageElement.prototype, "style", {
+      configurable: true,
+      get: () => ({ width: "", height: "" }),
+    });
+    try {
+      const sanitized = sanitizeHtml(
+        '<img src="https://example.com/rsg.png" style="width: 72.095px; height: 62.2472px">',
+      );
+      const template = document.createElement("template");
+      template.innerHTML = sanitized;
+      const image = template.content.querySelector("img")!;
+      expect(image.getAttribute("width")).toBe("72.095");
+      expect(image.getAttribute("height")).toBe("62.2472");
+    } finally {
+      if (styleDescriptor) {
+        Object.defineProperty(HTMLImageElement.prototype, "style", styleDescriptor);
+      } else {
+        delete (HTMLImageElement.prototype as unknown as { style?: CSSStyleDeclaration }).style;
+      }
+    }
+  });
+
+  it("does not restore unsafe executable image dimension expressions", () => {
+    const sanitized = sanitizeHtml(
+      '<img src="https://example.com/image.png" style="width: expression(alert(1)); height: calc(100% - 1px)">',
+    );
+
+    expect(sanitized).not.toContain("expression");
+  });
+
   it("preserves safe inline email styles", () => {
     const sanitized = sanitizeHtml(
       '<p style="color: red; text-align: center; margin: 8px">Hello</p>',

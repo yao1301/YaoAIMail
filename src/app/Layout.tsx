@@ -7,10 +7,9 @@ import CommandPalette from "../features/command-palette/CommandPalette";
 import ToastContainer from "../components/ToastContainer";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { useConfirmStore } from "../stores/confirm.store";
-import { useComposeStore } from "../stores/compose.store";
-import { useUIStore, applyThemeToDom, resolveTheme } from "../stores/ui.store";
+import { useComposeStore, type ComposeTab } from "../stores/compose.store";
+import { useUIStore, applyThemeToDom, applyTypographyToDom, resolveTheme } from "../stores/ui.store";
 import { useCommandStore } from "../stores/command.store";
-import { useKanbanStore } from "../stores/kanban.store";
 import { useKeyboard } from "../hooks/useKeyboard";
 import { useNetworkStatus } from "../hooks/useNetworkStatus";
 import { buildCommands } from "../features/command-palette/commands";
@@ -23,52 +22,67 @@ import { useCloseToBackground } from "./useCloseToBackground";
 import { useTrayI18n } from "./useTrayI18n";
 import { useMailtoOpen } from "./useMailtoOpen";
 import AppBackground from "./AppBackground";
+import RightToolsPanel from "../components/RightToolsPanels";
+import WorkspaceTabs from "../components/WorkspaceTabs";
+import FloatingAiWritingPanel from "../components/FloatingAiWritingPanel";
+import MessageDetail from "../components/MessageDetail";
+import SelectionTranslateOverlay from "../features/translate/SelectionTranslateOverlay";
 
 const loadSettingsView = () => import("../features/settings/SettingsView");
 const loadComposeView = () => import("../features/compose/ComposeView");
-const loadKanbanView = () => import("../features/kanban/KanbanView");
+const loadAddressBookView = () => import("../features/contacts/AddressBookView");
+const loadCompanyResearchView = () => import("../features/company-research/CompanyResearchView");
+const loadLeadFinderView = () => import("../features/lead-finder/LeadFinderView");
+const loadKanbanView = () => import("../features/home/HomeView");
 const loadSearchView = () => import("../features/search/SearchView");
-const loadSnoozedView = () => import("../features/snoozed/SnoozedView");
 const loadStarredView = () => import("../features/starred/StarredView");
+const loadAiWritingView = () => import("../features/settings/AiWritingTab");
+const loadForeignToolsView = () => import("../features/settings/ForeignToolsTab");
+const loadCustomerProfileView = () => import("../features/customer-profile/CustomerProfileView");
 const preloadLazyViews = createLazyViewPreloader([
   loadSettingsView,
   loadComposeView,
+  loadCompanyResearchView,
+  loadLeadFinderView,
   loadKanbanView,
   loadSearchView,
-  loadSnoozedView,
   loadStarredView,
+  loadAiWritingView,
+  loadForeignToolsView,
+  loadCustomerProfileView,
 ]);
 
 const SettingsView = lazy(loadSettingsView);
 const ComposeView = lazy(loadComposeView);
+const AddressBookView = lazy(loadAddressBookView);
+const CompanyResearchView = lazy(loadCompanyResearchView);
+const LeadFinderView = lazy(loadLeadFinderView);
 const KanbanView = lazy(loadKanbanView);
 const SearchView = lazy(loadSearchView);
-const SnoozedView = lazy(loadSnoozedView);
 const StarredView = lazy(loadStarredView);
+const AiWritingView = lazy(loadAiWritingView);
+const ForeignToolsView = lazy(loadForeignToolsView);
+const CustomerProfileView = lazy(loadCustomerProfileView);
 import { useTranslation } from "react-i18next";
 import i18next from "i18next";
 import { WifiOff } from "lucide-react";
-import { listen } from "@tauri-apps/api/event";
-import { useQueryClient } from "@tanstack/react-query";
 import { setNotificationsEnabled as setBackendNotificationsEnabled, syncTitlebarTheme } from "@/lib/api";
 
 export default function Layout() {
   const activeView = useUIStore((s) => s.activeView);
+  const rightPanelOpen = useUIStore((s) => s.rightPanelOpen);
+  const aiWritingFloating = useUIStore((s) => s.aiWritingFloating);
   const displayedView = activeView;
-  const composeKey = useComposeStore((s) => s.composeKey);
-  const setActiveView = useUIStore((s) => s.setActiveView);
+  const composeTabs = useComposeStore((s) => s.tabs);
+  const activeComposeTabId = useComposeStore((s) => s.activeTabId);
   const theme = useUIStore((s) => s.theme);
+  const fontFamily = useUIStore((s) => s.fontFamily);
+  const fontScale = useUIStore((s) => s.fontScale);
   const backgroundImage = useUIStore((s) => s.backgroundImage);
   const notificationsEnabled = useUIStore((s) => s.notificationsEnabled);
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
 
   useKeyboard();
-
-  // Load kanban cards at startup so MessageItem can show kanban indicators
-  useEffect(() => {
-    useKanbanStore.getState().fetchCards();
-  }, []);
 
   useEffect(() => scheduleLazyViewPreload(preloadLazyViews), []);
 
@@ -91,24 +105,6 @@ export default function Layout() {
       .catch((err) => console.warn("Failed to sync notification preference to backend", err));
   }, [notificationsEnabled]);
 
-  // Global listener: refresh data when snoozed messages are restored
-  useEffect(() => {
-    const unlisten = listen<{ message_id: string; return_to?: string }>("mail:unsnoozed", (event) => {
-      queryClient.invalidateQueries({ queryKey: ["messages"] });
-      queryClient.invalidateQueries({ queryKey: ["snoozed"] });
-
-      const { return_to } = event.payload;
-      if (return_to) {
-        if (return_to.startsWith("kanban")) {
-          setActiveView("kanban");
-        } else if (return_to === "inbox" || return_to === "starred" || return_to === "search") {
-          setActiveView(return_to as "inbox" | "starred" | "search");
-        }
-      }
-    });
-    return () => { unlisten.then((fn) => fn()); };
-  }, [queryClient, setActiveView]);
-
   useEffect(() => {
     applyThemeToDom(theme);
     syncTitlebarTheme(resolveTheme(theme)).catch(() => {});
@@ -123,6 +119,10 @@ export default function Layout() {
     }
   }, [theme]);
 
+  useEffect(() => {
+    applyTypographyToDom(fontFamily, fontScale);
+  }, [fontFamily, fontScale]);
+
   return (
     <div
       className={`app-shell flex flex-col h-screen overflow-hidden${backgroundImage ? " app-shell--with-background" : ""}`}
@@ -131,26 +131,80 @@ export default function Layout() {
       <TitleBar />
       <div className="flex flex-1 min-h-0 app-shell-content">
         <Sidebar />
-        <main className="flex-1 min-w-0 overflow-auto scroll-region app-main-scroll" style={{ position: "relative" }}>
+        <main className="flex-1 min-w-0 overflow-hidden" style={{ position: "relative", display: "flex", flexDirection: "column", maxHeight: "100%", minHeight: 0 }}>
           <OfflineBanner />
-          <ViewErrorBoundary key={displayedView}>
-            <Suspense fallback={<ViewLoadingFallback />}>
-              {displayedView === "inbox" && <InboxView />}
-              {displayedView === "kanban" && <KanbanView />}
-              {displayedView === "settings" && <SettingsView />}
-              {displayedView === "search" && <SearchView />}
-              {displayedView === "snoozed" && <SnoozedView />}
-              {displayedView === "starred" && <StarredView />}
-              {displayedView === "compose" && <ComposeView key={composeKey} />}
-            </Suspense>
-          </ViewErrorBoundary>
+          <WorkspaceTabs />
+          <div className="app-main-scroll" style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden", position: "relative" }}>
+            <ViewErrorBoundary key={displayedView}>
+              <Suspense fallback={<ViewLoadingFallback />}>
+                {displayedView === "inbox" && <InboxView />}
+                {displayedView === "addressBook" && <AddressBookView />}
+                {displayedView === "companyResearch" && <CompanyResearchView />}
+                {displayedView === "leadFinder" && <LeadFinderView />}
+                {displayedView === "kanban" && <KanbanView />}
+                {displayedView === "settings" && <SettingsView />}
+                {displayedView === "search" && <SearchView />}
+                {displayedView === "starred" && <StarredView />}
+                {displayedView === "customerProfile" && <CustomerProfileView />}
+                {displayedView === "compose" && composeTabs.length > 0 && (
+                  <ComposeTabsView tabs={composeTabs} activeTabId={activeComposeTabId} />
+                )}
+                {displayedView === "aiWriting" && <StandaloneToolView><AiWritingView /></StandaloneToolView>}
+                {displayedView === "foreignTools" && <StandaloneToolView><ForeignToolsView /></StandaloneToolView>}
+                {displayedView === "messageDetail" && <MessageDetailPane />}
+              </Suspense>
+            </ViewErrorBoundary>
+          </div>
         </main>
+        {rightPanelOpen && displayedView !== "settings" && <RightToolsPanel />}
       </div>
       <ComposeFAB />
       <StatusBar />
       <CommandPalette />
       <ToastContainer />
       <GlobalConfirmDialog />
+      <SelectionTranslateOverlay />
+      {aiWritingFloating && <FloatingAiWritingPanel />}
+    </div>
+  );
+}
+
+/** 写信标签容器：所有写信标签同时挂载（编辑状态保留），仅显示激活标签。 */
+function ComposeTabsView({ tabs, activeTabId }: { tabs: ComposeTab[]; activeTabId: string | null }) {
+  return (
+    <>
+      {tabs.map((tab) => (
+        <div
+          key={tab.id}
+          style={{
+            display: tab.id === activeTabId ? "block" : "none",
+            height: "100%",
+          }}
+        >
+          <ComposeView tabId={tab.id} />
+        </div>
+      ))}
+    </>
+  );
+}
+
+/** 全屏标签：双击/右键"打开"邮件后，标签内只显示邮件详情（无列表，顶部保留常用命令）。 */
+function MessageDetailPane() {
+  const messageDetailId = useUIStore((s) => s.messageDetailId);
+  const setActiveView = useUIStore((s) => s.setActiveView);
+  if (!messageDetailId) return null;
+  return (
+    <MessageDetail
+      messageId={messageDetailId}
+      onBack={() => setActiveView("inbox")}
+    />
+  );
+}
+
+function StandaloneToolView({ children }: { children: ReactNode }) {
+  return (
+    <div className="scroll-region" style={{ maxWidth: "980px", margin: "0 auto", padding: "28px 32px" }}>
+      {children}
     </div>
   );
 }

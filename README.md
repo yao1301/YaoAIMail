@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="src/assets/app-icon.png" alt="Pebble logo" width="120">
+  <img src="public/yao-logo.png" alt="YaoAIMail logo" width="120">
 </p>
 
-<h1 align="center">Pebble</h1>
+<h1 align="center">YaoAIMail</h1>
 
 <p align="center">
-  A local-first desktop email client for people who want a calmer, more private inbox.
+  An AI-powered foreign-trade email client — Pebble, rebuilt for B2B cross-border sellers.
 </p>
 
 <p align="center">
@@ -266,14 +266,32 @@ pnpm build:frontend
 cargo check
 ```
 
+## About this fork (YaoAIMail)
+
+**YaoAIMail**（老妖 AI 外贸邮）is an enhanced fork of [QingJ01/Pebble](https://github.com/QingJ01/Pebble), built for B2B cross-border foreign-trade sellers. All modifications in this fork are also released under AGPL-3.0.
+
+On top of upstream Pebble, this fork adds:
+
+- **AI email writing** — understands the customer's history and your writing style; multi-turn instruction box writes drafts directly, with undo and shared conversation history.
+- **AI assistant & customer memory** — customer profiles, follow-up records, and account-scoped writing styles.
+- **Lead finder** — model-driven multi-channel public web research (official sites, sitemaps, contact pages, PDFs, search engines) to discover potential B2B customers and their business emails, with source-URL evidence and multi-source cross-verification. Passive collection of publicly available business contact information only.
+- **Company intel (credit research)** — aggregates public web information about a company before you reach out.
+- **Send guard** — checks for missing attachments, wrong recipients, and risky wording before sending.
+- **Foreign trade tools** — container loading calculator, exchange rates, and other seller utilities.
+
+> 本项目基于 QingJ01/Pebble 二次开发，感谢原作者。Upstream changes are merged periodically.
+
 ## License
 
 Pebble is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+
+This fork (YaoAIMail) is distributed under the same AGPL-3.0 license. The original author's copyright notice and license text are preserved unchanged.
 
 ---
 
 <p align="center">
   Built by <a href="https://github.com/QingJ01">QingJ</a>.
+  YaoAIMail fork maintained by <a href="https://github.com/yao1301">yao1301</a>.
   <br>
   Friend link: <a href="https://linux.do">LINUX DO</a>
 </p>

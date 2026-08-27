@@ -1,5 +1,6 @@
-use pebble_core::{PebbleError, Result};
+use pebble_core::{Folder, Message, PebbleError, Result};
 use rusqlite::{params, OptionalExtension};
+use serde_json::json;
 
 use crate::Store;
 
@@ -71,6 +72,90 @@ pub struct PendingMailOpsSummary {
 }
 
 impl Store {
+    /// Commit a rule-generated local move and its remote outbox records in one
+    /// SQLite transaction. A crash can therefore leave either both changes or
+    /// neither change, but never a locally moved message with no server work.
+    pub fn move_rule_messages_to_folder_with_outbox(
+        &self,
+        messages: &[Message],
+        source: &Folder,
+        target: &Folder,
+    ) -> Result<u32> {
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        if source.account_id != target.account_id {
+            return Err(PebbleError::Validation(
+                "Rule move source and target belong to different accounts".to_string(),
+            ));
+        }
+        let needs_remote = !source.remote_id.starts_with("__local_")
+            && !target.remote_id.starts_with("__local_");
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let now = pebble_core::now_timestamp();
+            let mut changed = 0u32;
+            for message in messages {
+                if message.account_id != source.account_id {
+                    return Err(PebbleError::Validation(format!(
+                        "Rule move message {} belongs to a different account",
+                        message.id
+                    )));
+                }
+                tx.execute(
+                    "DELETE FROM message_folders WHERE message_id = ?1",
+                    params![message.id],
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO message_folders (message_id, folder_id) VALUES (?1, ?2)",
+                    params![message.id, target.id],
+                )?;
+                changed += tx.execute(
+                    "UPDATE messages
+                     SET is_deleted = 0, deleted_at = NULL, updated_at = ?1
+                     WHERE id = ?2",
+                    params![now, message.id],
+                )? as u32;
+                tx.execute(
+                    "INSERT OR REPLACE INTO search_pending (message_id, operation, created_at)
+                     VALUES (?1, 'index', ?2)",
+                    params![message.id, now],
+                )?;
+
+                if needs_remote {
+                    let payload = json!({
+                        "provider_account_id": message.account_id,
+                        "remote_id": message.remote_id,
+                        "op": "move_to_folder",
+                        "payload": {
+                            "source_folder_id": source.id,
+                            "source_folder_remote_id": source.remote_id,
+                            "target_folder_id": target.id,
+                            "target_folder_remote_id": target.remote_id,
+                            "add_labels": [target.remote_id],
+                            "remove_labels": [source.remote_id],
+                        }
+                    });
+                    tx.execute(
+                        "INSERT INTO pending_mail_ops
+                            (id, account_id, message_id, op_type, payload_json, status,
+                             attempts, last_error, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 'move_to_folder', ?4, 'pending', 0, NULL, ?5, ?5)",
+                        params![
+                            pebble_core::new_id(),
+                            message.account_id,
+                            message.id,
+                            payload.to_string(),
+                            now,
+                        ],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(changed)
+        })
+    }
+
     pub fn insert_pending_mail_op(
         &self,
         account_id: &str,
@@ -97,6 +182,40 @@ impl Store {
             )?;
             Ok(id)
         })
+    }
+
+    /// Queue a rule-generated folder move for remote replay. Rule execution
+    /// updates the local view first for responsiveness, but IMAP/Gmail/
+    /// Outlook must receive the same move instead of silently diverging.
+    pub fn enqueue_rule_move_to_folder(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        remote_message_id: &str,
+        source_folder_id: &str,
+        source_folder_remote_id: &str,
+        target_folder_id: &str,
+        target_folder_remote_id: &str,
+    ) -> Result<String> {
+        let payload = json!({
+            "provider_account_id": account_id,
+            "remote_id": remote_message_id,
+            "op": "move_to_folder",
+            "payload": {
+                "source_folder_id": source_folder_id,
+                "source_folder_remote_id": source_folder_remote_id,
+                "target_folder_id": target_folder_id,
+                "target_folder_remote_id": target_folder_remote_id,
+                "add_labels": [target_folder_remote_id],
+                "remove_labels": [source_folder_remote_id],
+            }
+        });
+        self.insert_pending_mail_op(
+            account_id,
+            message_id,
+            "move_to_folder",
+            &payload.to_string(),
+        )
     }
 
     pub fn list_pending_mail_ops(&self, account_id: &str) -> Result<Vec<PendingMailOp>> {
@@ -554,6 +673,86 @@ mod tests {
         store.mark_pending_mail_op_done(&op_id).unwrap();
         let done = store.list_pending_mail_ops(&account.id).unwrap();
         assert_eq!(done[0].status, PendingMailOpStatus::Done);
+    }
+
+    #[test]
+    fn rule_move_commits_local_folder_and_remote_outbox_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let source = test_folder(&account.id);
+        let mut target = test_folder(&account.id);
+        target.id = new_id();
+        target.remote_id = "Customers/Rain".to_string();
+        target.name = "Rain".to_string();
+        target.role = None;
+        store.insert_folder(&source).unwrap();
+        store.insert_folder(&target).unwrap();
+        let message = test_message(&account.id);
+        store
+            .insert_message(&message, std::slice::from_ref(&source.id))
+            .unwrap();
+
+        let moved = store
+            .move_rule_messages_to_folder_with_outbox(
+                std::slice::from_ref(&message),
+                &source,
+                &target,
+            )
+            .unwrap();
+
+        assert_eq!(moved, 1);
+        assert_eq!(
+            store.get_message_folder_ids(&message.id).unwrap(),
+            vec![target.id.clone()]
+        );
+        let ops = store.list_pending_mail_ops(&account.id).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_type, "move_to_folder");
+        assert!(ops[0].payload_json.contains(&source.remote_id));
+        assert!(ops[0].payload_json.contains(&target.remote_id));
+
+        // A server reconciliation may still see the old source UID while the
+        // move is pending. It must not hide the locally moved message.
+        store
+            .bulk_soft_delete(std::slice::from_ref(&message.id))
+            .unwrap();
+        assert!(!store.get_message(&message.id).unwrap().unwrap().is_deleted);
+
+        store.mark_pending_mail_op_done(&ops[0].id).unwrap();
+        store
+            .bulk_soft_delete(std::slice::from_ref(&message.id))
+            .unwrap();
+        assert!(store.get_message(&message.id).unwrap().unwrap().is_deleted);
+    }
+
+    #[test]
+    fn rule_move_rolls_back_local_changes_when_outbox_batch_is_invalid() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let source = test_folder(&account.id);
+        let mut target = test_folder(&account.id);
+        target.id = new_id();
+        target.remote_id = "Customers".to_string();
+        target.role = None;
+        store.insert_folder(&source).unwrap();
+        store.insert_folder(&target).unwrap();
+        let valid = test_message(&account.id);
+        store
+            .insert_message(&valid, std::slice::from_ref(&source.id))
+            .unwrap();
+        let mut invalid = test_message(&account.id);
+        invalid.account_id = "different-account".to_string();
+
+        assert!(store
+            .move_rule_messages_to_folder_with_outbox(&[valid.clone(), invalid], &source, &target)
+            .is_err());
+        assert_eq!(
+            store.get_message_folder_ids(&valid.id).unwrap(),
+            vec![source.id]
+        );
+        assert!(store.list_pending_mail_ops(&account.id).unwrap().is_empty());
     }
 
     #[test]

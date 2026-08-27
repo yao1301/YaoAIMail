@@ -1,46 +1,75 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { EditorContent } from "@tiptap/react";
 import {
   ArrowLeft, Send, X, AlertCircle,
   Type, FileCode2, Hash, Eye, EyeOff,
-  Paperclip, FileText, Trash2, BookTemplate,
-  ChevronDown, ChevronRight,
+  Paperclip, FileText, Trash2, BookTemplate, Library,
+  ChevronDown, ChevronRight, Sparkles, Undo2, Redo2,
+  FolderOpen, Copy,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import ContextMenu, { type ContextMenuItem } from "@/components/ContextMenu";
 import { useMailStore } from "@/stores/mail.store";
+import { useUIStore } from "@/stores/ui.store";
 import { useComposeStore } from "@/stores/compose.store";
 import { useAccountsQuery } from "@/hooks/queries";
 import { useSendEmailMutation } from "@/hooks/mutations";
 import ContactAutocomplete from "@/components/ContactAutocomplete";
 import { listTemplates, saveTemplate, deleteTemplate } from "@/lib/templates";
 import type { EmailTemplate } from "@/lib/templates";
+import { listKnowledgeItems, listStyleProfiles, searchKnowledgeBase, getMessagesBatch, readAttachmentFile, type KnowledgeItem, type StyleProfile, aiChat, type ChatTurn } from "@/lib/api";
 import { useComposeRecipients } from "@/hooks/useComposeRecipients";
 import { useComposeDraft, loadDraftFromStorage, clearDraftStorage } from "@/hooks/useComposeDraft";
-import { deleteDraft, stageComposeAttachment } from "@/lib/api";
+import { deleteDraft, stageComposeAttachment, getSendGuardConfig, checkSendGuard } from "@/lib/api";
+import { listEmailSignatures, type EmailSignature } from "@/lib/signatures";
 import { appendReplyQuoteHtml, useComposeEditor } from "@/hooks/useComposeEditor";
 import { useConfirmStore } from "@/stores/confirm.store";
 import { useToastStore } from "@/stores/toast.store";
 import type { Account } from "@/lib/ipc-types";
-import type { ComposeAttachment } from "./compose-draft";
+import type { ComposeAttachment, ComposeDraftSnapshot } from "./compose-draft";
 import { ModeButton, EditorToolbar, MarkdownToolbar, composeStyles } from "./ComposeToolbar";
 import { isValidEmailAddress, mergePendingRecipient } from "./recipient-utils";
+import KnowledgePicker from "@/components/KnowledgePicker";
+import { extractDocumentText } from "@/lib/documentText";
+import { getActiveWorkRole } from "@/features/settings/WorkRoleTab";
+import { resizeAutoGrowTextarea } from "@/lib/autoGrowTextarea";
+import { getWritingPreferences } from "@/lib/writingPreferences";
 
-export default function ComposeView() {
+export default function ComposeView({ tabId }: { tabId?: string }) {
   const composeMode = useComposeStore((s) => s.composeMode);
+  const myTab = useComposeStore((s) => (tabId ? s.tabsById[tabId] : undefined));
   const { data: accounts = [], isLoading } = useAccountsQuery();
 
-  if (composeMode === "new" && isLoading) {
+  if (tabId) {
+    // 多标签模式：只渲染自己的标签。
+    if (!myTab) return null;
+    if (myTab.mode === "new" && isLoading) {
+      return <div style={{ height: "100%" }} />;
+    }
+  } else if (composeMode === "new" && isLoading) {
     return <div style={{ height: "100%" }} />;
   }
 
-  return <ComposeViewInner accounts={accounts} />;
+  return <ComposeViewInner accounts={accounts} tabId={tabId} />;
 }
 
-function ComposeViewInner({ accounts }: { accounts: Account[] }) {
+function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: string }) {
   const { t } = useTranslation();
-  const composeMode = useComposeStore((s) => s.composeMode);
-  const composeReplyTo = useComposeStore((s) => s.composeReplyTo);
-  const composePrefill = useComposeStore((s) => s.composePrefill);
+  // 多标签模式：读自己标签的数据；独立窗口（无 tabId）读投影字段。
+  const myTab = useComposeStore((s) => (tabId ? s.tabsById[tabId] : undefined));
+  const activeTabId = useComposeStore((s) => s.activeTabId);
+  const isActive = !tabId || activeTabId === tabId;
+  const composeMode = myTab ? myTab.mode : useComposeStore((s) => s.composeMode);
+  const composeReplyTo = myTab ? myTab.replyTo : useComposeStore((s) => s.composeReplyTo);
+  const composePrefill = myTab ? myTab.prefill : useComposeStore((s) => s.composePrefill);
+  const draftSnapshot = myTab ? myTab.draftSnapshot : useComposeStore((s) => s.draftSnapshot);
+  const pendingAiBody = myTab ? myTab.pendingAiBody : useComposeStore((s) => s.pendingAiBody);
+  const setDraftSnapshot = useComposeStore((s) => s.setDraftSnapshot);
+  const setActiveDraftContext =
+    useComposeStore((s) => s.setActiveDraftContext) ?? (() => undefined);
+  const clearPendingAiBody =
+    useComposeStore((s) => s.clearPendingAiBody) ?? (() => undefined);
   const closeCompose = useComposeStore((s) => s.closeCompose);
   const showComposeLeaveConfirm = useComposeStore((s) => s.showComposeLeaveConfirm);
   const confirmCloseCompose = useComposeStore((s) => s.confirmCloseCompose);
@@ -48,8 +77,8 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
   const activeAccountId = useMailStore((s) => s.activeAccountId);
 
   const isReply = composeMode === "reply" || composeMode === "reply-all";
-  const restoredDraft = useRef(
-    composeMode === "new" ? loadDraftFromStorage(accounts.map((account) => account.id)) : null,
+  const restoredDraft = useRef<ComposeDraftSnapshot | null>(
+    draftSnapshot ?? (composeMode === "new" ? loadDraftFromStorage(accounts.map((account) => account.id)) : null),
   );
 
   // ─── Recipients ──────────────────────────────────────────────────────────────
@@ -77,16 +106,20 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
   });
   const [sendError, setSendError] = useState<string | null>(null);
   const sendMutation = useSendEmailMutation();
+  const writingAccountId = fromAccountId ?? activeAccountId;
+  const writingDefaults = getWritingPreferences(writingAccountId);
 
   // ─── Editor ──────────────────────────────────────────────────────────────────
   const {
     editor, editorMode, rawSource, setRawSource,
     richTextHtml, htmlPreview, setHtmlPreview,
     switchMode, textareaRef, quotedReplyHtml,
+    editorContentReady,
   } = useComposeEditor({
     fromAccountId, composeMode, composeReplyTo, isReply, t,
     restoredDraft: restoredDraft.current,
     prefillBody: composePrefill?.body,
+    preferredSignatureId: writingDefaults.signatureId || undefined,
   });
 
   // ─── Draft persistence ───────────────────────────────────────────────────────
@@ -99,7 +132,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
   // the draft persistence hook.
   const attachInputRef = useRef<HTMLInputElement>(null);
   const [attachments, setAttachments] = useState<ComposeAttachment[]>(() =>
-    restoredDraft.current?.attachments ?? [],
+    composePrefill?.attachments ?? restoredDraft.current?.attachments ?? [],
   );
   const [isDragging, setIsDragging] = useState(false);
 
@@ -111,14 +144,421 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
     to, cc, bcc, subject, rawSource, richTextHtml, editorMode, composeMode, fromAccountId,
     attachments,
     editorReady,
+    existingDraftId: restoredDraft.current?.sourceDraftId,
+    tabId,
   });
+
+  // Navigation unmounts this view. Keep the current editor state in memory so
+  // returning to the compose tab restores it without putting plaintext in
+  // localStorage. Closing/discarding the compose removes the tab first, so
+  // this cleanup does not resurrect an intentionally discarded draft.
+  useEffect(() => () => {
+    // 标签已关闭 / 独立窗口会话已重置 → 不保存。
+    if (tabId) {
+      if (!useComposeStore.getState().tabsById[tabId]) return;
+    } else if (useComposeStore.getState().composeMode === null) {
+      return;
+    }
+    if (!fromAccountId) return;
+    setDraftSnapshot({
+      accountId: fromAccountId,
+      to: [...to], cc: [...cc], bcc: [...bcc], subject,
+      rawSource, richTextHtml, editorMode,
+      attachments: attachments.map((attachment) => ({ ...attachment })),
+      quotedReplyHtml: quotedReplyHtml || undefined,
+      savedAt: Date.now(),
+    }, tabId);
+  }, [attachments, bcc, cc, editorMode, fromAccountId, quotedReplyHtml, rawSource, richTextHtml, setDraftSnapshot, subject, to, tabId]);
 
   // ─── Templates ───────────────────────────────────────────────────────────────
   const [showTemplates, setShowTemplates] = useState(false);
   const [templates, setTemplates] = useState<EmailTemplate[]>([]);
   const [showSaveTemplate, setShowSaveTemplate] = useState(false);
+  // 附件右键菜单
+  const [attachmentMenu, setAttachmentMenu] = useState<{ x: number; y: number; index: number } | null>(null);
+  // 正文图片右键菜单
+  const [inlineImageMenu, setInlineImageMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
   const [templateName, setTemplateName] = useState("");
-  const [showQuotedReply, setShowQuotedReply] = useState(false);
+  const [showQuotedReply, setShowQuotedReply] = useState(true);
+  const [signaturePickerOpen, setSignaturePickerOpen] = useState(false);
+  const [signatures, setSignatures] = useState<EmailSignature[]>([]);
+
+  useEffect(() => {
+    if (!fromAccountId) {
+      setSignatures([]);
+      return;
+    }
+    void listEmailSignatures(fromAccountId).then(setSignatures).catch(() => setSignatures([]));
+  }, [fromAccountId]);
+
+  // 草稿区与右侧 AI 写作共用当前发件账号的写作默认值；本次草稿的临时调整只保存在本组件。
+  const [writingProfiles, setWritingProfiles] = useState<StyleProfile[]>([]);
+  const [writingOptionsOpen, setWritingOptionsOpen] = useState(false);
+  const [languageOverride, setLanguageOverride] = useState<string | null>(null);
+  const [styleOverride, setStyleOverride] = useState<string | null>(null);
+  const [knowledgeOverride, setKnowledgeOverride] = useState<boolean | null>(null);
+  const [signatureOverride, setSignatureOverride] = useState<string | null>(null);
+  const effectiveLanguage = languageOverride ?? writingDefaults.language;
+  const effectiveStyleId = styleOverride ?? (writingDefaults.styleProfileId || writingProfiles.find((profile) => profile.isActive)?.id || "");
+  const effectiveIncludeKnowledge = knowledgeOverride ?? writingDefaults.includeKnowledge;
+  const effectiveSignatureId = signatureOverride ?? (writingDefaults.signatureId || signatures.find((signature) => signature.is_default)?.id || "");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLanguageOverride(null);
+    setStyleOverride(null);
+    setKnowledgeOverride(null);
+    setSignatureOverride(null);
+    void listStyleProfiles().then((list) => {
+      if (!cancelled) setWritingProfiles(list);
+    }).catch(() => {
+      if (!cancelled) setWritingProfiles([]);
+    });
+    return () => { cancelled = true; };
+  }, [writingAccountId]);
+
+  // Reply mode: draggable splitter between editor and original quoted reply.
+  const [draftEditorHeight, setDraftEditorHeight] = useState(90);
+  const beginDraftResize = useCallback((event: React.MouseEvent) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = draftEditorHeight;
+    const onMove = (moveEvent: MouseEvent) => {
+      const next = startHeight + (moveEvent.clientY - startY);
+      setDraftEditorHeight(Math.max(100, Math.min(window.innerHeight - 200, next)));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [draftEditorHeight]);
+
+  // ─── AI 写作助手（写信页内集成） ────────────────────────────────────
+  const aiInputFocusOwner = useUIStore((s) => s.aiInputFocusOwner);
+  const setAiInputFocusOwner = useUIStore((s) => s.setAiInputFocusOwner);
+  const aiPanelLocked = aiInputFocusOwner === "panel";
+  const [aiInstruction, setAiInstruction] = useState("");
+  const [aiContextFiles, setAiContextFiles] = useState<File[]>([]);
+  const [aiContextMessages, setAiContextMessages] = useState<Array<{ id: string; title: string }>>([]);
+  const [selectedKnowledgeIds, setSelectedKnowledgeIds] = useState<string[]>([]);
+  const [aiGenerating, setAiGenerating] = useState(false);
+  const [aiSnapshots, setAiSnapshots] = useState<string[]>([]);
+  const [aiRedoSnapshots, setAiRedoSnapshots] = useState<string[]>([]);
+  // 与右侧/悬浮 AI 写作共用同一条对话历史（避免两条独立线导致上下文脱节）。
+  // 写信页内联 AI 的多轮对话历史：用本地 useState，**不与右侧 AI 写作面板
+  // 共享 store**。原因：之前共用 useUIStore.aiWritingTurns 时，右侧面板的
+  // 对话历史会污染写信页的"继续对话"（模型看到不相关历史，输出风马牛不相及）。
+  // 写信页每次打开独立会话即可——后台任务用 pendingAiDraft 跨页保留。
+  const [aiHistory, setAiHistory] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
+  const knowledgeContextQueue = useUIStore((s) => s.knowledgeContextQueue);
+  const clearKnowledgeContextQueue = useUIStore((s) => s.clearKnowledgeContextQueue);
+  useEffect(() => {
+    if (!isActive) return;
+    const pending = knowledgeContextQueue.filter((item) => item.target === "compose").map((item) => item.itemId);
+    if (pending.length === 0) return;
+    setSelectedKnowledgeIds((current) => [...new Set([...current, ...pending])]);
+    clearKnowledgeContextQueue();
+  }, [isActive, knowledgeContextQueue, clearKnowledgeContextQueue]);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  /** 把 AI 生成的邮件草稿写入草稿栏。富文本模式必须走 tiptap setContent
+   *  （只改 rawSource 不会刷新编辑器），其他模式直接写 rawSource。 */
+  const writeAiReplyToDraft = useCallback((text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (editorMode === "rich" && editor) {
+      const html = trimmed
+        .split(/\n{2,}/)
+        .map((paragraph) => `<p>${paragraph.replace(/\n/g, "<br/>")}</p>`)
+        .join("");
+      editor.commands.setContent(html);
+      setRawSource(html);
+    } else {
+      setRawSource(trimmed);
+    }
+  }, [editorMode, editor, setRawSource]);
+
+  /** 读取草稿栏当前内容（快照用）。 */
+  const readDraftContent = useCallback(() => {
+    if (editorMode === "rich" && editor) {
+      return editor.getHTML();
+    }
+    return rawSource || "";
+  }, [editorMode, editor, rawSource]);
+
+  /** 恢复某份快照到草稿栏。 */
+  const restoreDraftContent = useCallback((snapshot: string) => {
+    if (editorMode === "rich" && editor) {
+      editor.commands.setContent(snapshot);
+      setRawSource(snapshot);
+    } else {
+      setRawSource(snapshot);
+    }
+  }, [editorMode, editor, setRawSource]);
+
+  function addComposeAiFiles(files: FileList | File[]) {
+    const next = Array.from(files).filter((file) => !aiContextFiles.some((item) => item.name === file.name && item.size === file.size && item.lastModified === file.lastModified));
+    if (next.length > 0) setAiContextFiles((current) => [...current, ...next]);
+  }
+
+  function handleComposeAiDrop(event: React.DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const messageId = event.dataTransfer.getData("application/x-pebble-message-id").trim();
+    const attachmentId = event.dataTransfer.getData("application/x-pebble-attachment-id").trim();
+    const files = Array.from(event.dataTransfer.files ?? []);
+    if (messageId) {
+      const title = event.dataTransfer.getData("text/plain").trim() || `邮件 ${messageId.slice(0, 8)}`;
+      setAiContextMessages((current) => current.some((item) => item.id === messageId) ? current : [...current, { id: messageId, title }]);
+    }
+    if (files.length > 0) addComposeAiFiles(files);
+    if (attachmentId && files.length === 0) {
+      void readAttachmentFile(attachmentId).then((attachment) => {
+        addComposeAiFiles([new File([new Uint8Array(attachment.bytes)], attachment.name, { type: attachment.mime_type || "" })]);
+      }).catch(() => useToastStore.getState().addToast({ message: "读取拖入附件失败", type: "error" }));
+    }
+  }
+
+  function handleComposeAiPaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const files = Array.from(event.clipboardData.files ?? []);
+    if (files.length === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    addComposeAiFiles(files);
+  }
+
+  async function handleAiGenerate() {
+    if (aiGenerating || !aiInstruction.trim()) return;
+    // 生成前记住用户当前的草稿（撤销到上一步用），相同内容不重复入栈。
+    const current = readDraftContent().trim();
+    if (current) {
+      setAiSnapshots((prev) => (prev[prev.length - 1] === current ? prev : [...prev, current].slice(-8)));
+    }
+    setAiRedoSnapshots([]);
+    setAiGenerating(true);
+    try {
+      // 与右侧 AI 写作保持一致：带 system 提示词，要求只输出邮件正文。
+      let styleProfile = "";
+      try {
+        const profiles = await listStyleProfiles();
+        const selected = profiles.find((p) => p.id === effectiveStyleId) ?? profiles.find((p) => p.isActive);
+        styleProfile = selected?.profile ?? "";
+      } catch {
+        styleProfile = "";
+      }
+      const languageInstruction = effectiveLanguage === "auto"
+        ? "语言：自动判断；回复时优先沿用来信语言，新联系人根据联系人习惯判断，缺少依据时默认英文。"
+        : `语言：只使用${effectiveLanguage}。`;
+      const system = [languageInstruction,
+        "你现在扮演我（外贸业务人员），根据我的写作风格写一封商务邮件。",
+        (() => { const role = getActiveWorkRole(fromAccountId); return role ? `【我的当前工作角色（用户已允许用于 AI 写作）】\n职位：${role.jobTitle}\n公司：${role.company}\n负责工作：${role.responsibilities}\n产品与市场：${role.productsMarkets}\n可处理范围：${role.permissions}\n沟通偏好：${role.preferences}\n必须遵守：${role.rules}` : ""; })(),
+        styleProfile ? `【我的写作风格】\n${styleProfile}` : "（未设置风格档案，按通用专业外贸语气书写）",
+        "【硬性要求】",
+        "1. 只输出邮件正文本身（含合适的称呼与正文），绝对不要输出任何解释、说明、前言、选项列表，不要出现\"以下是\"\"好的\"\"你可以\"等引导语。",
+        "2. 每一轮都输出完整、可直接使用的邮件正文（称呼+正文+结尾），内容充分、表述专业；即使对话前文已有草稿，也不得省略、只输出修改片段或大幅精简成几句话。",
+        // 有默认签名 → 禁止落款（避免双重签名）；没有 → 允许 AI 按风格写署名结尾。
+        (effectiveSignatureId && signatures.some((s) => s.id === effectiveSignatureId && (s.content ?? "").trim())
+          ? "3. 不要生成任何签名/落款/署名行（如 Best regards / Regards / Kind regards / Sincerely / Yours faithfully / 此致 / 敬礼 / 你的名字等）。正文在最后一句问候或内容后直接结束——账号的默认签名会由系统自动附加，重复落款会造成邮件出现两个签名。"
+          : "3. 你可以在正文结尾按你的写作风格写署名/落款（当前账号未设置默认签名，落款需要由正文自带）。"),
+        "4. 不要使用占位符（如 [Your Name]），不确定的内容用自然、稳妥的表达带过。",
+        "5. 【语言硬性要求】整封邮件必须使用单一语言（中文或英文，二选一），禁止在同一封内中英混杂；回复邮件时使用与原文相同的语言（原文是英文就用英文，是中文就用中文）。即使风格档案、工作角色或客户背景里出现另一种语言的片段，也只能用作参考语境，不能复制到正文里。如果目标收件人/原邮件/指令都是英文，则全文只能使用英文；不能用 \"Your礼品店\" / \"灯饰\" 这类把中文名词硬塞进英文句子的写法。",
+        composeReplyTo?.subject ? `【原邮件主题】${composeReplyTo.subject}` : "",
+        quotedReplyHtml ? `【原文内容摘要】\n${quotedReplyHtml.replace(/<[^>]+>/g, "").slice(0, 2000)}` : "",
+      ].filter(Boolean).join("\n\n");
+      const contextParts: string[] = [];
+      if (aiContextMessages.length > 0) {
+        const messages = await getMessagesBatch(aiContextMessages.map((item) => item.id));
+        contextParts.push(messages.map((message) => `【拖入邮件】\n主题：${message.subject}\n${message.body_text}`).join("\n\n"));
+      }
+      for (const file of aiContextFiles) {
+        try {
+          const text = (await extractDocumentText(file)).trim();
+          if (text) contextParts.push(`【拖入文件：${file.name}】\n${text.slice(0, 16000)}`);
+        } catch {
+          contextParts.push(`【拖入文件：${file.name}】（无法读取文字内容，请仅根据文件名处理）`);
+        }
+      }
+      if (selectedKnowledgeIds.length > 0) {
+        try {
+          const selectedItems = (await listKnowledgeItems(writingAccountId)).filter((item) => selectedKnowledgeIds.includes(item.id));
+          if (selectedItems.length > 0) contextParts.push(`【用户明确选择的资料中心文件】\n${selectedItems.map((item) => `资料：${item.name}\n${item.content.slice(0, 12000)}`).join("\n\n")}`);
+        } catch { /* 资料不可用时不阻断草稿生成 */ }
+      } else if (effectiveIncludeKnowledge) {
+        try {
+          const snippets = await searchKnowledgeBase(`${subject}\n${aiInstruction}`, 3, writingAccountId);
+          if (snippets.length > 0) {
+            contextParts.push(`【本次参考资料库】\n${snippets.map((item) => `${item.name}（${item.locator || item.section || "资料"}）：${item.content}`).join("\n\n")}`);
+          }
+        } catch {
+          // 资料库不可用时仍允许邮件生成，不阻断草稿。
+        }
+      }
+      // 关键：把当前草稿栏内容也作为上下文带给模型。
+      // 第二轮"继续对话"时模型必须知道要基于哪封信调整；如果只传
+      // "调整格式"四个字而没有草稿内容，模型不知道改什么，就会输出
+      // 极简的、和第一轮不搭边的内容（此前 bug 的根因之一）。
+      const draftNow = readDraftContent().trim();
+      const draftPart = draftNow ? `【当前草稿内容（用户正在编辑的邮件，请基于它调整）】\n${draftNow.slice(0, 12000)}` : "";
+      const userMessage = [aiInstruction.trim(), draftPart, contextParts.join("\n\n")]
+        .filter(Boolean)
+        .join("\n\n");
+      const nextHistory: { role: "user" | "assistant"; content: string }[] = [
+        ...aiHistory,
+        { role: "user", content: userMessage },
+      ];
+      const turns: ChatTurn[] = [
+        { role: "system", content: system },
+        ...nextHistory,
+      ];
+      // 全局任务标记：即使切到其他页面也不中断、不丢（组件卸载不影响 store）。
+      useUIStore.getState().setAiBgTask({ running: true, source: "compose", result: null });
+      const reply = await aiChat(turns);
+      const selectedSignature = signatures.find((signature) => signature.id === effectiveSignatureId);
+      const signatureText = selectedSignature?.content
+        ?.replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<[^>]+>/g, "")
+        .trim();
+      const draftReply = signatureText && !reply.includes(signatureText)
+        ? `${reply.trim()}\n\n--\n${signatureText}`
+        : reply;
+      useUIStore.getState().setAiBgTask({ running: false, source: "compose", result: reply });
+      // 写回共享对话历史（含 AI 回复），右侧/悬浮继续生成时能读到前文。
+      setAiHistory([...nextHistory, { role: "assistant", content: reply }]);
+      if (!mountedRef.current) {
+        // 用户已切走：暂存结果，回到写信页时自动应用（后台生成不丢）。
+        useUIStore.getState().setPendingAiDraft(draftReply);
+        useToastStore.getState().addToast({ message: "AI 草稿已生成，回到写信页即可查看。", type: "success" });
+      } else {
+        writeAiReplyToDraft(draftReply);
+        useToastStore.getState().addToast({ message: "AI 草稿已写入正文，可继续编辑或再次输入指令调整。", type: "success" });
+      }
+      setAiInstruction("");
+    } catch (error) {
+      useToastStore.getState().addToast({ message: `AI 生成失败：${String(error)}`, type: "error" });
+    } finally {
+      setAiGenerating(false);
+    }
+  }
+
+  /** 撤销到上一步：回到自己修改过的上一版草稿。 */
+  function handleAiUndo() {
+    const snapshot = aiSnapshots[aiSnapshots.length - 1];
+    if (!snapshot) return;
+    const current = readDraftContent().trim();
+    if (current) setAiRedoSnapshots((prev) => [...prev, current].slice(-8));
+    restoreDraftContent(snapshot);
+    setAiSnapshots((prev) => prev.slice(0, -1));
+    useToastStore.getState().addToast({ message: "已恢复到上一版草稿。", type: "success" });
+  }
+
+  /** 恢复到撤销前的下一版草稿。 */
+  function handleAiRedo() {
+    const snapshot = aiRedoSnapshots[aiRedoSnapshots.length - 1];
+    if (!snapshot) return;
+    const current = readDraftContent().trim();
+    if (current) setAiSnapshots((prev) => [...prev, current].slice(-8));
+    restoreDraftContent(snapshot);
+    setAiRedoSnapshots((prev) => prev.slice(0, -1));
+    useToastStore.getState().addToast({ message: "已恢复到下一版草稿。", type: "success" });
+  }
+
+  /** 工具栏“插入签名”：先选择该账号的签名，再插入到光标处。 */
+  function handleInsertSignature(signature: EmailSignature) {
+    try {
+      const content = signature.content.trim();
+      if (!content) {
+        useToastStore.getState().addToast({ message: "当前账号尚未设置签名，可在 设置 → 账号 → 邮件签名 中添加。", type: "error" });
+        return;
+      }
+      if (editorMode === "rich" && editor) {
+        const isHtml = /<[a-z][\s\S]*>/i.test(content);
+        const safeContent = isHtml
+          ? content
+          : content.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r?\n/g, "<br>");
+        // 与自动带出的签名格式统一：`<br/><br/>` 间距 + `--` 分隔线 + 签名。
+        // 之前手动插入是裸签名（无分隔线），和写新邮件自动带出的签名不一致。
+        editor.chain().focus().insertContent(`<br/><br/><div style="color:var(--color-text-secondary);font-size:13px">--<br/>${safeContent}</div>`).run();
+      } else {
+        setRawSource((previous) => `${(previous || "").trimEnd()}\n\n${content}`.trimStart());
+      }
+      setSignaturePickerOpen(false);
+    } catch (error) {
+      useToastStore.getState().addToast({ message: `插入签名失败：${String(error)}`, type: "error" });
+    }
+  }
+
+  function openSignaturePicker() {
+    if (signatures.length === 0) {
+      useToastStore.getState().addToast({ message: "当前账号没有可用签名，请先在账号设置中添加。", type: "error" });
+      return;
+    }
+    setSignaturePickerOpen((open) => !open);
+  }
+
+  // 从其他入口后台生成完成后回到写信页时，自动应用暂存结果。
+  // 必须等"内容初始化完成"（签名加载 + setContent 初始内容）之后再消费，
+  // 否则会被初始化 effect 的 setContent(editorContent) 覆盖成空白。
+  const pendingAiDraft = useUIStore((s) => s.pendingAiDraft);
+  useEffect(() => {
+    if (!isActive || !editorContentReady || !pendingAiDraft) return;
+    useUIStore.getState().setPendingAiDraft(null);
+    writeAiReplyToDraft(pendingAiDraft);
+    useToastStore.getState().addToast({ message: "AI 后台生成的草稿已应用到正文。", type: "success" });
+  }, [isActive, editorContentReady, pendingAiDraft, writeAiReplyToDraft]);
+  function handleAiClear() {
+    setAiHistory([]);
+    setAiInstruction("");
+  }
+  // ─── Knowledge base insertion ────────────────────────────────────────────────
+  const [showKnowledgePicker, setShowKnowledgePicker] = useState(false);
+  const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>([]);
+
+  async function toggleKnowledgePicker() {
+    if (knowledgeItems.length === 0) {
+      try {
+        setKnowledgeItems(await listKnowledgeItems(writingAccountId));
+      } catch {
+        /* ignore */
+      }
+    }
+    setShowKnowledgePicker((v) => !v);
+  }
+
+  // 把资料库条目作为附件加入邮件（资料库存的是文本内容，生成同名的 .txt 文件）
+  async function insertKnowledge(item: KnowledgeItem) {
+    setShowKnowledgePicker(false);
+    const fileName = /\.\w+$/.test(item.name) ? item.name : `${item.name}.txt`;
+    const file = new File([item.content], fileName, { type: "text/plain" });
+    try {
+      await stageAttachmentFiles([file]);
+    } catch (err) {
+      setSendError(typeof err === "string" ? err : "加入资料库附件失败，请重试");
+    }
+  }
+
+  useEffect(() => {
+    const body = editorMode === "rich" && editor ? editor.getHTML() : rawSource;
+    setActiveDraftContext({ fromAccountId, to, cc, bcc, subject, body }, tabId);
+    return () => setActiveDraftContext(null, tabId);
+  }, [fromAccountId, to, cc, bcc, subject, rawSource, richTextHtml, editorMode, editor, setActiveDraftContext, tabId]);
+
+  useEffect(() => {
+    if (!isActive || pendingAiBody == null) return;
+    if (editorMode === "rich" && editor) {
+      editor.commands.setContent(pendingAiBody);
+    } else {
+      setRawSource(pendingAiBody);
+    }
+    clearPendingAiBody(tabId);
+  }, [isActive, pendingAiBody, editorMode, editor, setRawSource, clearPendingAiBody, tabId]);
 
   async function refreshTemplates() {
     try {
@@ -139,6 +579,40 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
       staged.push({ name: file.name, path, size: file.size });
     }
     setAttachments((prev) => [...prev, ...staged]);
+  }
+
+  /** 把图片文件转成 base64 data URL（用于插入正文）。 */
+  function fileToDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  /** 判断文件名是否为常见图片格式。 */
+  function isImageFileName(name: string): boolean {
+    return /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(name);
+  }
+
+  /** 把本地附件（图片）插入到正文光标处，并从附件栏移除。 */
+  async function insertAttachmentAsInlineImage(att: ComposeAttachment) {
+    if (!editor) return;
+    try {
+      const b64 = await invoke<string>("read_file_as_base64", { path: att.path });
+      const mime = att.name.toLowerCase().endsWith(".png") ? "image/png"
+        : att.name.toLowerCase().endsWith(".gif") ? "image/gif"
+        : att.name.toLowerCase().endsWith(".webp") ? "image/webp"
+        : att.name.toLowerCase().endsWith(".bmp") ? "image/bmp"
+        : att.name.toLowerCase().endsWith(".svg") ? "image/svg+xml"
+        : "image/jpeg";
+      editor.chain().focus().setImage({ src: `data:${mime};base64,${b64}` }).run();
+      setAttachments((prev) => prev.filter((a) => a.path !== att.path));
+    } catch (err) {
+      console.warn("Failed to insert attachment as inline image:", err);
+      useToastStore.getState().addToast({ message: t("compose.insertInlineFailed", "插入正文失败，请重试"), type: "error" });
+    }
   }
 
   async function handleSaveTemplate() {
@@ -206,6 +680,49 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
         ? composeReplyTo.message_id_header
         : undefined;
 
+    // ─── Send Guard: soft warning before the email actually goes out ───────────
+    if (fromAccountId) {
+      try {
+        const guardCfg = await getSendGuardConfig();
+        if (guardCfg.enabled) {
+          const verdict = await checkSendGuard({
+            accountId: fromAccountId,
+            to: finalTo,
+            cc: finalCc,
+            bcc: finalBcc,
+            subject,
+            bodyText,
+          });
+          if (verdict.level === "warn" || verdict.level === "block") {
+            const message = verdict.reasons.length
+              ? verdict.reasons.join("\n")
+              : t("sendGuard.warnGeneric");
+            if (verdict.level === "block") {
+              // Strict mode: default is to return and fix; override via "still send".
+              const override = !(await useConfirmStore.getState().confirm({
+                title: t("sendGuard.warnTitle"),
+                message: `${message}\n\n${t("sendGuard.blockHint")}`,
+                confirmLabel: t("sendGuard.editAndReturn"),
+                cancelLabel: t("sendGuard.forceSend"),
+              }));
+              if (!override) return;
+            } else {
+              const ok = await useConfirmStore.getState().confirm({
+                title: t("sendGuard.warnTitle"),
+                message,
+                confirmLabel: t("sendGuard.sendAnyway"),
+                cancelLabel: t("common.cancel", "Cancel"),
+              });
+              if (!ok) return;
+            }
+          }
+        }
+      } catch (err) {
+        // Guard failures must never block a legitimate send.
+        console.warn("Send guard check failed, proceeding to send:", err);
+      }
+    }
+
     sendMutation.mutate(
       {
         accountId: fromAccountId,
@@ -239,8 +756,8 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
           draftIdsByAccountRef.current = {};
           draftIdRef.current = null;
           clearDraftStorage();
-          useComposeStore.getState().setComposeDirty(false);
-          closeCompose();
+          useComposeStore.getState().setComposeDirty(false, tabId);
+          closeCompose(tabId);
         },
         onError: (e) => {
           const msg = e instanceof Error ? e.message : String(e);
@@ -274,7 +791,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
       >
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           <button
-            onClick={closeCompose}
+            onClick={() => closeCompose(tabId)}
             style={composeStyles.backBtn}
             onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = "var(--color-bg-hover, rgba(0,0,0,0.04))"; }}
             onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = "transparent"; }}
@@ -327,7 +844,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
       )}
 
       {/* Fields + Editor */}
-      <div className="scroll-region compose-scroll" style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, overflow: "auto" }}>
+      <div className="scroll-region compose-scroll" data-email-translation-scope style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, overflow: "auto" }}>
         <div className="compose-form-shell">
           {/* From */}
           {accounts.length > 1 && (
@@ -562,8 +1079,50 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
 
               {/* Formatting toolbar */}
               <div className="compose-format-toolbar-slot">
+                <div style={{ position: "relative", display: "inline-block", marginRight: "8px" }}>
+                  <button
+                    type="button"
+                    onClick={() => void toggleKnowledgePicker()}
+                    title="把资料库文件作为附件加入邮件"
+                    className={`compose-toolbar-text-button${showKnowledgePicker ? " is-active" : ""}`}
+                  >
+                    <Library size={14} /> 资料库
+                  </button>
+                  {showKnowledgePicker && (
+                    <div style={{ position: "absolute", top: "28px", left: 0, zIndex: 50, width: "280px", maxHeight: "300px", overflowY: "auto", border: "1px solid var(--color-border)", borderRadius: "8px", background: "#fff", boxShadow: "0 6px 20px rgba(0,0,0,0.18)" }}>
+                      {knowledgeItems.length === 0 ? (
+                        <div style={{ padding: "10px 12px", fontSize: "12px", color: "var(--color-text-secondary)" }}>本地资料库为空，请先在设置中添加资料。</div>
+                      ) : (
+                        knowledgeItems.map((item) => (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => insertKnowledge(item)}
+                            style={{ display: "block", width: "100%", textAlign: "left", padding: "9px 12px", border: 0, borderBottom: "1px solid var(--color-border)", background: "transparent", cursor: "pointer", fontSize: "12px", color: "var(--color-text-primary)" }}
+                          >
+                            <strong>{item.name}</strong>
+                            <span style={{ display: "block", fontSize: "11px", color: "var(--color-text-secondary)", marginTop: "2px" }}>{item.content.slice(0, 60)}…</span>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  )}
+                </div>
                 {editorMode === "rich" && editor && (
-                  <EditorToolbar editor={editor} />
+                  <div style={{ position: "relative" }}>
+                    <EditorToolbar editor={editor} onInsertSignature={openSignaturePicker} />
+                    {signaturePickerOpen && (
+                      <div style={{ position: "absolute", left: 0, top: "30px", zIndex: 1000, minWidth: 220, maxWidth: 320, padding: 6, border: "1px solid var(--color-border)", borderRadius: 7, background: "var(--color-bg-primary)", boxShadow: "0 8px 24px rgba(0,0,0,0.28)" }}>
+                        <div style={{ padding: "4px 8px", fontSize: 11, color: "var(--color-text-secondary)" }}>选择要插入的签名</div>
+                        {signatures.map((signature) => (
+                          <button key={signature.id} type="button" onClick={() => handleInsertSignature(signature)} style={{ display: "block", width: "100%", padding: "7px 8px", border: 0, borderRadius: 5, textAlign: "left", background: "transparent", color: "var(--color-text-primary)", cursor: "pointer" }}>
+                            <strong style={{ fontSize: 12 }}>{signature.name}{signature.is_default ? "（默认）" : ""}</strong>
+                            <span style={{ display: "block", marginTop: 2, fontSize: 11, color: "var(--color-text-secondary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{signature.content.replace(/\s+/g, " ").slice(0, 70)}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 )}
                 {editorMode === "markdown" && (
                   <MarkdownToolbar textareaRef={textareaRef} onInsert={setRawSource} source={rawSource} />
@@ -594,13 +1153,27 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
           {attachments.length > 0 && (
             <div className="compose-inline-panel">
               {attachments.map((att, i) => (
-                <div key={i} style={{
-                  display: "flex", alignItems: "center", gap: "4px",
-                  padding: "4px 8px", borderRadius: "4px",
-                  backgroundColor: "var(--color-bg-hover)", fontSize: "12px",
-                }}>
-                  <FileText size={12} />
-                  <span style={{ maxWidth: "150px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{att.name}</span>
+                <div
+                  key={i}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    setAttachmentMenu({ x: event.clientX, y: event.clientY, index: i });
+                  }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: "4px",
+                    padding: "4px 8px", borderRadius: "4px",
+                    backgroundColor: "var(--color-bg-hover)", fontSize: "12px",
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => void invoke("open_local_file", { path: att.path })}
+                    title="打开附件查看"
+                    style={{ display: "flex", alignItems: "center", gap: "4px", border: "none", background: "none", cursor: "pointer", padding: 0, color: "var(--color-text-primary)" }}
+                  >
+                    <FileText size={12} />
+                    <span style={{ maxWidth: "150px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: "underline dotted" }}>{att.name}</span>
+                  </button>
                   <span style={{ color: "var(--color-text-secondary)", fontSize: "11px" }}>
                     {att.size < 1024 * 1024 ? `${(att.size / 1024).toFixed(0)} KB` : `${(att.size / (1024 * 1024)).toFixed(1)} MB`}
                   </span>
@@ -616,6 +1189,27 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
                 </div>
               ))}
             </div>
+          )}
+
+          {attachmentMenu && (() => {
+            const att = attachments[attachmentMenu.index];
+            if (!att) return null;
+            const items: ContextMenuItem[] = [
+              { label: t("compose.openAttachment", "打开附件"), icon: <FileText size={14} />, onClick: () => void invoke("open_local_file", { path: att.path }) },
+              { label: t("compose.showInFolder", "在文件夹中显示"), icon: <FolderOpen size={14} />, onClick: () => void invoke("show_in_folder", { path: att.path }) },
+              { separator: true },
+              { label: t("compose.insertInlineImage", "插入到正文"), icon: <FileText size={14} />, disabled: !isImageFileName(att.name), onClick: () => void insertAttachmentAsInlineImage(att) },
+              { separator: true },
+              { label: t("compose.copyFilename", "复制文件名"), icon: <Copy size={14} />, onClick: () => { void navigator.clipboard.writeText(att.name).then(() => useToastStore.getState().addToast({ message: t("compose.copied", "已复制"), type: "success" })); } },
+              { label: t("compose.copyPath", "复制完整路径"), icon: <Copy size={14} />, onClick: () => { void navigator.clipboard.writeText(att.path).then(() => useToastStore.getState().addToast({ message: t("compose.copied", "已复制"), type: "success" })); } },
+              { separator: true },
+              { label: t("compose.removeAttachment", "删除附件"), icon: <Trash2 size={14} />, danger: true, onClick: () => setAttachments((prev) => prev.filter((_, j) => j !== attachmentMenu.index)) },
+            ];
+            return <ContextMenu x={attachmentMenu.x} y={attachmentMenu.y} items={items} onClose={() => setAttachmentMenu(null)} />;
+          })()}
+
+          {inlineImageMenu && (
+            <ContextMenu x={inlineImageMenu.x} y={inlineImageMenu.y} items={inlineImageMenu.items} onClose={() => setInlineImageMenu(null)} />
           )}
 
           {/* Save template dialog */}
@@ -667,7 +1261,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
 
           {/* Editor area */}
           <div
-            className="compose-editor-area"
+            className={`compose-editor-area${isReply ? " compose-editor-area--reply" : ""}`}
             onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
             onDragLeave={() => setIsDragging(false)}
             onDrop={async (e) => {
@@ -685,24 +1279,93 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
             onPaste={async (e) => {
               const items = e.clipboardData?.items;
               if (!items) return;
-              const imageFiles: File[] = [];
+              const pastedFiles: File[] = [];
               for (const item of Array.from(items)) {
-                if (item.type.startsWith("image/")) {
+                if (item.kind === "file") {
                   const file = item.getAsFile();
-                  if (file) imageFiles.push(file);
+                  if (file) pastedFiles.push(file);
                 }
               }
-              if (!imageFiles.length) return;
+              if (!pastedFiles.length) return;
               e.preventDefault();
-              try {
-                await stageAttachmentFiles(imageFiles);
-              } catch (err) {
-                console.warn("Failed to stage pasted image:", err);
-                setSendError(t("compose.attachmentStageError", "Failed to attach file"));
+              // 图片 → 默认插入正文（方案 C）；其他文件 → 附件
+              const images = pastedFiles.filter((f) => f.type.startsWith("image/"));
+              const others = pastedFiles.filter((f) => !f.type.startsWith("image/"));
+              for (const img of images) {
+                try {
+                  const dataUrl = await fileToDataUrl(img);
+                  editor?.chain().focus().setImage({ src: dataUrl }).run();
+                } catch (err) {
+                  console.warn("Failed to paste image into body:", err);
+                }
+              }
+              if (others.length > 0) {
+                try {
+                  await stageAttachmentFiles(others);
+                } catch (err) {
+                  console.warn("Failed to stage pasted files:", err);
+                  setSendError(t("compose.attachmentStageError", "Failed to attach file"));
+                }
               }
             }}
           >
-            <div className="compose-editor-surface">
+            <div
+              className={`compose-editor-surface${isReply ? " compose-editor-surface--reply" : ""}`}
+              onContextMenu={(event) => {
+                const target = event.target as HTMLElement | null;
+                const img = target?.closest("img");
+                if (!img || !editor) return;
+                event.preventDefault();
+                const src = img.getAttribute("src") ?? "";
+                const isInlineData = src.startsWith("data:image/");
+                const items: ContextMenuItem[] = [
+                  { label: t("compose.imgToAttachment", "转为附件"), icon: <Paperclip size={14} />, disabled: !isInlineData, onClick: () => {
+                    if (!isInlineData) return;
+                    try {
+                      const [meta, b64] = src.split(",");
+                      const mime = meta.match(/^data:(.*?);/)?.[1] ?? "image/png";
+                      const bin = atob(b64);
+                      const bytes = new Uint8Array(bin.length);
+                      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                      const ext = (mime.split("/")[1] || "png").replace("+xml", "").replace("jpeg", "jpg");
+                      const file = new File([bytes], `pasted-${Date.now()}.${ext}`, { type: mime });
+                      void stageAttachmentFiles([file]);
+                      // 从正文移除该图片（改为附件）
+                      const { state } = editor;
+                      const { from } = state.selection;
+                      const node = state.doc.nodeAt(from);
+                      const imgPos = node?.type.name === "image" ? from : from - 1;
+                      editor.chain().focus().deleteRange({ from: Math.max(0, imgPos), to: imgPos + 1 }).run();
+                    } catch (err) {
+                      console.warn("Failed to convert image to attachment:", err);
+                      useToastStore.getState().addToast({ message: t("compose.imgToAttachmentFailed", "转换失败，请重试"), type: "error" });
+                    }
+                  } },
+                  { label: t("compose.copyImage", "复制图片"), icon: <Copy size={14} />, onClick: () => {
+                    if (src.startsWith("data:")) {
+                      fetch(src).then((r) => r.blob()).then((blob) => navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])).catch(() => {});
+                    }
+                  } },
+                  { separator: true },
+                  { label: t("compose.deleteImage", "删除图片"), icon: <Trash2 size={14} />, danger: true, onClick: () => {
+                    const { state } = editor;
+                    const { from } = state.selection;
+                    const node = state.doc.nodeAt(from);
+                    const imgPos = node?.type.name === "image" ? from : from - 1;
+                    editor.chain().focus().deleteRange({ from: Math.max(0, imgPos), to: imgPos + 1 }).run();
+                  } },
+                ];
+                setInlineImageMenu({ x: event.clientX, y: event.clientY, items });
+              }}
+              style={{
+                // 新邮件和回复统一从较矮的草稿区开始；内容超过可用高度时，
+                // 草稿区内部滚动，不再把 AI 指令框和原文引用挤出窗口。
+                minHeight: `${Math.max(90, draftEditorHeight)}px`,
+                maxHeight: "38vh",
+                overflowY: "auto",
+                flex: "0 0 auto",
+              }}
+            >
               {editorMode === "rich" ? (
                 <EditorContent
                   editor={editor}
@@ -738,8 +1401,228 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
                 />
               )}
             </div>
+            {/* AI 写作助手 —— 草稿栏下方：生成结果直接写入草稿栏 */}
+            <div style={{
+              margin: "10px 0",
+              border: "1px solid var(--color-border)",
+              borderRadius: 8,
+              padding: 10,
+              background: "color-mix(in srgb, var(--color-accent) 4%, var(--color-bg-secondary))",
+            }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600, color: "var(--color-text-primary)" }}>
+                  <Sparkles size={13} /> AI 写作助手（支持多轮对话，结果直接写入草稿）
+                </div>
+                {aiHistory.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleAiClear}
+                    style={{ background: "none", border: 0, color: "var(--color-text-secondary)", cursor: "pointer", fontSize: 11 }}
+                    title="清空对话"
+                  >
+                    清空
+                  </button>
+                )}
+              </div>
+              <div onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); }} onDrop={handleComposeAiDrop}>
+                <textarea
+                  value={aiInstruction}
+                  onChange={(e) => setAiInstruction(e.target.value)}
+                  onInput={(e) => resizeAutoGrowTextarea(e.currentTarget, 260)}
+                  onPaste={handleComposeAiPaste}
+                  onFocus={() => setAiInputFocusOwner("compose")}
+                  placeholder={aiPanelLocked
+                    ? "右侧 AI 写作当前激活中，点击此处切换为在本处输入"
+                    : "输入指令，也可以直接粘贴或拖入邮件、附件和多个文件。生成结果会直接写入正文草稿。"}
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    minHeight: 72,
+                    maxHeight: 260,
+                    padding: 8,
+                    border: "1px solid var(--color-border)",
+                    borderRadius: "6px 6px 0 0",
+                    background: aiPanelLocked ? "var(--color-bg-secondary)" : "var(--color-bg-primary)",
+                    color: "var(--color-text-primary)",
+                    fontSize: 13,
+                    resize: "none",
+                    fontFamily: "inherit",
+                    opacity: aiPanelLocked ? 0.5 : 1,
+                  }}
+                  disabled={aiGenerating}
+                />
+                <div style={{ marginTop: 6 }}>
+                  <KnowledgePicker accountId={writingAccountId} selectedIds={selectedKnowledgeIds} onChange={setSelectedKnowledgeIds} />
+                </div>
+                {(aiContextFiles.length > 0 || aiContextMessages.length > 0) && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "7px 8px", border: "1px dashed var(--color-accent)", borderTop: 0, borderRadius: "0 0 6px 6px" }}>
+                    {aiContextMessages.map((item) => <span key={item.id} style={{ fontSize: 11, padding: "3px 7px", borderRadius: 10, background: "var(--color-bg-hover)" }}>邮件：{item.title} <button type="button" onClick={() => setAiContextMessages((current) => current.filter((x) => x.id !== item.id))} style={{ border: 0, background: "transparent", cursor: "pointer" }}>×</button></span>)}
+                    {aiContextFiles.map((file) => <span key={`${file.name}-${file.size}-${file.lastModified}`} style={{ fontSize: 11, padding: "3px 7px", borderRadius: 10, background: "var(--color-bg-hover)" }}>文件：{file.name} <button type="button" onClick={() => setAiContextFiles((current) => current.filter((x) => x !== file))} style={{ border: 0, background: "transparent", cursor: "pointer" }}>×</button></span>)}
+                  </div>
+                )}
+                {(aiContextFiles.length > 0 || aiContextMessages.length > 0) && <div style={{ marginTop: 7, fontSize: 11, color: "var(--color-text-secondary)" }}>已添加 {aiContextMessages.length + aiContextFiles.length} 项上下文；点击生成后会使用这些内容发送给当前配置的 AI 服务商。</div>}
+              </div>
+              {/* 快捷调整提示：第一轮生成之后出现，点一下按该要求调整（不必打字） */}
+              <div style={{ marginTop: 8, borderTop: "1px solid var(--color-border)", paddingTop: 7 }}>
+                <button
+                  type="button"
+                  onClick={() => setWritingOptionsOpen((open) => !open)}
+                  style={{ border: 0, background: "transparent", padding: 0, color: "var(--color-text-secondary)", cursor: "pointer", fontSize: 11 }}
+                >
+                  {writingOptionsOpen ? "收起写作设置" : "写作设置"} · {effectiveLanguage === "auto" ? "自动判断语言" : effectiveLanguage} · {writingProfiles.find((profile) => profile.id === effectiveStyleId)?.name ?? "通用商务风"}
+                </button>
+                {writingOptionsOpen && (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 7, marginTop: 7, padding: 8, borderRadius: 6, background: "var(--color-bg-secondary)" }}>
+                    <label style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>生成语言
+                      <select value={effectiveLanguage} onChange={(event) => setLanguageOverride(event.target.value)} style={{ width: "100%", marginTop: 3, padding: "4px 5px", fontSize: 11 }}>
+                        <option value="auto">自动判断</option>
+                        <option value="中文">中文</option>
+                        <option value="English">English</option>
+                        <option value="Español">Español</option>
+                        <option value="Deutsch">Deutsch</option>
+                        <option value="Français">Français</option>
+                        <option value="日本語">日本語</option>
+                      </select>
+                    </label>
+                    <label style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>写作风格
+                      <select value={effectiveStyleId} onChange={(event) => setStyleOverride(event.target.value)} style={{ width: "100%", marginTop: 3, padding: "4px 5px", fontSize: 11 }}>
+                        {writingProfiles.length === 0 && <option value="">通用商务风</option>}
+                        {writingProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                      </select>
+                    </label>
+                    <label style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>签名
+                      <select value={effectiveSignatureId} onChange={(event) => setSignatureOverride(event.target.value)} style={{ width: "100%", marginTop: 3, padding: "4px 5px", fontSize: 11 }}>
+                        <option value="">不自动选择</option>
+                        {signatures.map((signature) => <option key={signature.id} value={signature.id}>{signature.name}{signature.is_default ? "（默认）" : ""}</option>)}
+                      </select>
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: "var(--color-text-secondary)" }}>
+                      <input type="checkbox" checked={effectiveIncludeKnowledge} onChange={(event) => setKnowledgeOverride(event.target.checked)} /> 生成时参考相关资料库内容
+                    </label>
+                    <button type="button" onClick={() => { setLanguageOverride(null); setStyleOverride(null); setKnowledgeOverride(null); setSignatureOverride(null); }} style={{ justifySelf: "start", alignSelf: "end", border: "1px solid var(--color-border)", background: "transparent", borderRadius: 5, padding: "4px 7px", fontSize: 11, cursor: "pointer" }}>恢复账号默认</button>
+                    <div style={{ gridColumn: "1 / -1", fontSize: 10, color: "var(--color-text-tertiary, var(--color-text-secondary))" }}>这里的调整只影响本次草稿；要修改长期默认值，请在右侧 AI 写作的“其他选项”中调整。</div>
+                  </div>
+                )}
+              </div>
+              {aiHistory.length >= 1 && (
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
+                {["更简短一些", "语气更礼貌", "语气直接一点", "更正式", "用英文写", "不要占位符"].map((hint) => (
+                  <button
+                    key={hint}
+                    type="button"
+                    disabled={aiGenerating}
+                    onClick={() => {
+                      setAiInputFocusOwner("compose");
+                      setAiInstruction(hint);
+                      void handleAiGenerate();
+                    }}
+                    style={{
+                      padding: "3px 10px",
+                      fontSize: 11,
+                      border: "1px solid var(--color-border)",
+                      borderRadius: 12,
+                      background: "transparent",
+                      color: "var(--color-text-secondary)",
+                      cursor: aiGenerating ? "not-allowed" : "pointer",
+                      opacity: aiGenerating ? 0.5 : 1,
+                    }}
+                  >
+                    {hint}
+                  </button>
+                ))}
+              </div>
+              )}
+              <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  disabled={aiGenerating || !aiInstruction.trim()}
+                  onClick={() => {
+                    // 点击生成 = 激活本处输入并生成（支持互相切换）
+                    setAiInputFocusOwner("compose");
+                    void handleAiGenerate();
+                  }}
+                  style={{
+                    padding: "5px 14px",
+                    border: 0,
+                    background: "var(--color-accent)",
+                    color: "#fff",
+                    borderRadius: 6,
+                    cursor: !aiGenerating && aiInstruction.trim() ? "pointer" : "not-allowed",
+                    opacity: !aiGenerating && aiInstruction.trim() ? 1 : 0.6,
+                    fontSize: 12,
+                    fontWeight: 600,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                  }}
+                >
+                  <Sparkles size={12} className={aiGenerating ? "spinner" : ""} />
+                  {aiGenerating ? "生成中…" : aiHistory.length > 0 ? "继续对话（覆盖草稿）" : "生成草稿"}
+                </button>
+                {aiSnapshots.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleAiUndo}
+                    title="回到上一版（你自己修改过的）草稿"
+                    style={{
+                      padding: "5px 12px",
+                      border: "1px solid var(--color-border)",
+                      background: "transparent",
+                      color: "var(--color-text-primary)",
+                      borderRadius: 6,
+                      cursor: "pointer",
+                      fontSize: 12,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 5,
+                    }}
+                  >
+                    <Undo2 size={12} /> 撤销到上一步
+                  </button>
+                )}
+                {aiRedoSnapshots.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleAiRedo}
+                    title="恢复到下一版草稿"
+                    style={{
+                      padding: "5px 12px",
+                      border: "1px solid var(--color-border)",
+                      background: "transparent",
+                      color: "var(--color-text-primary)",
+                      borderRadius: 6,
+                      cursor: "pointer",
+                      fontSize: 12,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 5,
+                    }}
+                  >
+                    <Redo2 size={12} /> 恢复到下一步
+                  </button>
+                )}
+              </div>
+            </div>
+            {/* 回复模式下，编辑器与原邮件之间的可拖动分界 */}
+            {isReply && (
+              <div
+                role="separator"
+                aria-orientation="horizontal"
+                aria-label="拖动调整草稿栏高度"
+                onMouseDown={beginDraftResize}
+                title="拖动调整草稿栏与原邮件之间的分界；原邮件默认显示到底部"
+                style={{
+                  cursor: "row-resize",
+                  height: 6,
+                  margin: "4px 0",
+                  background:
+                    "linear-gradient(to right, transparent, color-mix(in srgb, var(--color-accent) 40%, transparent) 50%, transparent)",
+                  borderRadius: 3,
+                }}
+              />
+            )}
             {quotedReplyHtml && (
-              <div className="compose-quoted-reply">
+              <div className="compose-quoted-reply compose-quoted-reply--page-scroll" style={isReply ? { flex: "0 0 auto", minHeight: 0, overflow: "visible", display: "block" } : undefined}>
                 <button
                   type="button"
                   className="compose-quoted-reply-toggle"

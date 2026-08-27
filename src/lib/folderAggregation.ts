@@ -82,9 +82,14 @@ export function sortFoldersForSidebar(folders: Folder[]): Folder[] {
 
 export function folderIdsForSelection(folderId: string | null, folders: Folder[]): string[] {
   if (!folderId) return [];
-  const role = roleFromAllAccountsFolderId(folderId) ?? folders.find((folder) => folder.id === folderId)?.role;
-  if (!role) return folders.some((folder) => folder.id === folderId) ? [folderId] : [];
-  return folders.filter((folder) => folder.role === role).map((folder) => folder.id);
+  // 全部账号虚拟文件夹（如"所有未读"）：跨账号按 role 聚合
+  const allRole = roleFromAllAccountsFolderId(folderId);
+  if (allRole) {
+    return folders.filter((folder) => folder.role === allRole).map((folder) => folder.id);
+  }
+  // 具体账号的真实文件夹：只看它自己，不跨账号合并同 role 文件夹
+  // （否则点击账号 A 的收件箱会混入账号 B 的收件箱）
+  return folders.some((folder) => folder.id === folderId) ? [folderId] : [];
 }
 
 export function roleForSelection(folderId: string | null, folders: Folder[]): Folder["role"] {

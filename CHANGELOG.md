@@ -6,6 +6,66 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Tool-calling agent infrastructure: `complete_chat_with_tools` with OpenAI-compatible tools, an agent loop (`run_agent`) with `web_search` / `fetch_url` / `gleif_company` tools, automatic fallback to plain chat when the model does not support function calling, and a forced final-answer round when the model gets stuck in a tool loop.
+- Customer management (renamed from customer profiles): follow-up stage (待开发→已成交/流失), multi-select characteristic tags, A/B/C tier, next-follow-up date, and a follow-up timeline. Profile generation now runs as a background task (survives page switches), searches the web autonomously, and auto-inserts a mail follow-up entry derived from the correspondence with that customer.
+- Lead discovery (renamed from AI find customers): agent-driven search returns structured candidates (company, website, country, customer type, reason, public emails, source); one-click "add to customer management" and one-click AI-generated outreach email that opens pre-filled in the compose window.
+- Credit research (renamed from background research): agent-driven deep-diligence button producing a structured report (profile, capability, supply-chain clues, risk signals, verification items, verdict, sources).
+- Message context-menu actions: edit any message (not only drafts), forward as .eml attachment, new mail to the same correspondent (sender for inbox / recipient for sent), create filter pre-filled from the message sender/recipient, export as .eml, and print.
+- Local `.eml` export backend (`build_forward_eml`, `export_message_eml`) and `open_local_file` for opening draft attachments with the default app.
+- Draft improvements: Cc/Bcc fields expanded by default; draft attachments clickable to inspect.
+
+### Changed
+
+- Initial/incremental sync now fetches at most 6 messages per batch (was 50), fixing `Initial sync failed: UID FETCH collect timed out`.
+- History backfill: page size 6 with 3-message fallback, failed sub-pages are skipped instead of aborting the whole folder, body-fetch timeout reduced to 45s, and a dedicated 120s backfill ticker so large folders keep progressing between 15-minute reconciles.
+- Sidebar labels renamed: 开发客户 / 资信调研 / 客户管理.
+- Inputs for lead discovery, credit research, and customer management persist across page switches.
+- Contact auto-classification states clearly when it only had an address to judge (no mail corpus yet) and advises re-running after sync completes.
+
+### Fixed
+
+- Customer profile generation returned empty content when the agent exhausted its turn budget on tool calls (picked the last assistant message with non-empty content and forces a final answer).
+- Agent lead search got stuck in a 24-tool-call loop without emitting the final JSON (tool-call budget enforced in the prompt, turn limit raised, forced final round).
+- Draft attachments could not be opened (`open_external_url` rejected `file://`); now uses `open_local_file`.
+
+## [1.1.1] - 2026-08-05
+
+### Added
+
+- Added a persistent right-side AI writing and foreign-trade tools panel.
+- Added an address book with company, job title, contact-role labels, tags, and mail-history import.
+- Added company-level customer profiles with multiple contacts and roles.
+- Added local knowledge-base parsing for DOCX, XLS/XLSX, PDF, and common text formats.
+- Added email and compose workspace tabs, attachment opening, and clipboard-file attachment paste.
+- Added custom data-location, themes, fonts, and font-size controls.
+- Added a homepage with local unread-mail actions, exchange rates, world clocks, holidays, and the business follow-up board.
+- Added independent customer-research and lead-finder pages with website evidence, GLEIF legal-entity matches, official verification sources, and locally saved research reports.
+- Added current-HS guidance, logistics/vessel/air-cargo tracking entrances, and a container-loading calculator.
+- Added multi-turn AI writing and address-book integration for public company-research results.
+
+### Changed
+
+- Mail lists now load additional pages automatically when scrolling.
+- Initial IMAP sync prioritizes Inbox and Sent history before low-priority Spam/Trash work, so a slow Spam folder cannot prevent mailbox backfill.
+- AI writing can use the active email thread or active compose draft with explicit user authorization.
+- AI writing can now accept multiple dragged emails and multiple local PDF, DOCX, XLS/XLSX, or text files as one-turn context. The selected items are shown before generation and require per-operation confirmation before being sent through the currently configured AI provider (including DeepSeek).
+- New installations default to a `data` folder beside the executable when that directory is writable; existing profiles stay in place until the user chooses an empty destination folder.
+- Switching away from a compose tab keeps the draft open; the discard prompt appears only when the compose tab is closed.
+
+### Fixed
+
+- Reconnect after Windows/Chinese remote-host-forced-close IMAP errors instead of stopping folder polling.
+- Keep Sent and other server folders in the default all-folder synchronization scope.
+- Preserve reply recipients when AI inserts only a body, and insert the selected account's configured signature without duplicating it.
+
+### Known limitations
+
+- AI summarization of private unread mail remains local-only and does not upload the whole inbox. AI use of dragged private files/emails is limited to the explicitly selected items and requires confirmation for each context selection.
+- The first lead-finder implementation uses public legal-entity and trade-data sources. Direct-person enrichment requires a user-provided licensed search/customs/enrichment API.
+- DeepSeek is used as the analysis model; real-time search and email verification providers are intentionally not connected until the user authorizes the specific destination and supplies its API key.
+
 ## [0.1.3] - 2026-07-01
 
 ### Added
@@ -277,7 +337,8 @@ This release includes:
 - Windows installers are not code-signed yet, so Windows SmartScreen may show a warning.
 - Outlook support is still experimental and depends on Microsoft Graph permissions configured by the user.
 
-[Unreleased]: https://github.com/QingJ01/Pebble/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/QingJ01/Pebble/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/QingJ01/Pebble/compare/v0.1.3...v1.1.1
 [0.1.3]: https://github.com/QingJ01/Pebble/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/QingJ01/Pebble/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/QingJ01/Pebble/compare/v0.1.0...v0.1.1

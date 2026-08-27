@@ -67,6 +67,7 @@ export interface MessageSummary {
   cc_list: EmailAddress[];
   bcc_list: EmailAddress[];
   has_attachments: boolean;
+  has_replies: boolean;
   is_read: boolean;
   is_starred: boolean;
   is_draft: boolean;
@@ -148,6 +149,8 @@ export interface SearchHit {
   subject?: string;
   from_address?: string;
   date?: number;
+  has_attachment?: boolean;
+  folder_ids?: string[];
 }
 
 /**
@@ -255,8 +258,21 @@ export interface Rule {
   conditions: string;
   actions: string;
   is_enabled: boolean;
+  /** 归属账号；空字符串 = 适用于所有账号。 */
+  account_id: string;
+  /** 触发时机 JSON 数组，例如 ["on_receive","on_send"]。 */
+  trigger_when: string;
   created_at: number;
   updated_at: number;
+}
+
+/** @rust src-tauri/src/commands/rules.rs → ApplyRulesReport */
+export interface ApplyRulesReport {
+  processed: number;
+  matched: number;
+  actions_applied: number;
+  errors: Array<{ message_id: string; subject: string; error: string }>;
+  matched_messages: Array<{ message_id: string; subject: string; from_address: string; rule_names: string[] }>;
 }
 
 // ─── Search types ───────────────────────────────────────────────────────────────
@@ -273,6 +289,7 @@ export interface AdvancedSearchQuery {
   dateFrom?: number;
   dateTo?: number;
   hasAttachment?: boolean;
+  accountId?: string;
   folderId?: string;
 }
 

@@ -4,11 +4,21 @@ use rusqlite::{params, OptionalExtension};
 use crate::Store;
 
 impl Store {
+    pub fn delete_attachments_by_message(&self, message_id: &str) -> Result<()> {
+        self.with_write(|conn| {
+            conn.execute(
+                "DELETE FROM attachments WHERE message_id = ?1",
+                params![message_id],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn insert_attachment(&self, attachment: &Attachment) -> Result<()> {
         self.with_write(|conn| {
             conn.execute(
                 "INSERT INTO attachments (id, message_id, filename, mime_type, size, local_path, content_id, is_inline)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     attachment.id,
                     attachment.message_id,
@@ -75,6 +85,17 @@ impl Store {
             Ok(result)
         })
     }
+
+    pub fn update_attachment_local_path(&self, attachment_id: &str, local_path: &str) -> Result<()> {
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE attachments SET local_path = ?2 WHERE id = ?1",
+                params![attachment_id, local_path],
+            )?;
+            Ok(())
+        })
+    }
+
 }
 
 #[cfg(test)]
@@ -195,6 +216,28 @@ mod tests {
         let (store, _) = setup_store_with_message();
         let fetched = store.get_attachment("nonexistent").unwrap();
         assert!(fetched.is_none());
+    }
+
+    #[test]
+    fn test_update_attachment_local_path() {
+        let (store, msg_id) = setup_store_with_message();
+        let att_id = new_id();
+        store.insert_attachment(&Attachment {
+            id: att_id.clone(),
+            message_id: msg_id,
+            filename: "history.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            size: 12,
+            local_path: Some("D:\\old\\attachments\\message\\history.pdf".to_string()),
+            content_id: None,
+            is_inline: false,
+        }).unwrap();
+
+        store.update_attachment_local_path(&att_id, "D:\\MailData\\attachments\\message\\history.pdf").unwrap();
+        assert_eq!(
+            store.get_attachment(&att_id).unwrap().unwrap().local_path.as_deref(),
+            Some("D:\\MailData\\attachments\\message\\history.pdf")
+        );
     }
 
     #[test]

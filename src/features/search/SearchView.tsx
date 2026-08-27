@@ -1,14 +1,20 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useTranslation } from "react-i18next";
-import { Search, SlidersHorizontal, Loader } from "lucide-react";
-import type { AdvancedSearchQuery, SearchHit } from "@/lib/api";
-import { advancedSearch, searchMessages } from "@/lib/api";
+import { Search, Loader, ArrowUp, ArrowDown, Paperclip, SlidersHorizontal } from "lucide-react";
+import type { Account, AdvancedSearchQuery, SearchHit } from "@/lib/api";
+import { advancedSearch, deleteMessage, listAccounts, listFolders, searchMessages } from "@/lib/api";
+import { useToastStore } from "@/stores/toast.store";
+import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { useUIStore } from "@/stores/ui.store";
 import SearchFilters from "./SearchFilters";
 import SearchResultItem from "./SearchResultItem";
 import MessageDetail from "@/components/MessageDetail";
+import { useMailStore } from "@/stores/mail.store";
+import SearchFilterDropdown from "@/components/SearchFilterDropdown";
+
+type SearchSortKey = "date" | "subject" | "attachments";
 
 const emptyFilters: AdvancedSearchQuery = {};
 
@@ -17,6 +23,7 @@ function hasActiveFilters(filters: AdvancedSearchQuery): boolean {
     filters.from ||
     filters.to ||
     filters.subject ||
+    filters.text ||
     filters.dateFrom ||
     filters.dateTo ||
     filters.hasAttachment ||
@@ -27,32 +34,93 @@ function hasActiveFilters(filters: AdvancedSearchQuery): boolean {
 export default function SearchView() {
   const { t } = useTranslation();
   const [query, setQuery] = useState("");
+  const activeAccountId = useMailStore((state) => state.activeAccountId);
+  const searchScope = useMailStore((state) => state.searchScope);
+  const searchRange = useMailStore((state) => state.searchRange);
+  const pendingSearchFilters = useUIStore((s) => s.pendingSearchFilters);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [folderNames, setFolderNames] = useState<Record<string, string>>({});
   const [filters, setFilters] = useState<AdvancedSearchQuery>(emptyFilters);
-  const [showFilters, setShowFilters] = useState(false);
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [searchFocused, setSearchFocused] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
+  const [sort, setSort] = useState<{ key: SearchSortKey; dir: "asc" | "desc" }>({ key: "date", dir: "desc" });
   const storeSearchQuery = useUIStore((s) => s.searchQuery);
+  const addToast = useToastStore((s) => s.addToast);
 
   const trimmed = query.trim();
   const filtersActive = hasActiveFilters(filters);
   const searchEnabled = hasSearched && (trimmed.length > 0 || filtersActive);
 
+  useEffect(() => {
+    void listAccounts().then((items) => {
+      setAccounts(items);
+    });
+  }, [activeAccountId]);
+
+  useEffect(() => {
+    if (accounts.length === 0) return;
+    void Promise.all(accounts.map((account) => listFolders(account.id)))
+      .then((folderGroups) => {
+        const next: Record<string, string> = {};
+        folderGroups.flat().forEach((folder) => { next[folder.id] = folder.name; });
+        setFolderNames(next);
+      })
+      .catch(() => {});
+  }, [accounts]);
+
+  // 有效搜索范围：searchRange（内联下拉可切换）> 侧边栏选择 searchScope
+  // auto 跟随侧边栏；all = 全部账号（不传 accountId）
+  const baseAccountId = searchScope?.accountId ?? activeAccountId ?? undefined;
+  const baseFolderId = searchScope?.kind === "folder" ? searchScope.folderId : undefined;
+  const isAllRange = searchRange === "all";
+  const selectedAccountId = isAllRange ? undefined : baseAccountId;
+  const scopedFolderId = isAllRange ? undefined : (searchRange === "account" ? undefined : baseFolderId);
+  const effectiveFilters = useMemo(
+    () => ({ ...filters, accountId: selectedAccountId, folderId: filters.folderId || scopedFolderId }),
+    [filters, scopedFolderId, selectedAccountId],
+  );
+  const effectiveFiltersActive = filtersActive || Boolean(scopedFolderId);
+  const scopeKey = isAllRange ? "all" : searchScope?.kind === "folder" ? `${searchScope.accountId}:${searchScope.folderId}` : searchScope?.accountId || activeAccountId || "all";
+  const scopeLabel = isAllRange
+    ? t("search.allAccounts", "全部账号")
+    : scopedFolderId
+      ? `当前文件夹：${folderNames[scopedFolderId] || "当前文件夹"}`
+      : selectedAccountId
+        ? `当前账号：${accounts.find((account) => account.id === selectedAccountId)?.email || "当前账号"}`
+        : t("search.allAccounts", "全部账号");
   const { data: results = [], isLoading: loading, error: queryError, refetch } = useQuery({
-    queryKey: ["search", trimmed, filters],
+    queryKey: ["search", trimmed, effectiveFilters, selectedAccountId, scopeKey],
     queryFn: () => {
-      if (filtersActive) {
-        return advancedSearch({ ...filters, text: trimmed || undefined });
+      if (effectiveFiltersActive) {
+        return advancedSearch({ ...effectiveFilters, text: trimmed || undefined }, 100);
       }
-      return searchMessages(trimmed);
+      return searchMessages(trimmed, 100, selectedAccountId);
     },
     enabled: searchEnabled,
     staleTime: 60_000,
     placeholderData: (prev: SearchHit[] | undefined) => prev,
   });
 
+  const sortedResults = useMemo(() => [...results].sort((a, b) => {
+    let comparison = 0;
+    if (sort.key === "date") comparison = (a.date ?? 0) - (b.date ?? 0);
+    if (sort.key === "subject") comparison = (a.subject ?? "").localeCompare(b.subject ?? "", undefined, { sensitivity: "base" });
+    if (sort.key === "attachments") comparison = Number(Boolean(a.has_attachment)) - Number(Boolean(b.has_attachment));
+    if (comparison === 0) comparison = (a.subject ?? "").localeCompare(b.subject ?? "", undefined, { sensitivity: "base" });
+    return sort.dir === "asc" ? comparison : -comparison;
+  }), [results, sort]);
+
+  function toggleSort(key: SearchSortKey) {
+    setSort((current) => current.key === key
+      ? { key, dir: current.dir === "asc" ? "desc" : "asc" }
+      : { key, dir: key === "subject" ? "asc" : "desc" });
+  }
+
   const resultsParentRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
-    count: results.length,
+    count: sortedResults.length,
     getScrollElement: () => resultsParentRef.current,
     estimateSize: () => 76,
     measureElement: (el) => el.getBoundingClientRect().height,
@@ -71,6 +139,13 @@ export default function SearchView() {
   }, [query, filters]);
 
   // Pick up context queries from other views and from this view while mounted.
+  const runLocalSearch = useCallback(({ query: q, filters: f }: { query: string; filters: AdvancedSearchQuery }) => {
+    setQuery(q);
+    setFilters(f);
+    setSelectedId(null);
+    setHasSearched(true);
+  }, []);
+
   useEffect(() => {
     if (!storeSearchQuery) return;
     setQuery(storeSearchQuery);
@@ -78,6 +153,15 @@ export default function SearchView() {
     setHasSearched(true);
     useUIStore.getState().setSearchQuery("");
   }, [storeSearchQuery]);
+
+  // 内联筛选下拉注入的筛选条件（收件箱/账户页的快捷条件跳转过来时消费）。
+  useEffect(() => {
+    if (!pendingSearchFilters) return;
+    setFilters(pendingSearchFilters);
+    setSelectedId(null);
+    setHasSearched(true);
+    useUIStore.getState().setPendingSearchFilters(null);
+  }, [pendingSearchFilters]);
 
   // Auto-search when filters change
   useEffect(() => {
@@ -108,19 +192,39 @@ export default function SearchView() {
     setFilters(emptyFilters);
   }
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Delete" || !selectedId) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, [contenteditable='true'], select")) return;
+      event.preventDefault();
+      const id = selectedId;
+      void deleteMessage(id).then(() => {
+        setSelectedId(null);
+        void refetch();
+        addToast({ message: "邮件已移到废纸篓", type: "success" });
+      }).catch((error) => addToast({ message: `删除失败：${extractErrorMessage(error)}`, type: "error" }));
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [addToast, refetch, selectedId]);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
-      <form onSubmit={handleSubmit} className="search-toolbar">
-        <div className="search-input-shell">
+      <div className="search-toolbar-wrap">
+      <form onSubmit={handleSubmit} className="search-toolbar" style={{ flexWrap: "wrap" }}>
+        <div className="search-input-shell" style={{ flex: "1 1 260px" }}>
           <Search size={16} aria-hidden="true" />
           <input
             type="text"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => { setQuery(e.target.value); setHasSearched(false); setSearchFocused(true); }}
             placeholder={t("inbox.searchPlaceholder")}
             aria-label={t("search.title", "Search")}
             autoFocus
             className="search-input"
+            onFocus={() => setSearchFocused(true)}
+            onBlur={() => window.setTimeout(() => setSearchFocused(false), 120)}
           />
         </div>
         <button
@@ -130,23 +234,90 @@ export default function SearchView() {
           <Search size={14} aria-hidden="true" />
           {t("search.searchButton")}
         </button>
-        <button
-          type="button"
-          onClick={() => setShowFilters(!showFilters)}
-          title={t("search.filters")}
-          aria-label={t("search.filters")}
-          className={`search-toolbar-button search-toolbar-icon-button ${
-            showFilters || hasActiveFilters(filters) ? "is-active" : ""
-          }`}
-        >
-          <SlidersHorizontal size={16} />
-        </button>
+        <SearchFilterDropdown
+          query={query}
+          onSearch={runLocalSearch}
+          onAdvanced={() => setFilterOpen(true)}
+        />
       </form>
+      <div style={{ padding: "4px 4px 0", color: "var(--color-text-tertiary)", fontSize: "11px" }}>
+        搜索范围：{scopeLabel}
+      </div>
+      {searchFocused && trimmed && !hasSearched && (
+        <div className="search-suggestions-menu" role="listbox" aria-label={t("search.quickFilters")}>
+          {[
+            ["包含", { text: trimmed }],
+            ["主题包含", { subject: trimmed }],
+            ["邮件正文包含", { text: trimmed }],
+            ["发件人包含", { from: trimmed }],
+            ["收件人包含", { to: trimmed }],
+          ].map(([label, patch]) => (
+            <button key={label as string} type="button" className="search-suggestion-item" onMouseDown={(event) => event.preventDefault()} onClick={() => {
+              setFilters((current) => ({ ...current, ...(patch as Partial<AdvancedSearchQuery>) }));
+              setQuery("");
+              setHasSearched(true);
+              setSearchFocused(false);
+            }}>
+              <span>{label as string}</span><strong>{trimmed}</strong>
+            </button>
+          ))}
+          <button type="button" className="search-suggestion-item" onMouseDown={(event) => event.preventDefault()} onClick={() => { setFilterOpen(true); setSearchFocused(false); }}>
+            <SlidersHorizontal size={14} /> <span>{t("search.moreFilters", "更多筛选条件")}</span>
+          </button>
+        </div>
+      )}
+      {filterOpen && (
+        <div className="search-filter-popover">
+          <SearchFilters filters={filters} accountId={selectedAccountId} onChange={setFilters} onClear={handleClearFilters} />
+        </div>
+      )}
+      </div>
+
+      {trimmed && (
+        <div className="search-smart-suggestions search-smart-suggestions--legacy" aria-label={t("search.quickFilters")}>
+          <span className="search-smart-suggestions__label">{t("search.quickFilters")}</span>
+          <QuickFilterChip
+            label={<>{t("search.quickSubject", "标题包含")} “{trimmed}”</>}
+            active={filters.subject === trimmed}
+            onApply={() => { setFilters((current) => ({ ...current, subject: trimmed })); setHasSearched(true); }}
+            onRemove={() => { setFilters((current) => ({ ...current, subject: undefined })); setHasSearched(true); }}
+            removeLabel="取消标题筛选"
+          />
+          <QuickFilterChip
+            label={<><Paperclip size={12} /> {t("search.quickAttachment", "仅看有附件")}</>}
+            active={filters.hasAttachment === true}
+            onApply={() => { setFilters((current) => ({ ...current, hasAttachment: true })); setHasSearched(true); }}
+            onRemove={() => { setFilters((current) => ({ ...current, hasAttachment: undefined })); setHasSearched(true); }}
+            removeLabel="取消附件筛选"
+          />
+          <QuickFilterChip
+            label={<>{t("search.quickFrom", "发件人包含")} “{trimmed}”</>}
+            active={filters.from === trimmed}
+            onApply={() => { setFilters((current) => ({ ...current, from: trimmed })); setHasSearched(true); }}
+            onRemove={() => { setFilters((current) => ({ ...current, from: undefined })); setHasSearched(true); }}
+            removeLabel="取消发件人筛选"
+          />
+        </div>
+      )}
+
+      {hasSearched && results.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: "6px", padding: "7px 12px", borderBottom: "1px solid var(--color-border)", color: "var(--color-text-secondary)", fontSize: "11px" }}>
+          <span style={{ marginRight: "3px" }}>排序：</span>
+          {(["attachments", "subject", "date"] as SearchSortKey[]).map((key) => {
+            const label = key === "date" ? "日期" : key === "subject" ? "主题" : "附件";
+            const active = sort.key === key;
+            return (
+              <SearchSortButton key={key} label={label} icon={key === "attachments" ? <Paperclip size={11} /> : undefined} active={active} dir={active ? sort.dir : null} onClick={() => toggleSort(key)} />
+            );
+          })}
+        </div>
+      )}
 
       {/* Filters panel */}
-      {showFilters && (
+      {false && (
         <SearchFilters
           filters={filters}
+          accountId={selectedAccountId}
           onChange={setFilters}
           onClear={handleClearFilters}
         />
@@ -257,14 +428,14 @@ export default function SearchView() {
             </div>
           )}
 
-          {!loading && results.length > 0 && (
+          {!loading && sortedResults.length > 0 && (
             <div
               role="listbox"
               aria-label={t("search.results", "Search results")}
               style={{ height: `${virtualizer.getTotalSize()}px`, width: "100%", position: "relative" }}
             >
               {virtualizer.getVirtualItems().map((virtualItem) => {
-                const hit = results[virtualItem.index];
+                const hit = sortedResults[virtualItem.index];
                 return (
                   <div
                     key={hit.message_id}
@@ -281,7 +452,14 @@ export default function SearchView() {
                     <SearchResultItem
                       hit={hit}
                       isSelected={hit.message_id === selectedId}
-                      onClick={() => setSelectedId(hit.message_id)}
+                      onClick={() => setSelectedId((current) => current === hit.message_id ? null : hit.message_id)}
+                      onDoubleClick={() => {
+                        useMailStore.getState().setSelectedMessage(hit.message_id);
+                        useUIStore.getState().setMessageDetailId(hit.message_id);
+                        useUIStore.getState().navigateToView("messageDetail");
+                        setSelectedId(null);
+                      }}
+                      folderLabel={(hit.folder_ids || []).map((id) => folderNames[id] || id).join(" / ")}
                       query={query}
                     />
                   </div>
@@ -302,5 +480,46 @@ export default function SearchView() {
         )}
       </div>
     </div>
+  );
+}
+
+function SearchSortButton({ label, icon, active, dir, onClick }: { label: string; icon?: React.ReactNode; active: boolean; dir: "asc" | "desc" | null; onClick: () => void }) {
+  return (
+    <button type="button" onClick={onClick} title={`按${label}排序`} style={{ display: "flex", alignItems: "center", gap: 3, padding: "2px 7px", border: "1px solid", borderColor: active ? "var(--color-accent)" : "transparent", borderRadius: 4, background: active ? "color-mix(in srgb, var(--color-accent) 10%, transparent)" : "transparent", color: active ? "var(--color-accent)" : "var(--color-text-secondary)", cursor: "pointer", fontSize: 11 }}>
+      {icon}{label}{active && dir && (dir === "asc" ? <ArrowUp size={11} /> : <ArrowDown size={11} />)}
+    </button>
+  );
+}
+
+function QuickFilterChip({
+  label,
+  active,
+  onApply,
+  onRemove,
+  removeLabel,
+}: {
+  label: React.ReactNode;
+  active: boolean;
+  onApply: () => void;
+  onRemove: () => void;
+  removeLabel: string;
+}) {
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 0, borderRadius: 5, background: active ? "color-mix(in srgb, var(--color-accent) 12%, transparent)" : "transparent" }}>
+      <button type="button" onClick={onApply} style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
+        {label}
+      </button>
+      {active && (
+        <button
+          type="button"
+          aria-label={removeLabel}
+          title={removeLabel}
+          onClick={(event) => { event.stopPropagation(); onRemove(); }}
+          style={{ border: 0, background: "transparent", color: "var(--color-accent)", cursor: "pointer", fontSize: 13, lineHeight: 1, padding: "1px 5px 2px 1px" }}
+        >
+          ×
+        </button>
+      )}
+    </span>
   );
 }

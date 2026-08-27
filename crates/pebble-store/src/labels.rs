@@ -51,6 +51,27 @@ impl Store {
         })
     }
 
+    /// Add one label to many messages in one write transaction. The label is
+    /// resolved/created once instead of once per message.
+    pub fn add_label_to_messages_batch(&self, message_ids: &[String], label_name: &str) -> Result<u32> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        let label_id = self.find_or_create_label(label_name)?;
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut changed = 0u32;
+            for message_id in message_ids {
+                changed += tx.execute(
+                    "INSERT OR IGNORE INTO message_labels (message_id, label_id) VALUES (?1, ?2)",
+                    rusqlite::params![message_id, label_id],
+                )? as u32;
+            }
+            tx.commit()?;
+            Ok(changed)
+        })
+    }
+
     /// Remove a label from a message (by label name).
     pub fn remove_label(&self, message_id: &str, label_name: &str) -> Result<()> {
         self.with_write(|conn| {

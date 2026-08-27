@@ -4,6 +4,11 @@ use crate::Store;
 
 impl Store {
     pub fn add_search_pending(&self, message_ids: &[String], operation: &str) -> Result<()> {
+        if !matches!(operation, "index" | "remove") {
+            return Err(PebbleError::Validation(format!(
+                "Unsupported search pending operation: {operation}"
+            )));
+        }
         self.with_write(|conn| {
             let now = now_timestamp();
             let mut stmt = conn

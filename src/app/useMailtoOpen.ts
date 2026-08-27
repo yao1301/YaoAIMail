@@ -2,10 +2,7 @@ import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { parseMailtoUrl } from "@/features/compose/mailto";
-import i18n from "@/lib/i18n";
-import { isComposeDirty, useComposeStore, type ComposePrefill } from "@/stores/compose.store";
-import { useConfirmStore } from "@/stores/confirm.store";
-import { useToastStore } from "@/stores/toast.store";
+import { useComposeStore, type ComposePrefill } from "@/stores/compose.store";
 
 const OPEN_MAILTO_EVENT = "app:open-mailto";
 
@@ -25,32 +22,6 @@ function parseMailtoUrls(urls: string[]) {
   return parsed;
 }
 
-async function confirmReplaceDirtyCompose() {
-  if (!isComposeDirty()) return true;
-  return useConfirmStore.getState().confirm({
-    title: i18n.t("compose.mailtoReplaceDraftTitle", "Open mail link?"),
-    message: i18n.t(
-      "compose.mailtoReplaceDraftConfirm",
-      "Opening this mail link will discard your unsaved draft. Continue?",
-    ),
-    confirmLabel: i18n.t("compose.leaveConfirm", "Discard"),
-    cancelLabel: i18n.t("compose.leaveCancel", "Keep editing"),
-    destructive: true,
-  });
-}
-
-function reportSkippedMailtoUrls(count: number) {
-  if (count <= 0) return;
-  useToastStore.getState().addToast({
-    type: "info",
-    message: i18n.t("compose.mailtoSkippedLinks", {
-      count,
-      defaultValue: "Opened the first mail link. {{count}} additional link was skipped.",
-      defaultValue_other: "Opened the first mail link. {{count}} additional links were skipped.",
-    }),
-  });
-}
-
 export async function openMailtoUrl(url: string) {
   return openMailtoUrls([url]);
 }
@@ -58,12 +29,11 @@ export async function openMailtoUrl(url: string) {
 async function openMailtoUrls(urls: string[]) {
   const parsed = parseMailtoUrls(urls);
   if (parsed.length === 0) return false;
-
-  if (!(await confirmReplaceDirtyCompose())) return false;
-
-  const [first, ...skipped] = parsed;
-  useComposeStore.getState().openCompose("new", null, first);
-  reportSkippedMailtoUrls(skipped.length);
+  // 多标签模式：每个 mailto 链接在主窗口打开一个新的写信标签，
+  // 不丢弃任何已有草稿。
+  for (const prefill of parsed) {
+    useComposeStore.getState().openCompose("new", null, prefill);
+  }
   return true;
 }
 

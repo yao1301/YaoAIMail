@@ -6,6 +6,7 @@ pub mod types;
 
 use pebble_core::{HttpProxyConfig, PebbleError, Result};
 use types::{TranslateProviderConfig, TranslateResult};
+use llm::ChatTurn;
 
 pub struct TranslateService;
 
@@ -71,12 +72,156 @@ impl TranslateService {
                 )
                 .await
             }
-            TranslateProviderConfig::LLM {
-                endpoint,
-                api_key,
-                model,
-                mode,
-            } => llm::translate(&client, endpoint, api_key, model, mode, text, from, to).await,
+            TranslateProviderConfig::LLM { providers, active_id } => {
+                let active = providers
+                    .iter()
+                    .find(|p| &p.id == active_id)
+                    .ok_or_else(|| {
+                        PebbleError::Translate("No active LLM provider selected".to_string())
+                    })?;
+                llm::translate(
+                    &client,
+                    &active.base_url,
+                    &active.api_key,
+                    &active.model,
+                    &active.mode,
+                    &active.chat_path,
+                    text,
+                    from,
+                    to,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Run a general LLM completion against the configured active provider.
+    /// Used by the外贸AI features (style learning, reply generation, summarization, agent).
+    pub async fn complete(
+        config: &TranslateProviderConfig,
+        system: &str,
+        user: &str,
+    ) -> Result<String> {
+        Self::complete_with_proxy(config, None, system, user).await
+    }
+
+    /// Like [`complete`], but routes through the global SOCKS5 proxy when set.
+    pub async fn complete_with_proxy(
+        config: &TranslateProviderConfig,
+        proxy: Option<&HttpProxyConfig>,
+        system: &str,
+        user: &str,
+    ) -> Result<String> {
+        let client = Self::http_client_with_proxy(proxy)?;
+
+        match config {
+            TranslateProviderConfig::LLM { providers, active_id } => {
+                let active = providers
+                    .iter()
+                    .find(|p| &p.id == active_id)
+                    .ok_or_else(|| {
+                        PebbleError::Translate(
+                            "No active LLM provider selected. Configure an AI 模型 (LLM) provider first."
+                                .to_string(),
+                        )
+                    })?;
+                llm::complete(
+                    &client,
+                    &active.base_url,
+                    &active.api_key,
+                    &active.model,
+                    &active.mode,
+                    &active.chat_path,
+                    system,
+                    user,
+                )
+                .await
+            }
+            _ => Err(PebbleError::Translate(
+                "AI features require an LLM provider. Please configure the AI 模型 (LLM) engine in settings."
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Short structured completion with a bounded output and low reasoning
+    /// effort where supported. Kept separate so normal AI writing behavior is
+    /// unchanged.
+    pub async fn complete_fast_with_proxy(
+        config: &TranslateProviderConfig,
+        proxy: Option<&HttpProxyConfig>,
+        system: &str,
+        user: &str,
+        max_output_tokens: u32,
+    ) -> Result<String> {
+        let client = Self::http_client_with_proxy(proxy)?;
+        match config {
+            TranslateProviderConfig::LLM { providers, active_id } => {
+                let active = providers
+                    .iter()
+                    .find(|provider| &provider.id == active_id)
+                    .ok_or_else(|| PebbleError::Translate("No active LLM provider selected".to_string()))?;
+                llm::complete_fast(
+                    &client,
+                    &active.base_url,
+                    &active.api_key,
+                    &active.model,
+                    &active.kind,
+                    &active.mode,
+                    &active.chat_path,
+                    system,
+                    user,
+                    max_output_tokens,
+                ).await
+            }
+            _ => Err(PebbleError::Translate(
+                "AI features require an LLM provider".to_string(),
+            )),
+        }
+    }
+
+    /// Multi-turn chat completion (see [`llm::complete_chat`]) against the active provider.
+    pub async fn complete_chat(
+        config: &TranslateProviderConfig,
+        turns: &[ChatTurn<'_>],
+    ) -> Result<String> {
+        Self::complete_chat_with_proxy(config, None, turns).await
+    }
+
+    /// Like [`complete_chat`], but routes through the global SOCKS5 proxy when set.
+    pub async fn complete_chat_with_proxy(
+        config: &TranslateProviderConfig,
+        proxy: Option<&HttpProxyConfig>,
+        turns: &[ChatTurn<'_>],
+    ) -> Result<String> {
+        let client = Self::http_client_with_proxy(proxy)?;
+
+        match config {
+            TranslateProviderConfig::LLM { providers, active_id } => {
+                let active = providers
+                    .iter()
+                    .find(|p| &p.id == active_id)
+                    .ok_or_else(|| {
+                        PebbleError::Translate(
+                            "No active LLM provider selected. Configure an AI 模型 (LLM) provider first."
+                                .to_string(),
+                        )
+                    })?;
+                llm::complete_chat(
+                    &client,
+                    &active.base_url,
+                    &active.api_key,
+                    &active.model,
+                    &active.mode,
+                    &active.chat_path,
+                    turns,
+                )
+                .await
+            }
+            _ => Err(PebbleError::Translate(
+                "AI features require an LLM provider. Please configure the AI 模型 (LLM) engine in settings."
+                    .to_string(),
+            )),
         }
     }
 }

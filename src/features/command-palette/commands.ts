@@ -2,7 +2,6 @@ import type { Command } from "@/stores/command.store";
 import { useUIStore } from "@/stores/ui.store";
 import { useComposeStore } from "@/stores/compose.store";
 import { useMailStore } from "@/stores/mail.store";
-import { useKanbanStore } from "@/stores/kanban.store";
 import { useToastStore } from "@/stores/toast.store";
 import { updateMessageFlags, archiveMessage } from "@/lib/api";
 import { queryClient } from "@/lib/query-client";
@@ -117,21 +116,6 @@ export function buildCommands(t: (key: string, defaultValue: string) => string):
         } catch {
           queryClient.invalidateQueries({ queryKey: ["messages"] });
           useToastStore.getState().addToast({ message: t("messageActions.archiveFailed", "Failed to archive"), type: "error" });
-        }
-      },
-    },
-    {
-      id: "mail:add-to-kanban",
-      name: t("commands.addToKanban", "Add to Kanban"),
-      category: t("commands.mail", "Mail"),
-      execute: async () => {
-        const id = useMailStore.getState().selectedMessageId;
-        if (!id) return;
-        try {
-          await useKanbanStore.getState().addCard(id, "todo");
-          useToastStore.getState().addToast({ message: t("messageActions.kanbanSuccess", "Added to kanban board"), type: "success" });
-        } catch {
-          useToastStore.getState().addToast({ message: t("messageActions.kanbanFailed", "Failed to add to kanban"), type: "error" });
         }
       },
     },

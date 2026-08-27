@@ -34,10 +34,12 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let write_manager = SqliteConnectionManager::file(path).with_init(|conn| {
             conn.execute_batch(
-                "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;",
+                "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000; PRAGMA synchronous=NORMAL;",
             )?;
             Ok(())
         });
+        // SQLite 单写者：写池保持 1 个连接，靠 busy_timeout 让写请求排队等待
+        // 而不是立刻报错（后台正文补齐、标记已读、发信等写操作共用它）。
         let write_pool = Pool::builder()
             .max_size(1)
             .build(write_manager)
@@ -45,12 +47,14 @@ impl Store {
 
         let read_manager = SqliteConnectionManager::file(path).with_init(|conn| {
             conn.execute_batch(
-                "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;",
+                "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000; PRAGMA synchronous=NORMAL;",
             )?;
             Ok(())
         });
+        // 读池扩容：WAL 下读写并发，充足的读连接保证正文补齐期间
+        // 邮件列表/搜索等读操作不被占满（此前 4 个曾被补齐任务占满导致"加载中"）。
         let read_pool = Pool::builder()
-            .max_size(4)
+            .max_size(8)
             .build(read_manager)
             .map_err(|e| PebbleError::Storage(format!("Failed to create read pool: {e}")))?;
 
@@ -92,7 +96,7 @@ impl Store {
                 Ok(())
             });
         let read_pool = Pool::builder()
-            .max_size(2)
+            .max_size(8)
             .build(read_manager)
             .map_err(|e| PebbleError::Storage(format!("Failed to create read pool: {e}")))?;
 

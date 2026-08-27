@@ -7,6 +7,7 @@ mod snooze_watcher;
 mod state;
 
 use serde::Serialize;
+use std::io::Write;
 use state::AppState;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -170,7 +171,7 @@ fn build_tray_menu<R: Runtime, M: Manager<R>>(
 }
 
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let menu = build_tray_menu(app, "Show Window", "Hide Window", "Quit Pebble")?;
+    let menu = build_tray_menu(app, "Show Window", "Hide Window", "Quit YaoAIMail")?;
     let icon = app
         .default_window_icon()
         .cloned()
@@ -179,7 +180,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     TrayIconBuilder::with_id("main")
         .icon(icon)
         .menu(&menu)
-        .tooltip("Pebble")
+        .tooltip("YaoAIMail")
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             TRAY_SHOW_ID => restore_main_window(app),
@@ -245,6 +246,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_drag::init())
         .on_window_event(|window, event| {
             if window.label() == "main" && matches!(event, WindowEvent::Focused(true)) {
                 commands::notifications::clear_attention_indicator(window.app_handle());
@@ -258,7 +260,7 @@ pub fn run() {
                     "Cannot read or write the profile id in {}: {e}. \
                      If you configured a custom profile directory (PEBBLE_PROFILE_DIR, \
                      pebble-profile.txt, or a portable pebble-profile folder), make sure \
-                     Pebble has write access to it.",
+                     YaoAIMail has write access to it.",
                     app_data.display()
                 )
             })?;
@@ -269,6 +271,49 @@ pub fn run() {
                 .allow_directory(&backgrounds_dir, true)?;
             let log_dir = commands::diagnostics::app_log_dir(&app_data);
             std::fs::create_dir_all(&log_dir)?;
+            // Release builds abort after a panic. Persist only the source
+            // location (never the panic payload, which may contain mail or
+            // search text) so a future crash remains diagnosable without
+            // leaking user content into logs.
+            let panic_log_path = log_dir.join("panic.log");
+            std::panic::set_hook(Box::new(move |info| {
+                let location = info
+                    .location()
+                    .map(|value| format!("{}:{}:{}", value.file(), value.line(), value.column()))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let thread_name = std::thread::current().name().unwrap_or("unnamed").to_string();
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&panic_log_path)
+                {
+                    let _ = writeln!(
+                        file,
+                        "UTC={:?} pid={} thread={} panic_location={}",
+                        std::time::SystemTime::now(),
+                        std::process::id(),
+                        thread_name,
+                        location
+                    );
+                }
+            }));
+            // Keep a direct startup marker even if another library has
+            // already installed a global tracing subscriber. This makes it
+            // possible to distinguish a stale log/profile from a live dev
+            // process during mail-sync diagnosis.
+            if let Ok(mut marker) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("pebble.log"))
+            {
+                let _ = writeln!(
+                    marker,
+                    "[direct-startup] pid={} app_data={} UTC={:?}",
+                    std::process::id(),
+                    app_data.display(),
+                    std::time::SystemTime::now()
+                );
+            }
             let file_appender =
                 tracing_appender::rolling::never(&log_dir, commands::diagnostics::LOG_FILE_NAME);
             let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
@@ -480,6 +525,10 @@ pub fn run() {
             set_tray_menu_labels,
             take_pending_mailto_urls,
             profile::get_profile_storage_namespace,
+            profile::get_profile_location,
+            profile::open_profile_folder,
+            profile::choose_profile_folder,
+            profile::schedule_profile_migration,
             commands::autostart::get_autostart_enabled,
             commands::autostart::set_autostart_enabled,
             commands::health::health_check,
@@ -488,6 +537,20 @@ pub fn run() {
             commands::health::open_default_mail_settings,
             commands::health::sync_titlebar_theme,
             commands::diagnostics::read_app_log,
+            commands::dashboard::get_dashboard_data,
+            commands::company_intel::research_company,
+            commands::company_intel::list_company_research,
+            commands::company_intel::delete_company_research,
+            commands::company_intel::save_company_research_analysis,
+            commands::company_intel::search_public_companies,
+            commands::company_intel::ai_find_companies,
+            commands::company_intel::search_lead_companies,
+            commands::company_intel::ai_find_company_batch,
+            commands::company_intel::enrich_lead_candidate,
+            commands::company_intel::summarize_lead_candidates,
+            commands::web_research::get_web_search_health,
+            commands::company_intel::find_companies_agent,
+            commands::company_intel::research_company_agent,
             commands::appearance::import_background_image,
             commands::appearance::delete_background_image,
             commands::accounts::add_account,
@@ -496,15 +559,26 @@ pub fn run() {
             commands::accounts::update_account_proxy,
             commands::accounts::update_account_proxy_setting,
             commands::accounts::update_account,
+            commands::accounts::get_account_details,
             commands::accounts::list_accounts,
             commands::accounts::delete_account,
             commands::accounts::test_imap_connection,
             commands::accounts::test_pop3_connection,
             commands::accounts::test_account_connection,
+            commands::address_book::list_address_book_contacts,
+            commands::address_book::save_address_book_contact,
+            commands::address_book::delete_address_book_contact,
+            commands::address_book::import_mail_contacts_to_address_book,
             commands::folders::list_folders,
+            commands::folders::get_body_backfill_stats,
             commands::folders::get_imap_sync_folders,
             commands::folders::update_imap_sync_folders,
+            commands::folders::create_folder,
+            commands::folders::move_folder,
+            commands::folders::rename_folder,
+            commands::folders::delete_folder,
             commands::messages::query::list_messages,
+            commands::messages::query::list_unread_messages,
             commands::messages::query::list_starred_messages,
             commands::messages::query::get_message,
             commands::messages::query::get_messages_batch,
@@ -516,6 +590,8 @@ pub fn run() {
             commands::messages::lifecycle::delete_message,
             commands::messages::lifecycle::restore_message,
             commands::messages::lifecycle::empty_trash,
+            commands::messages::lifecycle::empty_spam,
+            commands::messages::lifecycle::empty_drafts,
             commands::messages::lifecycle::move_to_folder,
             commands::network::get_global_proxy,
             commands::network::update_global_proxy,
@@ -542,6 +618,7 @@ pub fn run() {
             commands::rules::list_rules,
             commands::rules::update_rule,
             commands::rules::delete_rule,
+            commands::rules::apply_rules_to_folder,
             commands::compose::send_email,
             commands::compose::stage_compose_attachment,
             commands::trusted_senders::trust_sender,
@@ -551,6 +628,36 @@ pub fn run() {
             commands::translate::get_translate_config,
             commands::translate::save_translate_config,
             commands::translate::test_translate_connection,
+            commands::external_services::get_external_service_key_status,
+            commands::external_services::save_external_service_api_key,
+            commands::external_services::delete_external_service_api_key,
+            commands::external_services::validate_external_service_api_key,
+            commands::external_services::get_external_service_usage,
+            commands::ai::ai_prompt,
+            commands::ai::ai_chat,
+            commands::agent::agent_run,
+            commands::ai_style::list_style_profiles,
+            commands::ai_style::save_style_profile,
+            commands::ai_style::delete_style_profile,
+            commands::ai_style::get_sent_samples,
+            commands::customer_memory::list_customer_memories,
+            commands::customer_memory::save_customer_memory,
+            commands::customer_memory::delete_customer_memory,
+            commands::customer_memory::build_customer_memory,
+            commands::knowledge_base::list_knowledge_items,
+            commands::knowledge_base::save_knowledge_item,
+            commands::knowledge_base::delete_knowledge_item,
+            commands::knowledge_base::search_knowledge_base,
+            commands::send_guard::get_send_guard_config,
+            commands::send_guard::set_send_guard_config,
+            commands::send_guard::list_contact_roles,
+            commands::send_guard::set_contact_role,
+            commands::send_guard::delete_contact_role,
+            commands::send_guard::infer_contact_role,
+            commands::send_guard::infer_all_contact_roles,
+            commands::send_guard::auto_classify_contacts,
+            commands::send_guard::import_customer_roles,
+            commands::send_guard::check_send_guard,
             commands::threads::list_thread_messages,
             commands::threads::list_threads,
             commands::oauth::complete_oauth_flow,
@@ -560,11 +667,24 @@ pub fn run() {
             commands::oauth::update_oauth_account_proxy_setting,
             commands::attachments::list_attachments,
             commands::attachments::get_attachment_path,
+            commands::attachments::get_attachment_drag_icon_path,
+            commands::attachments::read_attachment_file,
+            commands::attachments::open_attachment,
             commands::attachments::download_attachment,
+            commands::attachments::save_attachments_as,
+            commands::attachments::copy_attachments_to_clipboard,
             commands::batch::batch_archive,
             commands::batch::batch_delete,
             commands::batch::batch_mark_read,
             commands::batch::batch_star,
+            commands::batch::mark_folder_all_read,
+            commands::mail_export::build_forward_eml,
+            commands::mail_export::export_message_eml,
+            commands::mail_export::open_local_file,
+            commands::mail_export::show_in_folder,
+            commands::mail_export::read_file_as_base64,
+            commands::system_icons::get_system_file_icon,
+            commands::windows::open_compose_window,
             commands::cloud_sync::test_webdav_connection,
             commands::cloud_sync::backup_to_webdav,
             commands::cloud_sync::export_backup_file,
@@ -593,6 +713,14 @@ pub fn run() {
             commands::user_data::delete_email_template,
             commands::user_data::get_email_signature,
             commands::user_data::set_email_signature,
+            commands::user_data::list_email_signatures,
+            commands::user_data::save_email_signature,
+            commands::user_data::delete_email_signature,
+            commands::user_data::set_default_email_signature,
+            commands::company_intel::load_lead_finder_data,
+            commands::company_intel::save_lead_finder_data,
+            commands::company_intel::load_lead_dev_records,
+            commands::company_intel::save_lead_dev_records,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

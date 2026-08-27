@@ -9,10 +9,15 @@ import RulesTab from "./RulesTab";
 import PendingOpsTab from "./PendingOpsTab";
 import ShortcutsTab from "./ShortcutsTab";
 import TranslateTab from "./TranslateTab";
+import AiWritingTab from "./AiWritingTab";
+import KnowledgeBaseTab from "./KnowledgeBaseTab";
+import SendGuardTab from "./SendGuardTab";
+import ExternalServicesTab from "./ExternalServicesTab";
 import PrivacyTab from "./PrivacyTab";
 import AboutTab from "./AboutTab";
+import WorkRoleTab from "./WorkRoleTab";
 
-const TAB_IDS = ["accounts", "general", "proxy", "appearance", "privacy", "rules", "remoteWrites", "translation", "shortcuts", "cloudSync", "about"] as const;
+const TAB_IDS = ["accounts", "general", "proxy", "appearance", "privacy", "rules", "remoteWrites", "translation", "aiWriting", "workRole", "knowledgeBase", "externalServices", "sendGuard", "shortcuts", "cloudSync", "about"] as const;
 
 const TAB_LABEL_KEYS: Record<string, string> = {
   accounts: "settings.accounts",
@@ -23,6 +28,11 @@ const TAB_LABEL_KEYS: Record<string, string> = {
   rules: "settings.rules",
   remoteWrites: "settings.remoteWrites",
   translation: "settings.translation",
+  aiWriting: "settings.aiWriting",
+  workRole: "settings.workRole",
+  knowledgeBase: "settings.knowledgeBase",
+  externalServices: "settings.externalServices",
+  sendGuard: "settings.sendGuard",
   shortcuts: "settings.shortcuts",
   cloudSync: "settings.cloudSync",
   about: "settings.about",
@@ -86,7 +96,7 @@ export default function SettingsView() {
               transition: "background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease",
             }}
           >
-            {t(TAB_LABEL_KEYS[id])}
+            {id === "knowledgeBase" ? "产品与资料中心" : id === "externalServices" ? "外部数据源 API" : t(TAB_LABEL_KEYS[id])}
           </button>
         ))}
       </div>
@@ -113,6 +123,11 @@ export default function SettingsView() {
         {activeTab === "rules" && <RulesTab />}
         {activeTab === "remoteWrites" && <PendingOpsTab />}
         {activeTab === "translation" && <TranslateTab />}
+        {activeTab === "aiWriting" && <AiWritingTab />}
+        {activeTab === "workRole" && <WorkRoleTab />}
+        {activeTab === "knowledgeBase" && <KnowledgeBaseTab />}
+        {activeTab === "externalServices" && <ExternalServicesTab />}
+        {activeTab === "sendGuard" && <SendGuardTab />}
         {activeTab === "shortcuts" && <ShortcutsTab />}
         {activeTab === "privacy" && <PrivacyTab />}
         {activeTab === "cloudSync" && <CloudSyncTab />}

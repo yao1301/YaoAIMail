@@ -1,21 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, Clock, Languages } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Languages } from "lucide-react";
 import { trustSender } from "@/lib/api";
 import { useTranslation } from "react-i18next";
 import type { PrivacyMode, TranslateResult } from "@/lib/api";
-import { useClickOutside } from "@/hooks/useClickOutside";
-import { MessageDetailSkeleton } from "./Skeleton";
+import { useClickOutside } from "@/hooks/useClickOutside";import { MessageDetailSkeleton } from "./Skeleton";
 import PrivacyBanner from "./PrivacyBanner";
 import AttachmentList from "./AttachmentList";
-import SnoozePopover from "../features/inbox/SnoozePopover";
 import { ShadowDomEmail } from "./ShadowDomEmail";
 import TranslatePopover from "../features/translate/TranslatePopover";
 import MessageActionToolbar from "./MessageActionToolbar";
 import { useMessageLoader } from "@/hooks/useMessageLoader";
 import { useBilingualTranslation } from "@/hooks/useBilingualTranslation";
 import { defaultPrivacyMode } from "@/lib/privacyMode";
-import { useKanbanStore } from "@/stores/kanban.store";
-import { useToastStore } from "@/stores/toast.store";
 import { useUIStore } from "@/stores/ui.store";
 import SelectionActionPopover from "./SelectionActionPopover";
 import type { EmailAddress } from "@/lib/api";
@@ -51,18 +47,15 @@ function formatRecipients(addresses: EmailAddress[]): string {
 export default function MessageDetail({ messageId, onBack, folderRole }: Props) {
   const { t } = useTranslation();
   const [privacyMode, setPrivacyMode] = useState<PrivacyMode>(() => defaultPrivacyMode());
-  const [showSnooze, setShowSnooze] = useState(false);
   const [showSelectionActions, setShowSelectionActions] = useState<{ text: string; position: { x: number; y: number } } | null>(null);
   const [showTranslate, setShowTranslate] = useState<{ text: string; position: { x: number; y: number } } | null>(null);
 
-  const snoozeRef = useRef<HTMLDivElement>(null);
   const selectionActionsRef = useRef<HTMLDivElement>(null);
   const translateRef = useRef<HTMLDivElement>(null);
 
-  const { message, setMessage, rendered, loading, error } = useMessageLoader(messageId, privacyMode);
+  const { message, setMessage, rendered, loading, error, hydrateFailed } = useMessageLoader(messageId, privacyMode);
   const { bilingualMode, bilingualResult, bilingualLoading, handleBilingualToggle, resetBilingual } = useBilingualTranslation(messageId, rendered, message);
 
-  useClickOutside(snoozeRef, showSnooze, () => setShowSnooze(false));
   useClickOutside(selectionActionsRef, !!showSelectionActions, () => setShowSelectionActions(null));
   useClickOutside(translateRef, !!showTranslate, () => setShowTranslate(null));
 
@@ -140,27 +133,6 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
     setShowSelectionActions(null);
   }
 
-  async function handleAddSelectionToKanbanNote(text: string) {
-    setShowSelectionActions(null);
-    try {
-      const kanban = useKanbanStore.getState();
-      if (!kanban.cardIdSet.has(messageId)) {
-        await kanban.addCard(messageId, "todo");
-      }
-      await useKanbanStore.getState().setContextNote(messageId, text);
-      useUIStore.getState().setActiveView("kanban");
-      useToastStore.getState().addToast({
-        message: t("kanban.contextNoteAdded", "Added selected text to Kanban note"),
-        type: "success",
-      });
-    } catch {
-      useToastStore.getState().addToast({
-        message: t("kanban.contextNoteFailed", "Failed to add Kanban note"),
-        type: "error",
-      });
-    }
-  }
-
   function handleContextMenu(e: React.MouseEvent) {
     const selectedText = getCurrentSelectedText();
     if (selectedText.length <= 5) return;
@@ -235,9 +207,14 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
       {/* Header */}
       <div
         style={{
-          padding: "12px 16px",
+          padding: "16px 18px",
           borderBottom: "1px solid var(--color-border)",
+          boxShadow: "0 2px 8px rgba(0,0,0,0.06)",
           flexShrink: 0,
+          background:
+            "linear-gradient(180deg, color-mix(in srgb, var(--color-accent) 7%, var(--color-bg-primary)) 0%, var(--color-bg-primary) 100%)",
+          position: "relative",
+          zIndex: 2,
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
@@ -270,35 +247,6 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
           >
             {message.subject || t("inbox.noSubject", "(no subject)")}
           </h2>
-          <div ref={snoozeRef} style={{ position: "relative", marginLeft: "auto", flexShrink: 0 }}>
-            <button
-              onClick={() => setShowSnooze(!showSnooze)}
-              style={{
-                background: "none",
-                border: "none",
-                cursor: "pointer",
-                padding: "4px",
-                borderRadius: "4px",
-                color: "var(--color-text-secondary)",
-                display: "flex",
-                alignItems: "center",
-              }}
-              title={t("messageActions.snooze", "Snooze message")}
-              aria-label={t("messageActions.snooze", "Snooze message")}
-            >
-              <Clock size={16} />
-            </button>
-            {showSnooze && (
-              <SnoozePopover
-                messageId={messageId}
-                onClose={() => setShowSnooze(false)}
-                onSnoozed={() => {
-                  setShowSnooze(false);
-                  onBack();
-                }}
-              />
-            )}
-          </div>
           <button
             onClick={handleBilingualToggle}
             aria-pressed={bilingualMode}
@@ -326,7 +274,14 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
           onBack={onBack}
           onMessageUpdate={setMessage}
         />
-        <div style={{ paddingLeft: "32px" }}>
+        <div
+          style={{
+            paddingLeft: "32px",
+            marginTop: 10,
+            paddingTop: 10,
+            borderTop: "1px dashed color-mix(in srgb, var(--color-border) 60%, transparent)",
+          }}
+        >
           <div style={{ fontSize: "13px", color: "var(--color-text-primary)", marginBottom: "2px" }}>
             <span style={{ fontWeight: "500" }}>
               {message.from_name || message.from_address}
@@ -362,9 +317,33 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
         />
       )}
 
+      {/* 正文下载失败提示（不覆盖已显示的头部/内容） */}
+      {hydrateFailed && (
+        <div
+          role="status"
+          style={{
+            flexShrink: 0,
+            margin: "8px 14px 0",
+            padding: "8px 12px",
+            borderRadius: 8,
+            fontSize: 12,
+            color: "#9a6700",
+            background: "color-mix(in srgb, #f59e0b 10%, transparent)",
+            border: "1px solid color-mix(in srgb, #f59e0b 40%, transparent)",
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+          }}
+        >
+          <AlertTriangle size={13} />
+          <span>正文下载暂时失败（网络/服务器波动），已显示邮件头部。网络恢复后重新打开该邮件即可自动补全。</span>
+        </div>
+      )}
+
       {/* Body */}
       <div
         className="scroll-region message-body-scroll"
+        data-email-translation-scope
         tabIndex={0}
         role="region"
         aria-label={t("messageDetail.body", "Message body")}
@@ -432,7 +411,6 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
             onTranslate={handleTranslateSelectedText}
             onSearch={handleSearchSelectedText}
             onCreateRule={handleCreateRuleFromSelection}
-            onAddToKanbanNote={handleAddSelectionToKanbanNote}
             onClose={() => setShowSelectionActions(null)}
           />
         </div>

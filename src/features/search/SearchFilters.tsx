@@ -9,6 +9,7 @@ interface FolderWithAccount extends Folder {
 
 interface Props {
   filters: AdvancedSearchQuery;
+  accountId?: string;
   onChange: (filters: AdvancedSearchQuery) => void;
   onClear: () => void;
 }
@@ -28,14 +29,15 @@ function dateInputToTimestamp(value: string, endOfDay = false): number | undefin
   return Math.floor(new Date(`${value}T${endOfDay ? "23:59:59" : "00:00:00"}`).getTime() / 1000);
 }
 
-export default function SearchFilters({ filters, onChange, onClear }: Props) {
+export default function SearchFilters({ filters, accountId, onChange, onClear }: Props) {
   const { t } = useTranslation();
   const [folders, setFolders] = useState<FolderWithAccount[]>([]);
 
   useEffect(() => {
     listAccounts().then((accounts) => {
       const emailByAccountId = new Map(accounts.map((a) => [a.id, a.email]));
-      Promise.all(accounts.map((a) => listFolders(a.id))).then((results) => {
+      const scopedAccounts = accountId ? accounts.filter((account) => account.id === accountId) : accounts;
+      Promise.all(scopedAccounts.map((a) => listFolders(a.id))).then((results) => {
         const all: FolderWithAccount[] = results.flat().map((f) => ({
           ...f,
           accountEmail: emailByAccountId.get(f.account_id) ?? "",
@@ -43,7 +45,7 @@ export default function SearchFilters({ filters, onChange, onClear }: Props) {
         setFolders(all);
       });
     });
-  }, []);
+  }, [accountId]);
 
   function update(patch: Partial<AdvancedSearchQuery>) {
     onChange({ ...filters, ...patch });

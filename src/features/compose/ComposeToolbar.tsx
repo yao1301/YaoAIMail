@@ -2,7 +2,7 @@ import { useEditorState } from "@tiptap/react";
 import {
   Bold, Italic, Strikethrough, Heading1, Heading2,
   List, ListOrdered, Quote, Code, Minus, Undo2, Redo2,
-  Link, Image,
+  Link, Image, Stamp,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { Editor } from "@tiptap/react";
@@ -27,8 +27,20 @@ export function ModeButton({ icon: Icon, label, active, onClick }: {
 
 // ─── Editor Toolbar ────────────────────────────────────────────────────────────
 
-export function EditorToolbar({ editor }: { editor: Editor }) {
+export function EditorToolbar({ editor, onInsertSignature }: { editor: Editor; onInsertSignature?: () => void }) {
   const { t } = useTranslation();
+
+  const FONTS: Array<{ label: string; value: string }> = [
+    { label: "默认字体", value: "" },
+    { label: "Arial", value: "Arial, Helvetica, sans-serif" },
+    { label: "宋体", value: "SimSun, serif" },
+    { label: "黑体", value: "SimHei, sans-serif" },
+    { label: "微软雅黑", value: "Microsoft YaHei, sans-serif" },
+    { label: "Times New Roman", value: "Times New Roman, serif" },
+    { label: "Courier New", value: "Courier New, monospace" },
+    { label: "Verdana", value: "Verdana, sans-serif" },
+    { label: "Georgia", value: "Georgia, serif" },
+  ];
 
   const activeStates = useEditorState({
     editor,
@@ -42,6 +54,7 @@ export function EditorToolbar({ editor }: { editor: Editor }) {
       orderedList: e.isActive("orderedList"),
       blockquote: e.isActive("blockquote"),
       codeBlock: e.isActive("codeBlock"),
+      fontFamily: e.getAttributes("textStyle").fontFamily as string | undefined,
     }),
   });
 
@@ -64,8 +77,56 @@ export function EditorToolbar({ editor }: { editor: Editor }) {
     btn(Redo2, t("compose.toolbar.redo", "Redo"), () => editor.chain().focus().redo().run()),
   ];
 
+  // 插入签名（在工具栏开头，方便随时插入）
+  const signatureItems = onInsertSignature
+    ? [{ label: "插入签名", icon: Stamp, action: onInsertSignature }]
+    : [];
+
   return (
     <div className="compose-format-toolbar">
+      <select
+        title="字体"
+        aria-label="字体"
+        value={activeStates.fontFamily ?? ""}
+        onChange={(e) => {
+          const value = e.target.value;
+          if (value) {
+            editor.chain().focus().setFontFamily(value).run();
+          } else {
+            editor.chain().focus().unsetFontFamily().run();
+          }
+        }}
+        style={{
+          height: "26px",
+          fontSize: "12px",
+          padding: "0 4px",
+          border: "1px solid var(--color-border)",
+          borderRadius: "5px",
+          background: "#fff",
+          color: "var(--color-text-primary)",
+          outline: "none",
+          maxWidth: "120px",
+        }}
+      >
+        {FONTS.map((font) => (
+          <option key={font.label} value={font.value}>{font.label}</option>
+        ))}
+      </select>
+      {signatureItems.map((item, i) => {
+        const Icon = item.icon;
+        return (
+          <button
+            key={`sig-${i}`}
+            type="button"
+            onClick={item.action}
+            title={item.label}
+            aria-label={item.label}
+            className="compose-format-button"
+          >
+            <Icon size={15} />
+          </button>
+        );
+      })}
       {items.map((item, i) => {
         const Icon = item.icon;
         return (

@@ -103,7 +103,7 @@ describe("StarredView", () => {
     mockMailState.setSelectedMessage = setSelectedMessage;
   });
 
-  it("shows Load More for a full first page and fetches the next page when clicked", () => {
+  it("automatically fetches the next page when the end is visible", () => {
     const messages = Array.from({ length: 50 }, (_, index) => makeMessage(`m-${index + 1}`));
     useStarredMessagesQuery.mockReturnValue({
       data: messages,
@@ -117,11 +117,8 @@ describe("StarredView", () => {
     render(<StarredView />);
 
     expect(useStarredMessagesQuery).toHaveBeenCalledWith("account-1", 0);
-    expect(screen.getByRole("button", { name: "Load More" })).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: "Load More" }));
-
-    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+    expect(fetchNextPage).toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Load More" })).toBeNull();
   });
 
   it("clears the selected detail when the starred message is unstarred", () => {
@@ -163,7 +160,7 @@ describe("StarredView", () => {
     expect(screen.queryByTestId("message-detail")).toBeNull();
   });
 
-  it("keeps Load More available when all currently loaded starred messages are unstarred", () => {
+  it("continues automatic pagination when all loaded starred messages are unstarred", () => {
     useStarredMessagesQuery.mockReturnValue({
       data: [makeMessage("m-1")],
       loading: false,
@@ -178,7 +175,8 @@ describe("StarredView", () => {
     fireEvent.click(screen.getByRole("button", { name: "unstar" }));
 
     expect(screen.queryByText("No starred messages")).toBeNull();
-    expect(screen.getByRole("button", { name: "Load More" })).toBeTruthy();
+    expect(fetchNextPage).toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Load More" })).toBeNull();
   });
 
   it("resets local selection and removal state when the active account changes", () => {

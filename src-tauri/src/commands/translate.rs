@@ -136,7 +136,12 @@ fn validate_provider_config(
     match provider_config {
         TranslateProviderConfig::DeepLX { endpoint } => validate_translate_url(endpoint),
         TranslateProviderConfig::GenericApi { endpoint, .. } => validate_translate_url(endpoint),
-        TranslateProviderConfig::LLM { endpoint, .. } => validate_translate_url(endpoint),
+        TranslateProviderConfig::LLM { providers, .. } => {
+            for p in providers {
+                validate_translate_url(&p.base_url)?;
+            }
+            Ok(())
+        }
         TranslateProviderConfig::DeepL { .. } => Ok(()), // uses official API, no custom URL
     }
 }

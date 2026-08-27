@@ -91,7 +91,7 @@ pub async fn run_snooze_watcher(
                         let _ = app_handle
                             .notification()
                             .builder()
-                            .title("Pebble - Snoozed Message")
+            .title("YaoAIMail - Snoozed Message")
                             .body(&body)
                             .show();
                     }

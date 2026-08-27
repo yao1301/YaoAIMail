@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::backoff::SyncBackoff;
-use pebble_core::{new_id, now_timestamp, Message, PebbleError, Result};
+use pebble_core::{new_id, now_timestamp, Folder, Message, PebbleError, ProviderType, Result};
 use pebble_store::Store;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
@@ -23,6 +23,12 @@ pub struct SyncProgress {
     pub status: String,
     pub phase: String,
     pub message: Option<String>,
+    /// Server-side total messages in the mailbox being synced (history backfill).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u32>,
+    /// Messages processed so far in the current history backfill pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub received: Option<u32>,
 }
 
 impl SyncProgress {
@@ -32,6 +38,8 @@ impl SyncProgress {
             status: "started".to_string(),
             phase: phase.to_string(),
             message: None,
+            total: None,
+            received: None,
         }
     }
 
@@ -41,6 +49,8 @@ impl SyncProgress {
             status: "completed".to_string(),
             phase: phase.to_string(),
             message: None,
+            total: None,
+            received: None,
         }
     }
 
@@ -50,6 +60,8 @@ impl SyncProgress {
             status: "error".to_string(),
             phase: phase.to_string(),
             message: Some(message.to_string()),
+            total: None,
+            received: None,
         }
     }
 }
@@ -158,7 +170,7 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
 /// moment it has been flushed — we don't keep every attachment's bytes
 /// live in memory until the whole function returns. Writes use a buffered
 /// writer with 64 KiB chunks so the working set stays bounded.
-pub(crate) fn persist_message_attachments(
+pub fn persist_message_attachments(
     store: &Store,
     attachments_root: &Path,
     message_id: &str,
@@ -276,6 +288,27 @@ struct ImapFolderCursor {
     uidvalidity: Option<u64>,
     last_uid: Option<u32>,
     highest_modseq: Option<u64>,
+    #[serde(default)]
+    history_complete: bool,
+    /// Next IMAP sequence number range to backfill, moving from newest to oldest.
+    /// `None` means the oldest message has already been reached.
+    #[serde(default)]
+    history_next_sequence: Option<u32>,
+    /// Version 1 introduced a real advancing history cursor. Older cursor
+    /// records may incorrectly claim completion after a duplicate-only page.
+    #[serde(default)]
+    history_cursor_version: u8,
+    #[serde(default)]
+    unavailable: bool,
+    /// Signature of the last history-count verification that required a
+    /// recovery pass. This prevents a permanently missing/undeliverable set
+    /// of UIDs from causing the same full mailbox scan every tick.
+    #[serde(default)]
+    history_recovery_server_exists: Option<u32>,
+    #[serde(default)]
+    history_recovery_local_count: Option<u64>,
+    #[serde(default)]
+    history_recovery_paused: bool,
 }
 
 fn parse_imap_folder_cursor(state: Option<&str>) -> ImapFolderCursor {
@@ -293,6 +326,11 @@ fn prepare_imap_folder_cursor_for_status(
     if let (Some(stored), Some(current)) = (cursor.uidvalidity, uidvalidity) {
         if stored != current {
             cursor.last_uid = None;
+            cursor.history_complete = false;
+            cursor.history_next_sequence = None;
+            cursor.history_recovery_server_exists = None;
+            cursor.history_recovery_local_count = None;
+            cursor.history_recovery_paused = false;
         }
     }
     if uidvalidity.is_some() {
@@ -348,9 +386,12 @@ fn should_skip_missing_imap_mailbox_during_initial_sync(
 
 fn should_fail_initial_sync_for_folder_error(
     folder_role: Option<pebble_core::FolderRole>,
-    is_retryable: bool,
+    _is_retryable: bool,
 ) -> bool {
-    folder_role == Some(pebble_core::FolderRole::Inbox) || is_retryable
+    // A slow or broken Spam/Trash mailbox must never prevent Inbox and Sent
+    // history from becoming available. Those folders retain an incomplete
+    // cursor and are retried independently on the next pass.
+    folder_role == Some(pebble_core::FolderRole::Inbox)
 }
 
 fn idle_check_recovery_user_error(
@@ -379,8 +420,12 @@ fn is_retryable_imap_connection_error(error: &PebbleError) -> bool {
     let lower = message.to_ascii_lowercase();
 
     lower.contains("os error 10053")
+        || lower.contains("os error 10054")
         || lower.contains("connection reset")
         || lower.contains("connection aborted")
+        || lower.contains("远程主机强迫关闭")
+        || lower.contains("远程主机强制关闭")
+        || lower.contains("主机中的软件中止了一个已建立的连接")
         || lower.contains("broken pipe")
         || lower.contains("connection closed")
         || lower.contains("closed connection")
@@ -401,14 +446,76 @@ fn is_missing_imap_mailbox_error(error: &PebbleError) -> bool {
         || lower.contains("mailbox does not exist")
         || lower.contains("mailbox doesn't exist")
         || lower.contains("no such mailbox")
+        || lower.contains("nonexistent")
+        || lower.contains("not selectable")
 }
 
 fn should_attempt_imap_remote_folder(folder: &pebble_core::Folder) -> bool {
     !folder.remote_id.starts_with("__local_")
 }
 
-/// Page size used when backfilling a folder's full history.
-const HISTORY_PAGE_SIZE: u32 = 200;
+/// Fallback page size used when a server rejects a larger headers-only history
+/// range. Complete RFC822 messages, images and attachments are not downloaded
+/// during initial sync; they are fetched only when a user opens a message.
+const HISTORY_PAGE_SIZE: u32 = 3;
+
+/// Default page size for history backfill. 100 封/页：headers-only 拉取
+/// 开销小；服务器拒绝大范围时自动降级为 HISTORY_PAGE_SIZE(=3) 小页重试。
+const HISTORY_PAGE_SIZE_FAST: u32 = 100;
+/// New mail is the highest-priority work: after headers are committed, the
+/// complete MIME message (body and attachments) for the whole incremental
+/// batch is hydrated immediately on a dedicated connection. A large message
+/// must not prevent the headers for later mail from being stored, but it also
+/// must not be demoted behind historical backfill.
+const NEW_MESSAGE_HYDRATION_LIMIT: usize = 100;
+
+/// How many header-only messages the background body backfill hydrates per
+/// pass. Kept modest so a few large attachments do not hog the dedicated
+/// connection for too long; remaining messages continue next pass.
+/// 每轮 100 封 + 封间让出，避免长时间独占数据库写连接（SQLite 单写者），
+/// 否则邮件列表等其它读写会被堵住（"一直加载中"）。
+/// 原 20 封/轮 + 20s 轮间 ≈ 1 封/秒，几千封要几小时；加大批量 + 缩短轮间后
+/// 约 30+ 封/秒（网络往返仍是一封一次 FETCH）。
+const BODY_HYDRATION_BATCH: u32 = 100;
+
+/// 全局正文补齐互斥锁：所有账号的补齐任务共用，同一时间只允许一个账号
+/// 跑补齐（多账号并发会争抢唯一的数据库写连接导致其它操作超时）。
+static BODY_BACKFILL_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// 进程级"批量 UID FETCH 不可用"标记：某些服务器（如 Zoho）对批量
+/// BODY.PEEK[] 支持差，一次批量就要超时。第一次失败后记住，整个进程
+/// 生命周期内不再尝试批量，直接逐封分片拉取（避免每 pass 都白等 30s）。
+static BODY_BACKFILL_BATCH_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// History-sync cursor version for the newer implementation.
+const HISTORY_CURSOR_VERSION: u8 = 3;
+
+/// Maximum history pages advanced per folder in a single backfill pass.
+/// 10 页 × 100 封/页 ≈ 1000 封/轮：大多数文件夹一轮收全；超大文件夹
+/// 也只需几轮（每 2 分钟一轮）。超时页会自动降级成 3 封小页重试
+/// （fetch_history_page_with_fallback），不会因单页失败卡死。
+const HISTORY_BACKFILL_PAGES_PER_RUN: u32 = 10;
+
+fn imap_history_priority(folder: &pebble_core::Folder) -> u8 {
+    match folder.role {
+        Some(pebble_core::FolderRole::Inbox) => 0,
+        Some(pebble_core::FolderRole::Sent) => 1,
+        Some(pebble_core::FolderRole::Drafts) => 2,
+        Some(pebble_core::FolderRole::Archive) => 3,
+        None => 4,
+        Some(pebble_core::FolderRole::Trash) => 8,
+        Some(pebble_core::FolderRole::Spam) => 9,
+    }
+}
+
+fn should_defer_imap_recent_fetch(folder: &pebble_core::Folder) -> bool {
+    matches!(
+        folder.role,
+        Some(pebble_core::FolderRole::Trash | pebble_core::FolderRole::Spam)
+    )
+}
 
 /// Inclusive sequence-number ranges covering a mailbox from newest to
 /// oldest, each at most `page_size` messages long. `exists == 0` yields no
@@ -468,6 +575,10 @@ fn should_poll_imap_folder_for_realtime(folder: &pebble_core::Folder) -> bool {
     should_poll_imap_folder_for_scope(folder, ImapPollScope::Realtime)
 }
 
+fn should_probe_custom_folder_for_new_mail(folder: &pebble_core::Folder) -> bool {
+    should_attempt_imap_remote_folder(folder) && folder.role.is_none() && !folder.is_system
+}
+
 /// Configuration for the sync worker.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -497,6 +608,10 @@ impl SyncConfig {
 
 fn imap_poll_policy(config: &SyncConfig) -> RealtimePollPolicy {
     RealtimePollPolicy::from_foreground_interval_secs(config.poll_interval_secs)
+}
+
+fn custom_folder_poll_interval_secs(config: &SyncConfig) -> Option<u64> {
+    (!config.manual_only()).then_some(config.poll_interval_secs.max(1))
 }
 
 fn first_reconcile_deadline(now: Instant, interval: Duration) -> Instant {
@@ -537,6 +652,7 @@ pub(crate) async fn recv_sync_trigger(
 }
 
 /// Common fields shared by all sync workers.
+#[derive(Clone)]
 pub(crate) struct SyncWorkerBase {
     pub(crate) account_id: String,
     pub(crate) store: Arc<Store>,
@@ -589,9 +705,24 @@ impl SyncWorkerBase {
             let _ = tx.send(SyncProgress::error(&self.account_id, phase, message));
         }
     }
+
+    /// Emit a fine-grained progress tick (e.g. history backfill page done).
+    pub(crate) fn emit_sync_progress(&self, phase: &str, total: u32, received: u32) {
+        if let Some(tx) = &self.progress_tx {
+            let _ = tx.send(SyncProgress {
+                account_id: self.account_id.clone(),
+                status: "progress".to_string(),
+                phase: phase.to_string(),
+                message: None,
+                total: Some(total),
+                received: Some(received),
+            });
+        }
+    }
 }
 
 /// A worker that syncs mail for one account.
+#[derive(Clone)]
 pub struct SyncWorker {
     pub(crate) base: SyncWorkerBase,
     provider: Arc<ImapMailProvider>,
@@ -767,24 +898,99 @@ impl SyncWorker {
         cursor
     }
 
+    fn is_folder_quarantined(&self, folder: &pebble_core::Folder) -> bool {
+        self.stored_imap_folder_cursor(folder).unavailable
+    }
+
+    fn quarantine_folder(&self, folder: &pebble_core::Folder, reason: &str) {
+        let mut cursor = self.stored_imap_folder_cursor(folder);
+        if cursor.unavailable {
+            return;
+        }
+        cursor.unavailable = true;
+        cursor.history_complete = true;
+        cursor.history_next_sequence = None;
+        if let Some(state) = serialize_imap_folder_cursor(&cursor) {
+            let _ = self
+                .base
+                .store
+                .set_folder_sync_state(&self.base.account_id, &folder.id, &state);
+        }
+        warn!(
+            "Quarantined unavailable IMAP folder {} ({}) for account {}: {}",
+            folder.name, folder.remote_id, self.base.account_id, reason
+        );
+    }
+
+    fn clear_folder_quarantine(&self, folder: &pebble_core::Folder, cursor: &mut ImapFolderCursor) {
+        if !cursor.unavailable {
+            return;
+        }
+        cursor.unavailable = false;
+        if let Some(state) = serialize_imap_folder_cursor(cursor) {
+            let _ = self
+                .base
+                .store
+                .set_folder_sync_state(&self.base.account_id, &folder.id, &state);
+        }
+        info!(
+            "Restored IMAP folder {} ({}) after a successful status check",
+            folder.name, folder.remote_id
+        );
+    }
+
     async fn try_imap_folder_cursor_for_sync(
         &self,
         folder: &pebble_core::Folder,
     ) -> Result<ImapFolderCursor> {
-        let cursor = self.stored_imap_folder_cursor(folder);
-        if !should_attempt_imap_remote_folder(folder) {
+        let mut cursor = self.stored_imap_folder_cursor(folder);
+        if !should_attempt_imap_remote_folder(folder) || self.is_folder_quarantined(folder) {
             return Ok(cursor);
         }
-        let status = self
+        let status = match self
             .provider
             .inner()
             .get_mailbox_status(&folder.remote_id)
-            .await?;
-        Ok(prepare_imap_folder_cursor_for_status(
+            .await
+        {
+            Ok(status) => status,
+            Err(error) if is_retryable_imap_connection_error(&error) => {
+                warn!(
+                    "Mailbox status failed for {} ({}); reconnecting before retry",
+                    folder.name, error
+                );
+                let _ = self.provider.disconnect().await;
+                self.provider.connect().await?;
+                self.provider
+                    .inner()
+                    .get_mailbox_status(&folder.remote_id)
+                    .await?
+            }
+            Err(error) => {
+                if is_missing_imap_mailbox_error(&error) {
+                    self.quarantine_folder(folder, &error.to_string());
+                }
+                return Err(error);
+            }
+        };
+        self.clear_folder_quarantine(folder, &mut cursor);
+        let mut cursor = prepare_imap_folder_cursor_for_status(
             cursor,
             status.uid_validity.map(u64::from),
             status.highest_modseq,
-        ))
+        );
+        if cursor.history_cursor_version < HISTORY_CURSOR_VERSION {
+            // Keep last_uid for the fast newest-mail path, but restart the
+            // sequence-number backfill. This is deliberately a one-time
+            // migration: once persisted as v2, normal incremental sync is
+            // unchanged.
+            cursor.history_cursor_version = HISTORY_CURSOR_VERSION;
+            cursor.history_complete = false;
+            cursor.history_next_sequence = (status.exists > 0).then_some(status.exists);
+        } else if cursor.history_next_sequence.is_none() && !cursor.history_complete && status.exists > 0 {
+            cursor.history_next_sequence = Some(status.exists);
+        }
+        Ok(cursor)
     }
 
     fn persist_imap_folder_cursor_after_sync(
@@ -829,6 +1035,7 @@ impl SyncWorker {
             .store
             .get_sync_state(&self.base.account_id)?
             .and_then(|state| state.selected_imap_folder_remote_ids)
+            .filter(|ids| !ids.is_empty())
             .map(|ids| ids.into_iter().collect::<HashSet<_>>());
 
         let discovered_folders = self
@@ -884,22 +1091,22 @@ impl SyncWorker {
         // (insert_folder upserts, so in-memory IDs from list_folders may differ).
         let folders = self.base.store.list_folders(&self.base.account_id)?;
 
-        // Sync all folders, prioritising Inbox first
-        let mut ordered: Vec<&pebble_core::Folder> = Vec::with_capacity(folders.len());
-        if let Some(inbox) = folders
-            .iter()
-            .find(|f| f.role == Some(pebble_core::FolderRole::Inbox))
-        {
-            ordered.push(inbox);
-        }
-        for f in &folders {
-            if f.role != Some(pebble_core::FolderRole::Inbox) {
-                ordered.push(f);
-            }
-        }
+        // Keep user-critical history moving first. Server LIST order is not a
+        // useful priority and often places a huge Spam folder before Sent.
+        let mut ordered: Vec<&pebble_core::Folder> = folders.iter().collect();
+        ordered.sort_by_key(|folder| imap_history_priority(folder));
 
         let mut first_initial_sync_error = None;
+        // Phase 1: every selected server folder gets a small recent batch
+        // before any one large mailbox can monopolise the worker.
         for folder in &ordered {
+            if should_defer_imap_recent_fetch(folder) {
+                info!(
+                    "Deferring recent fetch for low-priority folder {} until Inbox and Sent history are available",
+                    folder.name
+                );
+                continue;
+            }
             if let Err(e) = self.initial_sync_folder_with_reconnect(folder).await {
                 warn!("Initial sync folder {} failed: {}", folder.name, e);
                 let is_retryable = is_retryable_imap_connection_error(&e);
@@ -915,6 +1122,490 @@ impl SyncWorker {
             return Err(e);
         }
 
+        // Phase 2: start background history backfill for folders that are not
+        // history-complete yet. Each folder advances at most
+        // HISTORY_BACKFILL_PAGES_PER_RUN pages per run so a huge Sent/Archive
+        // mailbox cannot keep the worker (and the "syncing" indicator) busy for
+        // hours; the remaining pages are filled by the reconcile ticker loop.
+        if let Err(error) = self.backfill_incomplete_history(HISTORY_BACKFILL_PAGES_PER_RUN).await {
+            warn!(
+                "Initial history backfill pass failed for account {}: {}",
+                self.base.account_id, error
+            );
+        }
+
+        // Synchronize folder deletions right after discovery so folders the
+        // user removed from the web client are cleaned up locally without
+        // waiting for the next 15-minute reconcile tick.
+        if let Err(error) = self.reconcile_imap_folders().await {
+            warn!(
+                "Initial folder reconciliation failed for account {}: {}",
+                self.base.account_id, error
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Compare the server folder list with local folders and remove local
+    /// records for IMAP folders that no longer exist on the server (e.g. the
+    /// user deleted them from the web client). Local-only system folders are
+    /// always preserved. Safe to call periodically: deletions are idempotent.
+    async fn reconcile_imap_folders(&self) -> Result<()> {
+        // LIST can fail independently from the rest of a sync when an IMAP
+        // connection is being recycled. Retry a few times here so a manual
+        // collect does not leave the UI on the old folder tree just because
+        // the first LIST hit a transient disconnect. Empty responses are
+        // retried as well; after the final attempt they remain protected and
+        // never trigger local cleanup.
+        let mut remote = None;
+        let mut last_error = None;
+        for attempt in 0..3 {
+            match self
+                .provider
+                .inner()
+                .list_folders(&self.base.account_id)
+                .await
+            {
+                Ok(folders) if !folders.is_empty() => {
+                    remote = Some(folders);
+                    break;
+                }
+                Ok(_) => {
+                    warn!(
+                        "Server folder list is empty for account {} (attempt {}/3)",
+                        self.base.account_id,
+                        attempt + 1
+                    );
+                }
+                Err(error) => {
+                    let retryable = is_retryable_imap_connection_error(&error);
+                    last_error = Some(error);
+                    if !retryable {
+                        break;
+                    }
+                }
+            }
+            if attempt < 2 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
+            }
+        }
+        let remote = match remote {
+            Some(folders) => folders,
+            None => {
+                if let Some(error) = last_error {
+                    return Err(error);
+                }
+                Vec::new()
+            }
+        };
+        // P0 数据保护：服务器返回空文件夹列表时（网络中断 / 服务器异常经常表现为
+        // LIST 成功但返回空响应），绝不能删除本地文件夹——否则收件箱、草稿箱等
+        // 全部本地文件夹会被清空并进入"no Inbox folder found"的恶性循环。
+        if remote.is_empty() {
+            warn!(
+                "Server folder list is empty for account {}; skipping folder reconciliation to protect local data",
+                self.base.account_id
+            );
+            return Ok(());
+        }
+        // Reconcile paths before any cleanup. A server-side rename changes
+        // remote_id; matching a unique leaf/role preserves the local folder
+        // ID and its message memberships instead of creating a new empty row.
+        self.base
+            .store
+            .reconcile_remote_folder_tree(&self.base.account_id, &remote)?;
+        self.probe_quarantined_folders().await;
+        // 服务器是层级的权威来源：根据（已同步的）remote_id 重建 parent_id，
+        // 修复用户在网页邮箱移动文件夹后本地层级与服务器不一致的问题。
+        match self
+            .base
+            .store
+            .repair_folder_hierarchy_from_remote_ids(&self.base.account_id)
+        {
+            Ok(repaired) => info!(
+                account_id = %self.base.account_id,
+                remote_folders = remote.len(),
+                repaired,
+                "Reconciled server-authoritative IMAP folder hierarchy"
+            ),
+            Err(error) => {
+            warn!(
+                "Failed to repair folder hierarchy for account {}: {}",
+                self.base.account_id, error
+            );
+            }
+        }
+        Ok(())
+    }
+
+    async fn probe_quarantined_folders(&self) {
+        let Ok(folders) = self.base.store.list_folders(&self.base.account_id) else {
+            return;
+        };
+        for folder in folders {
+            if !self.is_folder_quarantined(&folder) || folder.remote_id.starts_with("__local_") {
+                continue;
+            }
+            match self
+                .provider
+                .inner()
+                .get_mailbox_status(&folder.remote_id)
+                .await
+            {
+                Ok(_) => {
+                    let mut cursor = self.stored_imap_folder_cursor(&folder);
+                    self.clear_folder_quarantine(&folder, &mut cursor);
+                }
+                Err(error) if is_missing_imap_mailbox_error(&error) => {}
+                Err(error) => warn!(
+                    "Unavailable-folder probe failed for {}: {}",
+                    folder.remote_id, error
+                ),
+            }
+        }
+    }
+
+    /// Repair historical local-only moves made by older rule code. Those
+    /// versions changed message_folders but did not persist a remote MOVE, so
+    /// there is no source mailbox in a pending-op record. We locate each UID
+    /// once across the server mailboxes, then move only when the target mailbox
+    /// does not already contain it. This is bounded and idempotent.
+    async fn repair_historical_local_moves(&self, limit: u32) -> Result<u32> {
+        let folders = self.base.store.list_folders(&self.base.account_id)?;
+        let mut targets: Vec<(Folder, Vec<(String, u32)>)> = Vec::new();
+        let mut needed = HashSet::new();
+        let mut remaining = limit as usize;
+
+        for folder in &folders {
+            if remaining == 0 || folder.remote_id.starts_with("__local_") {
+                continue;
+            }
+            let mut refs = Vec::new();
+            for (message_id, remote_id) in self
+                .base
+                .store
+                .list_message_remote_ids_by_folder(&folder.id)?
+            {
+                let Ok(uid) = remote_id.parse::<u32>() else {
+                    continue;
+                };
+                refs.push((message_id, uid));
+                needed.insert(uid);
+                remaining = remaining.saturating_sub(1);
+                if remaining == 0 {
+                    break;
+                }
+            }
+            if !refs.is_empty() {
+                targets.push((folder.clone(), refs));
+            }
+        }
+        if needed.is_empty() {
+            return Ok(0);
+        }
+
+        let mut server_uids: std::collections::HashMap<String, HashSet<u32>> =
+            std::collections::HashMap::new();
+        for folder in &folders {
+            if folder.remote_id.starts_with("__local_") {
+                continue;
+            }
+            match self
+                .provider
+                .inner()
+                .fetch_all_uids(&folder.remote_id)
+                .await
+            {
+                Ok(uids) => {
+                    let matching: HashSet<u32> =
+                        uids.into_iter().filter(|uid| needed.contains(uid)).collect();
+                    if !matching.is_empty() {
+                        server_uids.insert(folder.remote_id.clone(), matching);
+                    }
+                }
+                Err(error) => warn!(
+                    "Historical move repair skipped mailbox {}: {}",
+                    folder.remote_id, error
+                ),
+            }
+        }
+
+        let mut repaired = 0u32;
+        for (target, refs) in targets {
+            for (message_id, uid) in refs {
+                if server_uids
+                    .get(&target.remote_id)
+                    .is_some_and(|uids| uids.contains(&uid))
+                {
+                    continue;
+                }
+                let Some(source_remote_id) = server_uids.iter().find_map(|(mailbox, uids)| {
+                    (mailbox != &target.remote_id && uids.contains(&uid)).then_some(mailbox.clone())
+                }) else {
+                    continue;
+                };
+                match self
+                    .provider
+                    .inner()
+                    .move_message_with_dedup(
+                        &source_remote_id,
+                        uid,
+                        &target.remote_id,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        server_uids
+                            .entry(source_remote_id.clone())
+                            .or_default()
+                            .remove(&uid);
+                        server_uids
+                            .entry(target.remote_id.clone())
+                            .or_default()
+                            .insert(uid);
+                        repaired += 1;
+                        info!(
+                            "Repaired historical local move {} UID {}: {} -> {}",
+                            message_id, uid, source_remote_id, target.remote_id
+                        );
+                    }
+                    Err(error) => warn!(
+                        "Historical move repair failed for {} UID {}: {}",
+                        message_id, uid, error
+                    ),
+                }
+            }
+        }
+        if repaired > 0 {
+            info!(
+                account_id = %self.base.account_id,
+                repaired,
+                "Historical local-only rule moves repaired on server"
+            );
+        }
+        Ok(repaired)
+    }
+
+    /// Continue filling history for folders whose `history_complete` flag is
+    /// still false, advancing each folder at most `max_pages_per_folder`
+    /// pages per call. Safe to call repeatedly: already-stored UIDs are
+    /// skipped, so an interrupted backfill resumes on the next run.
+    async fn backfill_incomplete_history(&self, max_pages_per_folder: u32) -> Result<()> {
+        let folders = self.base.store.list_folders(&self.base.account_id)?;
+        for folder in &folders {
+            if !should_attempt_imap_remote_folder(folder) || self.is_folder_quarantined(folder) {
+                continue;
+            }
+            let mut cursor = self.stored_imap_folder_cursor(folder);
+            if cursor.history_recovery_paused {
+                // A repeated count mismatch means rescanning the same range
+                // is not making progress (for example, a server-side UID
+                // range that cannot be fetched or a provider that hides
+                // messages from SEARCH/FETCH). Probe cheaply and resume only
+                // when the mailbox state has materially changed.
+                let status = match self
+                    .provider
+                    .inner()
+                    .get_mailbox_status(&folder.remote_id)
+                    .await
+                {
+                    Ok(status) => status,
+                    Err(error) => {
+                        debug!(
+                            "Paused history recovery probe skipped for {}: {}",
+                            folder.name, error
+                        );
+                        continue;
+                    }
+                };
+                let local_count = self
+                    .base
+                    .store
+                    .list_remote_ids_by_folder(&self.base.account_id, &folder.id)
+                    .map(|items| items.len() as u64)
+                    .unwrap_or(0);
+                let unchanged = cursor.history_recovery_server_exists == Some(status.exists)
+                    && cursor.history_recovery_local_count == Some(local_count);
+                if unchanged {
+                    continue;
+                }
+                info!(
+                    "Resuming paused history recovery for {} because mailbox counts changed (local {}, server {})",
+                    folder.name, local_count, status.exists
+                );
+                cursor.history_recovery_paused = false;
+                cursor.history_recovery_server_exists = None;
+                cursor.history_recovery_local_count = None;
+                cursor.history_complete = false;
+                cursor.history_next_sequence = (status.exists > 0).then_some(status.exists);
+                if let Err(error) = self.persist_imap_folder_cursor_after_sync(folder, cursor) {
+                    warn!(
+                        "Failed to persist resumed history cursor for folder {}: {}",
+                        folder.name, error
+                    );
+                }
+                continue;
+            }
+            if cursor.history_complete {
+                continue;
+            }
+            info!(
+                "History backfill pass for folder {} (max {} pages) account {}",
+                folder.name, max_pages_per_folder, self.base.account_id
+            );
+            match self
+                .sync_folder_history_pages(folder, false, Some(max_pages_per_folder))
+                .await
+            {
+                Ok(count) => {
+                    let mut cursor = self.stored_imap_folder_cursor(folder);
+                    // A page with zero *new* messages is not necessarily the
+                    // end: it may simply overlap the recent batch already
+                    // stored during initial sync. Completion is determined by
+                    // the persisted sequence cursor, never by `count`.
+                    let is_done = cursor.history_next_sequence.is_none();
+                    if is_done {
+                        // 兜底校验：若本地邮件数远少于服务器 exists，说明之前可能
+                        // 发生过静默丢失（fetch 失败但游标照常推进），不标记完成，
+                        // 重置游标让下轮从头重试，直到数量对齐。
+                        let local_count = self
+                            .base
+                            .store
+                            .list_remote_ids_by_folder(&self.base.account_id, &folder.id)
+                            .map(|items| items.len() as u64)
+                            .unwrap_or(0);
+                        let server_exists = self
+                            .provider
+                            .inner()
+                            .get_mailbox_status(&folder.remote_id)
+                            .await
+                            .map(|status| status.exists as u64)
+                            .unwrap_or(0);
+                        if server_exists > 0 && local_count < server_exists.saturating_mul(90) / 100 {
+                            let same_gap = cursor.history_recovery_server_exists
+                                == Some(server_exists as u32)
+                                && cursor.history_recovery_local_count == Some(local_count);
+                            if same_gap {
+                                warn!(
+                                    "History backfill for {} is paused after repeated count mismatch (local {} vs server {}); will probe without rescanning",
+                                    folder.name, local_count, server_exists
+                                );
+                                cursor.history_recovery_paused = true;
+                            } else {
+                                warn!(
+                                    "History backfill finished for {} but local count {} << server exists {}; scheduling one recovery pass",
+                                    folder.name, local_count, server_exists
+                                );
+                                cursor.history_recovery_paused = false;
+                                cursor.history_next_sequence = Some(server_exists as u32);
+                            }
+                            cursor.history_recovery_server_exists = Some(server_exists as u32);
+                            cursor.history_recovery_local_count = Some(local_count);
+                            cursor.history_complete = false;
+                            if cursor.history_recovery_paused {
+                                cursor.history_next_sequence = None;
+                            }
+                            if let Err(error) =
+                                self.persist_imap_folder_cursor_after_sync(folder, cursor)
+                            {
+                                warn!(
+                                    "Failed to persist cursor for folder {}: {}",
+                                    folder.name, error
+                                );
+                            }
+                            return Ok(());
+                        }
+                        cursor.history_complete = true;
+                        cursor.history_recovery_server_exists = None;
+                        cursor.history_recovery_local_count = None;
+                        cursor.history_recovery_paused = false;
+                        info!(
+                            "History backfill completed for folder {} ({} new messages this pass)",
+                            folder.name, count
+                        );
+                    } else {
+                        info!(
+                            "History backfill progressed for folder {} ({} new messages this pass)",
+                            folder.name, count
+                        );
+                    }
+                    if let Err(error) = self.persist_imap_folder_cursor_after_sync(folder, cursor) {
+                        warn!(
+                            "Failed to persist cursor for folder {}: {}",
+                            folder.name, error
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        "History backfill paused for folder {} and will retry on next reconcile: {}",
+                        folder.name, error
+                    );
+                    let _ = self.provider.disconnect().await;
+                    if let Err(reconnect_error) = self.provider.connect().await {
+                        warn!(
+                            "Reconnect after history backfill failure for folder {} failed: {}",
+                            folder.name, reconnect_error
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 自愈：周期性对账"已标记完成"的文件夹。若本地邮件数远少于服务器 exists
+    /// （历史上因网络故障/静默丢失被误标完成），自动复位回填游标并重新拉取。
+    /// 对任何用户、任何文件夹都生效，无需人工干预。
+    async fn heal_stale_complete_folders(&self) -> Result<()> {
+        let folders = self.base.store.list_folders(&self.base.account_id)?;
+        for folder in &folders {
+            if !should_attempt_imap_remote_folder(folder) || self.is_folder_quarantined(folder) {
+                continue;
+            }
+            let cursor = self.stored_imap_folder_cursor(folder);
+            if !cursor.history_complete {
+                continue;
+            }
+            let local_count = self
+                .base
+                .store
+                .list_remote_ids_by_folder(&self.base.account_id, &folder.id)
+                .map(|items| items.len() as u64)
+                .unwrap_or(0);
+            let status = match self
+                .provider
+                .inner()
+                .get_mailbox_status(&folder.remote_id)
+                .await
+            {
+                Ok(status) => status,
+                Err(error) => {
+                    debug!("Heal check skipped for {}: {}", folder.name, error);
+                    continue;
+                }
+            };
+            let server_exists = status.exists as u64;
+            if server_exists > 0 && local_count < server_exists.saturating_mul(90) / 100 {
+                warn!(
+                    "Healing folder {}: local {} vs server exists {}; restarting history backfill",
+                    folder.name, local_count, server_exists
+                );
+                let mut healed = cursor.clone();
+                healed.history_complete = false;
+                healed.history_next_sequence = Some(status.exists);
+                if let Err(error) =
+                    self.persist_imap_folder_cursor_after_sync(folder, healed)
+                {
+                    warn!(
+                        "Failed to persist healed cursor for folder {}: {}",
+                        folder.name, error
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -927,6 +1618,7 @@ impl SyncWorker {
                         folder.role.clone(),
                     ) =>
             {
+                self.quarantine_folder(folder, &e.to_string());
                 debug!(
                     "Skipping unavailable IMAP folder {} ({}) for account {}: {}",
                     folder.name, folder.remote_id, self.base.account_id, e
@@ -947,7 +1639,7 @@ impl SyncWorker {
     }
 
     async fn initial_sync_folder_once(&self, folder: &pebble_core::Folder) -> Result<()> {
-        if !should_attempt_imap_remote_folder(folder) {
+        if !should_attempt_imap_remote_folder(folder) || self.is_folder_quarantined(folder) {
             debug!(
                 "Skipping local-only IMAP folder {} ({}) during initial sync",
                 folder.name, folder.remote_id
@@ -958,14 +1650,29 @@ impl SyncWorker {
         let cursor = self.try_imap_folder_cursor_for_sync(folder).await?;
         let since_uid = cursor.last_uid;
         let notify_new = should_notify_imap_startup_fetch(since_uid);
-        let count = if let Some(uid) = since_uid {
-            self.sync_folder(folder, Some(uid), 50, notify_new).await?
-        } else {
-            // No cursor yet (fresh account or folder whose local data was
-            // cleared): backfill the full mailbox instead of fetching only
-            // the most recent page.
-            self.sync_folder_history(folder, notify_new).await?
-        };
+        // Store new headers before attempting MIME downloads. Some IMAP
+        // servers close the connection while fetching a large body or
+        // attachment; fetching the whole batch first used to make *all* new
+        // mail disappear until the next retry. Headers give the user an
+        // immediate, reliable cursor and the newest few messages are then
+        // hydrated one by one on a best-effort basis.
+        let mut count = 0;
+        if let Some(uid) = since_uid {
+            count += self
+                .sync_folder_headers_with_hydration(
+                    folder,
+                    Some(uid),
+                    HISTORY_PAGE_SIZE_FAST,
+                    notify_new,
+                )
+                .await?;
+        }
+        // A small recent-window scan repairs a stale cursor without issuing
+        // another large header request that could compete with new-mail
+        // hydration on slow servers.
+        count += self
+            .sync_folder_headers(folder, None, HISTORY_PAGE_SIZE, notify_new && since_uid.is_none())
+            .await?;
 
         if count > 0 {
             info!(
@@ -1005,8 +1712,564 @@ impl SyncWorker {
             .fetch_messages_raw(&folder.remote_id, since_uid, limit)
             .await?;
 
-        self.store_fetched_messages(folder, raw_messages, notify_new)
+        self.store_fetched_messages(folder, raw_messages, notify_new, false)
             .await
+    }
+
+    /// Fast sync path: store headers immediately and defer full MIME downloads
+    /// until the user opens a message.
+    pub async fn sync_folder_headers(
+        &self,
+        folder: &pebble_core::Folder,
+        since_uid: Option<u32>,
+        limit: u32,
+        notify_new: bool,
+    ) -> Result<u32> {
+        if Self::is_local_folder(folder) {
+            return Ok(0);
+        }
+        let raw_messages = match self
+            .provider
+            .inner()
+            .fetch_messages_headers(&folder.remote_id, since_uid, limit)
+            .await
+        {
+            Ok(messages) => messages,
+            Err(error) if is_retryable_imap_connection_error(&error) => {
+                warn!(
+                    "Header fetch failed for {} ({}); reconnecting before retry",
+                    folder.name, error
+                );
+                let _ = self.provider.disconnect().await;
+                self.provider.connect().await?;
+                self.provider
+                    .inner()
+                    .fetch_messages_headers(&folder.remote_id, since_uid, limit)
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
+        self.store_fetched_messages(folder, raw_messages, notify_new, true).await
+    }
+
+    /// Fetch incremental headers first, then immediately hydrate the complete
+    /// incremental batch (body and attachments) on a dedicated connection. A
+    /// failed MIME fetch is non-fatal: the header remains stored and the body
+    /// backfill queue retries it later.
+    async fn sync_folder_headers_with_hydration(
+        &self,
+        folder: &pebble_core::Folder,
+        since_uid: Option<u32>,
+        limit: u32,
+        notify_new: bool,
+    ) -> Result<u32> {
+        if Self::is_local_folder(folder) {
+            return Ok(0);
+        }
+
+        let raw_messages = match self
+            .provider
+            .inner()
+            .fetch_messages_headers(&folder.remote_id, since_uid, limit)
+            .await
+        {
+            Ok(messages) => messages,
+            Err(error) if is_retryable_imap_connection_error(&error) => {
+                warn!(
+                    "Header fetch failed for {} ({}); reconnecting before retry",
+                    folder.name, error
+                );
+                let _ = self.provider.disconnect().await;
+                self.provider.connect().await?;
+                self.provider
+                    .inner()
+                    .fetch_messages_headers(&folder.remote_id, since_uid, limit)
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
+
+        let uids: Vec<u32> = raw_messages
+            .iter()
+            .map(|(uid, _)| *uid)
+            .take(NEW_MESSAGE_HYDRATION_LIMIT)
+            .collect();
+        let stored = self
+            .store_fetched_messages(folder, raw_messages, notify_new, true)
+            .await?;
+
+        // Do not await MIME downloads here. A single large message can take
+        // the full 45-second body timeout; keeping that wait in the main
+        // worker was the reason the UI appeared frozen and later messages
+        // were delayed. Use a dedicated connection so live polling remains
+        // available for other folders.
+        if !uids.is_empty() {
+            let base = self.base.clone();
+            let provider = Arc::new(self.provider.clone_for_idle());
+            let folder = folder.clone();
+            tokio::spawn(async move {
+                if let Err(error) = provider.connect().await {
+                    warn!(
+                        "Background MIME hydration connection failed for {} (headers retained): {}",
+                        folder.name, error
+                    );
+                    return;
+                }
+                for uid in uids {
+                    if let Err(error) =
+                        Self::hydrate_incremental_message(&base, &provider, &folder, uid).await
+                    {
+                        warn!(
+                            "Best-effort MIME hydration failed for {} UID {} (header retained): {}",
+                            folder.name, uid, error
+                        );
+                    }
+                }
+                let _ = provider.disconnect().await;
+            });
+        }
+
+        Ok(stored)
+    }
+
+    async fn hydrate_incremental_message(
+        base: &SyncWorkerBase,
+        provider: &ImapMailProvider,
+        folder: &pebble_core::Folder,
+        uid: u32,
+    ) -> Result<()> {
+        let remote_id = uid.to_string();
+        let Some(message_id) = base.store.find_message_id_by_remote_in_folder(
+            &base.account_id,
+            &folder.id,
+            &remote_id,
+        )? else {
+            return Ok(());
+        };
+
+        let raw = match provider
+            .inner()
+            .fetch_message_raw_by_uid(&folder.remote_id, uid)
+            .await
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                let _ = base.store.fail_body_download_job(&message_id, &error.to_string());
+                return Err(error);
+            }
+        };
+        match Self::hydrate_message_from_raw(base, folder, &message_id, &raw).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = base.store.fail_body_download_job(&message_id, &error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    /// 用已下载的原始邮件 bytes 完成 hydrate：解析、写正文、附件落盘、emit。
+    /// 由 hydrate_incremental_message（单封）和批量 backfill（chunk 批量）共用。
+    async fn hydrate_message_from_raw(
+        base: &SyncWorkerBase,
+        folder: &pebble_core::Folder,
+        message_id: &str,
+        raw: &[u8],
+    ) -> Result<()> {
+        let parsed = parse_raw_email(raw)?;
+
+        base.store.update_message_content(
+            message_id,
+            &parsed.body_text,
+            &parsed.body_html,
+            &parsed.snippet,
+            parsed.has_attachments,
+            None,
+        )?;
+        base.store.delete_attachments_by_message(message_id)?;
+        persist_message_attachments_async(
+            Arc::clone(&base.store),
+            base.attachments_dir.clone(),
+            message_id.to_string(),
+            parsed.attachments,
+        )
+        .await;
+        base.store.complete_body_download_job(message_id)?;
+
+        if let Some(mut message) = base.store.get_message(message_id)? {
+            message.body_text = parsed.body_text;
+            message.body_html_raw = parsed.body_html;
+            message.snippet = parsed.snippet;
+            message.has_attachments = parsed.has_attachments;
+            message.remote_version = None;
+            base.emit_message(StoredMessage {
+                message,
+                folder_ids: vec![folder.id.clone()],
+                notify: false,
+            });
+        }
+        Ok(())
+    }
+
+    /// Background full-body backfill: hydrate every message that still only
+    /// has headers (remote_version = 'headers-only') so that full text and
+    /// attachments are downloaded locally. Hydrated messages flow through the
+    /// indexing pipeline again, which makes their body searchable.
+    ///
+    /// Runs on a dedicated connection and is limited to `limit` messages per
+    /// pass so large attachments cannot starve live polling. Failures are
+    /// skipped and retried on the next pass. Non-IMAP accounts (POP3 etc.)
+    /// are skipped because there is no server-side UID fetch path.
+    async fn hydrate_incomplete_bodies(&self, limit: u32) -> Result<u32> {
+        let account = self
+            .base
+            .store
+            .get_account(&self.base.account_id)?
+            .ok_or_else(|| PebbleError::Internal(format!("Account {} missing", self.base.account_id)))?;
+        if account.provider != ProviderType::Imap {
+            return Ok(0);
+        }
+        let candidates = self
+            .base
+            .store
+            .claim_body_download_jobs(&self.base.account_id, limit)?;
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        info!(
+            account_id = %self.base.account_id,
+            count = candidates.len(),
+            "Body backfill: hydrating {} header-only messages in background",
+            candidates.len()
+        );
+        let mut done = 0u32;
+
+        // 先过滤掉已被其他路径 hydrate 的（避免重复下载），并解析 UID。
+        // 收集 (folder_id, folder_remote_id, message_id, uid) 列表，按文件夹分组，
+        // 每个文件夹内用批量 UID FETCH（一次网络往返拿多封），显著加速。
+        struct Candidate {
+            message_id: String,
+            uid: u32,
+        }
+        let mut by_folder: std::collections::BTreeMap<String, (String, Vec<Candidate>)> =
+            std::collections::BTreeMap::new();
+        for (message_id, folder_id, folder_remote_id, remote_uid) in &candidates {
+            // Historical MOVE/reconcile bugs sometimes left a complete local
+            // copy soft-deleted and a newer header-only duplicate visible.
+            // Reuse the complete row itself: this is instant, preserves its
+            // attachment paths, and avoids downloading bytes already on disk.
+            if let Some(restored_id) = self
+                .base
+                .store
+                .restore_complete_local_duplicate(message_id)?
+            {
+                done += 1;
+                info!(
+                    "Body backfill restored complete local duplicate {} for header-only row {}",
+                    restored_id, message_id
+                );
+                continue;
+            }
+            match self.base.store.get_message(message_id)? {
+                Some(message) if message.remote_version.as_deref() == Some("headers-only") => {}
+                _ => continue,
+            }
+            let uid = match remote_uid.parse::<u32>() {
+                Ok(uid) => uid,
+                Err(_) => {
+                    warn!(
+                        "Body backfill: invalid remote UID {remote_uid} for {message_id}, skipping"
+                    );
+                    continue;
+                }
+            };
+            by_folder
+                .entry(folder_id.clone())
+                .or_insert_with(|| (folder_remote_id.clone(), Vec::new()))
+                .1
+                .push(Candidate {
+                    message_id: message_id.clone(),
+                    uid,
+                });
+        }
+
+        if by_folder.is_empty() {
+            return Ok(done);
+        }
+        let provider = Arc::new(self.provider.clone_for_idle());
+        provider.connect().await?;
+
+        // 批量失败标记提升到 pass 级：只要有一个文件夹的批量失败（服务器
+        // 不支持批量 UID FETCH，如 Zoho），本轮 pass 内所有文件夹都不再试
+        // 批量，避免每个文件夹各白等一次超时。批量成功则保持开启。
+        // 若进程级已标记"批量不可用"（历史 pass 失败过），直接跳过批量。
+        let mut batch_enabled = !BODY_BACKFILL_BATCH_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
+        for (_folder_id, (folder_remote_id, items)) in &by_folder {
+            // ── 成熟策略（对任何服务器通用，不针对 Zoho）──
+            // 第 1 步：一次 UID FETCH (RFC822.SIZE) 批量拿所有候选邮件大小。
+            //         响应只有 uid+size 两列，几百封一次命令也不会超时。
+            // 第 2 步：按大小分流——
+            //   小邮件（≤128KB）→ 批量 BODY.PEEK[]（每批 20 封，总响应约 2.5MB）
+            //   大邮件（>128KB）→ 单封分片拉取（1MiB chunk 路径，专为大附件设计）
+            // 批量只在真正失败（服务器不支持）时禁用；逐封路径配合
+            // last_selected 去重，每封只剩一次 UID FETCH 往返，仍是主流方案。
+            let (size_by_uid, sizes_authoritative): (std::collections::HashMap<u32, u32>, bool) = match provider
+                .inner()
+                .fetch_message_sizes_by_uids(folder_remote_id, &items.iter().map(|c| c.uid).collect::<Vec<_>>())
+                .await
+            {
+                Ok(sizes) => (sizes.into_iter().collect(), true),
+                Err(size_error) => {
+                    // 拿不到大小（个别服务器限制）→ 全部按大邮件单封分片处理，仍正确。
+                    warn!(
+                        "Body backfill: fetch sizes failed for folder {folder_remote_id} ({size_error}); falling back to per-message fetch"
+                    );
+                    (std::collections::HashMap::new(), false)
+                }
+            };
+
+            // A successful UID FETCH (RFC822.SIZE) response is authoritative:
+            // omitted UIDs no longer exist in this mailbox. This most often
+            // happens after IMAP MOVE assigned a different UID in the target.
+            // Park those jobs instead of hammering the same stale UID forever;
+            // the header pass will rebind and wake them when it sees the new UID.
+            if sizes_authoritative {
+                for candidate in items.iter().filter(|c| !size_by_uid.contains_key(&c.uid)) {
+                    let rebound = match self.base.store.get_message(&candidate.message_id)? {
+                        Some(message) => match message.message_id_header.as_deref() {
+                            Some(header) => match provider
+                                .inner()
+                                .find_uid_by_message_id(folder_remote_id, header)
+                                .await
+                            {
+                                Ok(Some(destination_uid)) if destination_uid != candidate.uid => self
+                                    .base
+                                    .store
+                                    .rebind_message_remote_id_by_header_in_folder(
+                                        &self.base.account_id,
+                                        _folder_id,
+                                        header,
+                                        &destination_uid.to_string(),
+                                        None,
+                                    )?
+                                    .is_some(),
+                                Ok(_) => false,
+                                Err(error) => {
+                                    debug!(
+                                        "Destination UID lookup failed for {} in {}: {}",
+                                        candidate.message_id, folder_remote_id, error
+                                    );
+                                    false
+                                }
+                            },
+                            None => false,
+                        },
+                        None => false,
+                    };
+                    if rebound {
+                        info!(
+                            "Body backfill rebound moved message {} in {}; retrying with destination UID",
+                            candidate.message_id, folder_remote_id
+                        );
+                        continue;
+                    }
+                    let reason = format!(
+                        "IMAP UID {} is absent from mailbox {}; waiting for destination UID rebind",
+                        candidate.uid, folder_remote_id
+                    );
+                    let _ = self.base.store.mark_body_download_job_unavailable(
+                        &candidate.message_id,
+                        &reason,
+                    );
+                }
+            }
+
+            // 小邮件批量（每批 20 封 ≤128KB 的，总响应 ~2.5MB 可控）。
+            // batch_enabled 是 pass 级的：任何文件夹批量失败都会禁用整个 pass 的批量。
+            const SMALL_THRESHOLD: u32 = 128 * 1024;
+            let small: Vec<&Candidate> = items
+                .iter()
+                .filter(|c| !sizes_authoritative || size_by_uid.contains_key(&c.uid))
+                .filter(|c| size_by_uid.get(&c.uid).copied().unwrap_or(u32::MAX) <= SMALL_THRESHOLD)
+                .collect();
+            for chunk in small.chunks(20) {
+                if !batch_enabled {
+                    // 批量已在前面文件夹失败过 → 这批小邮件直接逐封分片拉取
+                    for candidate in chunk {
+                        match self.base.store.get_message(&candidate.message_id)? {
+                            Some(message) if message.remote_version.as_deref() == Some("headers-only") => {}
+                            _ => continue,
+                        }
+                        let folder = match self.base.store.get_folder(&_folder_id)? {
+                            Some(folder) => folder,
+                            None => continue,
+                        };
+                        match Self::hydrate_incremental_message(
+                            &self.base,
+                            &provider,
+                            &folder,
+                            candidate.uid,
+                        )
+                        .await
+                        {
+                            Ok(()) => done += 1,
+                            Err(error) => {
+                                warn!(
+                                    "Body backfill: hydrate failed for {} ({error}); retried next pass",
+                                    candidate.message_id
+                                );
+                                let _ = self.base.store.fail_body_download_job(
+                                    &candidate.message_id,
+                                    &error.to_string(),
+                                );
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    continue;
+                }
+                let uids: Vec<u32> = chunk.iter().map(|c| c.uid).collect();
+                let raws = match provider
+                    .inner()
+                    .fetch_messages_raw_by_uids(folder_remote_id, &uids)
+                    .await
+                {
+                    Ok(raws) => raws,
+                    Err(batch_error) => {
+                        let batch_error_text = batch_error.to_string();
+                        let connection_lost = is_retryable_imap_connection_error(&batch_error)
+                            || batch_error_text.contains("timed out waiting for connection")
+                            || batch_error_text.contains("timed out after");
+                        warn!(
+                            "Body backfill: batch fetch failed for folder {folder_remote_id} ({batch_error}); disabling batch for this pass and this process, falling back to per-message fetch"
+                        );
+                        batch_enabled = false;
+                        // 进程级记住：该服务器不支持批量，后续 pass 不再尝试。
+                        BODY_BACKFILL_BATCH_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let failed_ids: Vec<String> = chunk
+                            .iter()
+                            .map(|candidate| candidate.message_id.clone())
+                            .collect();
+                        let _ = self.base.store.retry_body_download_jobs(
+                            &failed_ids,
+                            &format!("batch fetch failed: {batch_error}"),
+                        );
+                        if connection_lost {
+                            let remaining_ids: Vec<String> = candidates
+                                .iter()
+                                .map(|candidate| candidate.0.clone())
+                                .collect();
+                            let _ = self.base.store.retry_body_download_jobs(
+                                &remaining_ids,
+                                &format!("IMAP connection lost during body backfill: {batch_error}"),
+                            );
+                            let _ = provider.disconnect().await;
+                            return Ok(done);
+                        }
+                        continue;
+                    }
+                };
+                let raw_by_uid: std::collections::HashMap<u32, Vec<u8>> =
+                    raws.into_iter().collect();
+                for candidate in chunk {
+                    let raw = if let Some(raw) = raw_by_uid.get(&candidate.uid) {
+                        raw.clone()
+                    } else {
+                        // Some IMAP servers accept a batch command but omit a
+                        // body item. Retry this UID once through the mature
+                        // single-message path before classifying the job.
+                        let folder = match self.base.store.get_folder(&_folder_id)? {
+                            Some(folder) => folder,
+                            None => continue,
+                        };
+                        match provider.inner().fetch_message_raw_by_uid(&folder.remote_id, candidate.uid).await {
+                            Ok(raw) => raw,
+                            Err(error) => {
+                                let _ = self.base.store.fail_body_download_job(
+                                    &candidate.message_id,
+                                    &error.to_string(),
+                                );
+                                continue;
+                            }
+                        }
+                    };
+                    match self.base.store.get_message(&candidate.message_id)? {
+                        Some(message) if message.remote_version.as_deref() == Some("headers-only") => {}
+                        _ => continue,
+                    }
+                    let folder = match self.base.store.get_folder(&_folder_id)? {
+                        Some(folder) => folder,
+                        None => continue,
+                    };
+                    match Self::hydrate_message_from_raw(
+                        &self.base,
+                        &folder,
+                        &candidate.message_id,
+                        &raw,
+                    )
+                    .await
+                    {
+                        Ok(()) => done += 1,
+                        Err(error) => {
+                            warn!(
+                                "Body backfill: hydrate failed for {} ({error}); retried next pass",
+                                candidate.message_id
+                            );
+                            let _ = self.base.store.fail_body_download_job(
+                                &candidate.message_id,
+                                &error.to_string(),
+                            );
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+
+            // 大邮件（或拿不到大小）→ 单封分片拉取（SELECT 已由 last_selected 去重）
+            let large: Vec<&Candidate> = items
+                .iter()
+                .filter(|c| !sizes_authoritative || size_by_uid.contains_key(&c.uid))
+                .filter(|c| size_by_uid.get(&c.uid).copied().unwrap_or(u32::MAX) > SMALL_THRESHOLD)
+                .collect();
+            for candidate in large {
+                match self.base.store.get_message(&candidate.message_id)? {
+                    Some(message) if message.remote_version.as_deref() == Some("headers-only") => {}
+                    _ => continue,
+                }
+                let folder = match self.base.store.get_folder(&_folder_id)? {
+                    Some(folder) => folder,
+                    None => continue,
+                };
+                match Self::hydrate_incremental_message(
+                    &self.base,
+                    &provider,
+                    &folder,
+                    candidate.uid,
+                )
+                .await
+                {
+                    Ok(()) => done += 1,
+                    Err(error) => {
+                        warn!(
+                            "Body backfill: hydrate failed for {} ({error}); retried next pass",
+                            candidate.message_id
+                        );
+                        let _ = self.base.store.fail_body_download_job(
+                            &candidate.message_id,
+                            &error.to_string(),
+                        );
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        let _ = provider.disconnect().await;
+        info!(
+            account_id = %self.base.account_id,
+            done,
+            remaining = candidates.len() as u32 - done,
+            "Body backfill pass finished"
+        );
+        Ok(done)
     }
 
     /// Backfill the full history of a folder that has no sync cursor yet,
@@ -1027,6 +2290,20 @@ impl SyncWorker {
         folder: &pebble_core::Folder,
         notify_new: bool,
     ) -> Result<u32> {
+        self.sync_folder_history_pages(folder, notify_new, None).await
+    }
+
+    /// Backfill folder history, advancing at most `max_pages` pages
+    /// (None = full history). Large mailboxes are therefore completed over
+    /// multiple runs instead of blocking the worker for hours, which keeps
+    /// the account out of a perpetual "syncing" state while the history
+    /// still eventually completes in the background.
+    async fn sync_folder_history_pages(
+        &self,
+        folder: &pebble_core::Folder,
+        notify_new: bool,
+        max_pages: Option<u32>,
+    ) -> Result<u32> {
         if Self::is_local_folder(folder) {
             return Ok(0);
         }
@@ -1036,22 +2313,123 @@ impl SyncWorker {
             .inner()
             .get_mailbox_status(&folder.remote_id)
             .await?;
-        let ranges = history_page_ranges(status.exists, HISTORY_PAGE_SIZE);
+        let cursor = self.stored_imap_folder_cursor(folder);
+        let mut next_end = cursor.history_next_sequence.unwrap_or(status.exists);
+        let page_limit = max_pages.unwrap_or(u32::MAX) as usize;
 
         let mut total = 0u32;
-        for (index, (start_seq, end_seq)) in ranges.into_iter().enumerate() {
+        let mut processed = 0u32;
+        let mut index = 0usize;
+        while index < page_limit && next_end > 0 {
+            let end_seq = next_end.min(status.exists);
+            let start_seq = end_seq.saturating_sub(HISTORY_PAGE_SIZE_FAST - 1).max(1);
+            info!(
+                "History sync page {}/{} for {} (sequence {}:{})",
+                index + 1,
+                page_limit.min(history_page_ranges(end_seq, HISTORY_PAGE_SIZE_FAST).len()),
+                folder.name,
+                start_seq,
+                end_seq
+            );
             let raw_messages = self
-                .provider
-                .inner()
-                .fetch_messages_page(&folder.remote_id, start_seq, end_seq)
+                .fetch_history_page_with_fallback(folder, start_seq, end_seq)
                 .await?;
+            // 历史补全只存邮件头（headers-only），正文/附件在打开时按需下载，
+            // 避免带附件邮件拖慢整个历史同步。
             let count = self
-                .store_fetched_messages(folder, raw_messages, notify_new && index == 0)
+                .store_fetched_messages(folder, raw_messages, notify_new && index == 0, true)
                 .await?;
             total += count;
+            processed += end_seq - start_seq + 1;
+            info!(
+                "History sync page {}/{} stored {} new messages for {} (total {})",
+                index + 1,
+                page_limit.min(history_page_ranges(end_seq, HISTORY_PAGE_SIZE_FAST).len()),
+                count,
+                folder.name,
+                total
+            );
+            // 每页完成后上报进度：服务器该文件夹总数 vs 已处理条数，
+            // 让状态栏显示"历史同步中 已收 X / 总 Y"。
+            self.base.emit_sync_progress(
+                "history",
+                status.exists,
+                processed.min(status.exists),
+            );
+            next_end = start_seq.saturating_sub(1);
+            let mut cursor = self.stored_imap_folder_cursor(folder);
+            cursor.history_next_sequence = (next_end > 0).then_some(next_end);
+            cursor.history_complete = next_end == 0;
+            self.persist_imap_folder_cursor_after_sync(folder, cursor)?;
+            index += 1;
         }
 
         Ok(total)
+    }
+
+    /// Fetch one headers-only history page, transparently retrying in small
+    /// sub-pages after reconnecting when a server rejects the larger range.
+    async fn fetch_history_page_with_fallback(
+        &self,
+        folder: &pebble_core::Folder,
+        start_seq: u32,
+        end_seq: u32,
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        match self
+            .provider
+            .inner()
+            .fetch_messages_headers_range(&folder.remote_id, start_seq, end_seq)
+            .await
+        {
+            Ok(msgs) => Ok(msgs),
+            Err(e) if is_retryable_imap_connection_error(&e) => {
+                warn!(
+                    "History page {}:{} for {} timed out ({}); retrying in small pages",
+                    start_seq, end_seq, folder.name, e
+                );
+                let _ = self.provider.disconnect().await;
+                self.provider.connect().await?;
+                let mut out = Vec::new();
+                let mut had_failure = false;
+                let mut end = end_seq;
+                while end >= start_seq {
+                    let start = if end > start_seq + HISTORY_PAGE_SIZE - 1 {
+                        end - HISTORY_PAGE_SIZE + 1
+                    } else {
+                        start_seq
+                    };
+                    match self
+                        .provider
+                        .inner()
+                        .fetch_messages_headers_range(&folder.remote_id, start, end)
+                        .await
+                    {
+                        Ok(msgs) => out.extend(msgs),
+                        Err(e2) => {
+                            had_failure = true;
+                            warn!(
+                                "Small history page {}:{} for {} failed ({}); retrying next pass",
+                                start, end, folder.name, e2
+                            );
+                        }
+                    }
+                    if start == start_seq {
+                        break;
+                    }
+                    end = start - 1;
+                }
+                // 小页全部失败：返回错误让回填暂停（游标不推进），下轮再试，
+                // 避免"遍历完但一封没存却标记完成"的静默丢失。
+                if out.is_empty() && had_failure {
+                    return Err(PebbleError::Network(format!(
+                        "History backfill page {start_seq}:{end_seq} for {} failed after small-page retry",
+                        folder.name
+                    )));
+                }
+                Ok(out)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Store a batch of raw fetched messages, resolving threads and
@@ -1061,6 +2439,7 @@ impl SyncWorker {
         folder: &pebble_core::Folder,
         raw_messages: Vec<(u32, Vec<u8>)>,
         notify_new: bool,
+        headers_only: bool,
     ) -> Result<u32> {
         if raw_messages.is_empty() {
             return Ok(0);
@@ -1076,7 +2455,6 @@ impl SyncWorker {
             .store
             .get_existing_remote_ids_in_folder(&self.base.account_id, &folder.id, &all_remote_ids)
             .unwrap_or_default();
-
         // Parse all raw messages upfront so we can collect In-Reply-To / References
         // before querying thread mappings (avoids loading the full account mapping).
         let parsed_messages: Vec<(u32, Result<crate::parser::ParsedMessage>)> = raw_messages
@@ -1118,6 +2496,27 @@ impl SyncWorker {
 
         let mut stored_count = 0u32;
 
+        // 按 Message-ID 去重：本地已存在的（如发送后本地存的 local-sent 副本）
+        // 服务器对应副本跳过，避免"已发送"出现两封一模一样的邮件。
+        let existing_message_ids = {
+            let headers: Vec<String> = parsed_messages
+                .iter()
+                .filter_map(|(_, res)| match res {
+                    Ok(p) => p.message_id_header.clone(),
+                    Err(_) => None,
+                })
+                .collect();
+            self.base
+                .store
+                .get_existing_message_ids(&self.base.account_id, &headers)
+                .unwrap_or_default()
+        };
+
+        // Build the whole batch before touching SQLite. The old implementation
+        // committed one transaction per message, which serialized every
+        // header into its own writer lock and made large mailboxes crawl.
+        let mut pending: Vec<(u32, Message, Vec<AttachmentData>, String)> = Vec::new();
+
         for (uid, parse_result) in parsed_messages {
             let remote_id = uid.to_string();
 
@@ -1139,6 +2538,44 @@ impl SyncWorker {
 
             let now = now_timestamp();
 
+            // 跳过本地已存在相同 Message-ID 的服务器副本（如"已发送"重复）
+            if let Some(mid) = &parsed.message_id_header {
+                if existing_message_ids.contains(mid) {
+                    // A locally moved IMAP message is already associated with
+                    // the destination folder, but the server assigns it a new
+                    // UID there. Rebind that existing row instead of blindly
+                    // skipping this header. This also collapses duplicate rows
+                    // left by older move/reconcile cycles and wakes body fetch.
+                    if let Some(rebound_id) = self
+                        .base
+                        .store
+                        .rebind_message_remote_id_by_header_in_folder(
+                            &self.base.account_id,
+                            &folder.id,
+                            mid,
+                            &remote_id,
+                            None,
+                        )?
+                    {
+                        let _ = self.base.store.clear_sync_failure(
+                            &self.base.account_id,
+                            &folder.id,
+                            &remote_id,
+                        );
+                        info!(
+                            "Rebound moved IMAP message {} in {} to destination UID {}",
+                            rebound_id, folder.name, remote_id
+                        );
+                        continue;
+                    }
+                    debug!(
+                        "Message-ID {} already exists locally (account {}), skipping server copy",
+                        mid, self.base.account_id
+                    );
+                    continue;
+                }
+            }
+
             // Build a temporary message to compute thread_id
             let mut msg = Message {
                 id: new_id(),
@@ -1158,11 +2595,12 @@ impl SyncWorker {
                 body_text: parsed.body_text.clone(),
                 body_html_raw: parsed.body_html.clone(),
                 has_attachments: parsed.has_attachments,
-                is_read: false,
+                // 已发送文件夹（Sent）的消息本来就是已读的，不参与未读计数
+                is_read: folder.role == Some(pebble_core::FolderRole::Sent),
                 is_starred: false,
                 is_draft: false,
                 date: parsed.date,
-                remote_version: None,
+                remote_version: headers_only.then(|| "headers-only".to_string()),
                 is_deleted: false,
                 deleted_at: None,
                 created_at: now,
@@ -1172,51 +2610,58 @@ impl SyncWorker {
             let thread_id = compute_thread_id(&msg, &thread_mappings);
             msg.thread_id = Some(thread_id);
 
-            match self
-                .base
-                .store
-                .insert_message(&msg, std::slice::from_ref(&folder.id))
-            {
-                Ok(()) => {
-                    stored_count += 1;
-                    let _ = self.base.store.clear_sync_failure(
-                        &self.base.account_id,
-                        &folder.id,
-                        &remote_id,
-                    );
-                    // Update in-memory thread mappings so later messages in this batch
-                    // can find this message as a thread parent.
-                    if let (Some(mid), Some(tid)) = (&msg.message_id_header, &msg.thread_id) {
-                        thread_mappings.insert(mid.clone(), tid.clone());
-                    }
-
-                    persist_message_attachments_async(
-                        Arc::clone(&self.base.store),
-                        self.base.attachments_dir.clone(),
-                        msg.id.clone(),
-                        parsed.attachments,
-                    )
-                    .await;
-
-                    // Notify listeners (e.g. search indexer) about the new message
-                    self.base.emit_message(StoredMessage {
-                        message: msg.clone(),
-                        folder_ids: vec![folder.id.clone()],
-                        notify: notify_new,
-                    });
-                }
-                Err(e) => {
-                    let reason = e.to_string();
-                    let _ = self.base.store.upsert_sync_failure(
-                        &self.base.account_id,
-                        &folder.id,
-                        &remote_id,
-                        "imap",
-                        &reason,
-                    );
-                    error!("Failed to store message UID {}: {}", uid, e);
-                }
+            // Update in-memory thread mappings so later messages in this batch
+            // can find this message as a thread parent.
+            if let (Some(mid), Some(tid)) = (&msg.message_id_header, &msg.thread_id) {
+                thread_mappings.insert(mid.clone(), tid.clone());
             }
+
+            pending.push((uid, msg, parsed.attachments, remote_id));
+        }
+
+        let batch: Vec<(Message, Vec<String>)> = pending
+            .iter()
+            .map(|(_, msg, _, _)| (msg.clone(), vec![folder.id.clone()]))
+            .collect();
+
+        if let Err(error) = self.base.store.insert_messages_batch(&batch) {
+            let reason = error.to_string();
+            for (uid, _, _, remote_id) in &pending {
+                let _ = self.base.store.upsert_sync_failure(
+                    &self.base.account_id,
+                    &folder.id,
+                    remote_id,
+                    "imap",
+                    &reason,
+                );
+                error!("Failed to store message UID {}: {}", uid, error);
+            }
+            return Ok(0);
+        }
+
+        for (_, msg, attachments, remote_id) in pending {
+            stored_count += 1;
+            let _ = self.base.store.clear_sync_failure(
+                &self.base.account_id,
+                &folder.id,
+                &remote_id,
+            );
+
+            if !headers_only {
+                persist_message_attachments_async(
+                    Arc::clone(&self.base.store),
+                    self.base.attachments_dir.clone(),
+                    msg.id.clone(),
+                    attachments,
+                ).await;
+            }
+
+            // Notify listeners only after the entire SQLite batch is durable.
+            self.base.emit_message(StoredMessage {
+                message: msg,
+                folder_ids: vec![folder.id.clone()],
+                notify: notify_new,
+            });
         }
 
         Ok(stored_count)
@@ -1268,6 +2713,34 @@ impl SyncWorker {
         Ok(())
     }
 
+    async fn poll_changed_custom_folders(&self) -> Result<()> {
+        let folders = self.base.store.list_folders(&self.base.account_id)?;
+        for folder in folders.iter().filter(|folder| should_probe_custom_folder_for_new_mail(folder)) {
+            let cursor = self.stored_imap_folder_cursor(folder);
+            let Some(last_uid) = cursor.last_uid else {
+                // Initial/history synchronization owns mailboxes without a
+                // trusted cursor; do not turn old mail into new-mail alerts.
+                continue;
+            };
+            let status = match self.provider.inner().probe_mailbox_status(&folder.remote_id).await {
+                Ok(status) => status,
+                Err(error) => {
+                    debug!("Custom-folder status probe skipped for {}: {}", folder.name, error);
+                    continue;
+                }
+            };
+            let uidvalidity_changed = matches!(
+                (cursor.uidvalidity, status.uid_validity.map(u64::from)),
+                (Some(stored), Some(current)) if stored != current
+            );
+            let has_new_uid = status.uid_next.is_some_and(|next| next > last_uid.saturating_add(1));
+            if uidvalidity_changed || has_new_uid {
+                let _ = self.poll_imap_folder_with_reconnect(folder).await;
+            }
+        }
+        Ok(())
+    }
+
     async fn poll_imap_folder_with_reconnect(
         &self,
         folder: &pebble_core::Folder,
@@ -1275,6 +2748,7 @@ impl SyncWorker {
         match self.poll_imap_folder_once(folder).await {
             Ok(()) => None,
             Err(e) if is_missing_imap_mailbox_error(&e) => {
+                self.quarantine_folder(folder, &e.to_string());
                 debug!(
                     "Skipping unavailable IMAP folder {} ({}) for account {}: {}",
                     folder.name, folder.remote_id, self.base.account_id, e
@@ -1331,7 +2805,7 @@ impl SyncWorker {
     }
 
     async fn poll_imap_folder_once(&self, folder: &pebble_core::Folder) -> Result<()> {
-        if !should_attempt_imap_remote_folder(folder) {
+        if !should_attempt_imap_remote_folder(folder) || self.is_folder_quarantined(folder) {
             debug!(
                 "Skipping local-only IMAP folder {} ({}) during poll",
                 folder.name, folder.remote_id
@@ -1343,7 +2817,14 @@ impl SyncWorker {
         let since_uid = cursor.last_uid;
 
         let count = if let Some(uid) = since_uid {
-            self.sync_folder(folder, Some(uid), 50, true).await?
+            // 先存头，再逐封尽力补全正文/附件；单封超时不阻塞整批新邮件。
+            self.sync_folder_headers_with_hydration(
+                folder,
+                Some(uid),
+                HISTORY_PAGE_SIZE_FAST,
+                true,
+            )
+                .await?
         } else {
             // Folder was just added to the selection (or its cursor was
             // lost): backfill the full history before switching to
@@ -1374,6 +2855,7 @@ impl SyncWorker {
         match self.reconcile_folder_once(folder).await {
             Ok(()) => Ok(()),
             Err(e) if is_missing_imap_mailbox_error(&e) => {
+                self.quarantine_folder(folder, &e.to_string());
                 debug!(
                     "Skipping unavailable IMAP folder {} ({}) during reconcile for account {}: {}",
                     folder.name, folder.remote_id, self.base.account_id, e
@@ -1685,6 +3167,55 @@ impl SyncWorker {
             return;
         }
 
+        // 正文/附件补齐必须与收新邮件、文件夹对账彻底解耦。旧实现把它放在
+        // backfill_ticker 分支末尾，前面的 LIST/SELECT 一旦超时，本轮补齐就
+        // 永远轮不到；并且等待 40 封完整 MIME 下载会阻塞主同步 select。
+        // 每个账号启动一个独立、可停止的后台循环，使用独立 IMAP 连接。
+        let body_worker = self.clone();
+        tokio::spawn(async move {
+            let mut stop_rx = body_worker.stop_rx.clone();
+            let mut consecutive_failures = 0u32;
+            let mut next_delay = tokio::time::Duration::from_secs(1);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(next_delay) => {
+                        // 全局互斥：同一时间只允许一个账号的正文补齐写数据库，
+                        // 避免多账号并发把唯一的写连接占满导致其它操作超时。
+                        let lock = BODY_BACKFILL_LOCK
+                            .get_or_init(|| tokio::sync::Mutex::new(()))
+                            .lock()
+                            .await;
+                        match body_worker.hydrate_incomplete_bodies(BODY_HYDRATION_BATCH).await {
+                            Ok(done) => {
+                                consecutive_failures = 0;
+                                // 有进度时 3 秒后继续下一轮（原 20 秒，太慢；
+                                // 100 封/轮 + 3s ≈ 30+ 封/秒）。已补完时降低
+                                // 空轮询频率，避免每 3 秒扫一次数据库。
+                                next_delay = tokio::time::Duration::from_secs(if done > 0 { 3 } else { 120 });
+                            }
+                            Err(error) => {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                let backoff_secs = 30u64
+                                    .saturating_mul(1u64 << consecutive_failures.saturating_sub(1).min(3))
+                                    .min(300);
+                                next_delay = tokio::time::Duration::from_secs(backoff_secs);
+                                warn!(
+                                    "Independent body backfill error for account {}: {}; retrying in {}s",
+                                    body_worker.base.account_id, error, backoff_secs
+                                );
+                            }
+                        }
+                        drop(lock);
+                    }
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
         let poll_policy = imap_poll_policy(&config);
         let reconcile_interval = tokio::time::Duration::from_secs(config.reconcile_interval_secs);
 
@@ -1696,6 +3227,19 @@ impl SyncWorker {
             reconcile_interval,
         );
         reconcile_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // History backfill advances on its own faster beat (every 2 minutes)
+        // so large Sent/Archive mailboxes keep making progress between full
+        // 15-minute reconciles, without polling new mail more often.
+        let mut backfill_ticker = tokio::time::interval(tokio::time::Duration::from_secs(120));
+        backfill_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The account-specific preference has already been resolved into
+        // `config`; when absent it contains the global default. Manual mode
+        // returned above, so custom folders follow the same active interval.
+        let mut custom_folder_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
+            custom_folder_poll_interval_secs(&config).unwrap_or(60),
+        ));
+        custom_folder_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let supports_idle = self.provider.inner().supports_idle().await;
         if supports_idle {
@@ -1773,7 +3317,36 @@ impl SyncWorker {
                 poll_policy.next_delay(runtime.context(backoff.failure_count(), Instant::now()));
 
             tokio::select! {
-                _ = tokio::time::sleep(next_poll_delay), if !idle_watcher_active => {
+                _ = custom_folder_ticker.tick() => {
+                    if !backoff.is_circuit_open() {
+                        if let Err(error) = self.poll_changed_custom_folders().await {
+                            warn!("Custom-folder new-mail probe failed for account {}: {}", self.base.account_id, error);
+                        }
+                    }
+                }
+                // 历史补全的独立节奏：每 2 分钟推进一次，不等 15 分钟 reconcile。
+                _ = backfill_ticker.tick() => {
+                    if backoff.is_circuit_open() {
+                        continue;
+                    }
+                    // 自愈：先对账"已标完成但数量不足"的文件夹，复位后重新回填。
+                    if let Err(e) = self.heal_stale_complete_folders().await {
+                        warn!("Heal tick error for account {}: {}", self.base.account_id, e);
+                    }
+                    if let Err(e) = self.backfill_incomplete_history(HISTORY_BACKFILL_PAGES_PER_RUN).await {
+                        warn!("Backfill tick error for account {}: {}", self.base.account_id, e);
+                    }
+                    if let Err(e) = self.reconcile_imap_folders().await {
+                        warn!("Backfill tick folder sync error for account {}: {}", self.base.account_id, e);
+                    }
+                    // 正文和附件由独立后台循环补齐；这里不再 await，避免慢邮件
+                    // 阻塞实时收信、IDLE、轮询和文件夹对账。
+                }
+                // 轮询始终作为兜底运行（即使 IDLE watcher 已激活）。
+                // 部分服务器（如 Zoho）的 IDLE 不推送新邮件通知，若此时禁用
+                // 轮询，新邮件将一直无法自动收到；轮询开销很小（无变化时
+                // 只做一次 SELECT 对比）。
+                _ = tokio::time::sleep(next_poll_delay) => {
                     if backoff.is_circuit_open() {
                         warn!(
                             "Circuit open for account {} ({} consecutive failures); attempting half-open poll after scheduled delay",
@@ -1919,6 +3492,7 @@ impl SyncWorker {
                 trigger = recv_sync_trigger(&mut trigger_rx) => {
                     match trigger {
                         Some(trigger) => {
+                            info!("Sync trigger received for account {}: {:?}", self.base.account_id, trigger);
                             runtime.record_trigger(trigger, Instant::now());
                             if !trigger.should_sync_now() {
                                 continue;
@@ -1948,6 +3522,25 @@ impl SyncWorker {
                                         self.refresh_inbox_local_uid_baseline(&mut last_exists);
                                 }
                             }
+                            // Manual "收取邮件" also syncs folder deletions from the
+                            // server and advances history backfill, so users see
+                            // deleted folders disappear and the Sent/Archive
+                            // history grow without waiting for the 15-minute tick.
+                            if trigger == SyncTrigger::Manual {
+                                if let Err(e) = self.reconcile_imap_folders().await {
+                                    warn!("Manual folder list sync error for account {}: {}", self.base.account_id, e);
+                                }
+                                if let Err(e) = self.repair_historical_local_moves(200).await {
+                                    warn!("Manual historical move repair error for account {}: {}", self.base.account_id, e);
+                                }
+                                if let Err(e) = self
+                                    .backfill_incomplete_history(HISTORY_BACKFILL_PAGES_PER_RUN)
+                                    .await
+                                {
+                                    warn!("Manual history backfill error for account {}: {}", self.base.account_id, e);
+                                }
+                                info!("Manual sync processing finished for account {}", self.base.account_id);
+                            }
                         }
                         None => {
                             trigger_rx = None;
@@ -1970,6 +3563,16 @@ impl SyncWorker {
                             polling_baseline_trusted =
                                 self.refresh_inbox_local_uid_baseline(&mut last_exists);
                         }
+                    }
+                    // Sync folder list from the server: remove local records for
+                    // folders deleted server-side, and continue history backfill
+                    // for folders that are still incomplete.
+                    if let Err(e) = self.reconcile_imap_folders().await {
+                        warn!("Reconcile folder list error: {}", e);
+                        self.base.emit_error("reconcile", &format!("Folder list sync error: {}", e));
+                    }
+                    if let Err(e) = self.backfill_incomplete_history(HISTORY_BACKFILL_PAGES_PER_RUN).await {
+                        warn!("Reconcile history backfill error: {}", e);
                     }
                     let folders = match self.base.store.list_folders(&self.base.account_id) {
                         Ok(f) => f,
@@ -2052,6 +3655,8 @@ mod tests {
             uidvalidity: Some(1234),
             last_uid: Some(987),
             highest_modseq: Some(4567),
+            history_complete: true,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&cursor).unwrap();
@@ -2066,6 +3671,8 @@ mod tests {
             uidvalidity: Some(1234),
             last_uid: Some(987),
             highest_modseq: Some(4567),
+            history_complete: true,
+            ..Default::default()
         };
 
         let prepared = prepare_imap_folder_cursor_for_status(stored, Some(9999), Some(7000));
@@ -2073,6 +3680,7 @@ mod tests {
         assert_eq!(prepared.uidvalidity, Some(9999));
         assert_eq!(prepared.last_uid, None);
         assert_eq!(prepared.highest_modseq, Some(7000));
+        assert!(!prepared.history_complete);
     }
 
     #[test]
@@ -2081,6 +3689,8 @@ mod tests {
             uidvalidity: Some(1234),
             last_uid: Some(987),
             highest_modseq: Some(4567),
+            history_complete: true,
+            ..Default::default()
         };
 
         let prepared = prepare_imap_folder_cursor_for_status(stored, Some(1234), Some(7000));
@@ -2088,6 +3698,7 @@ mod tests {
         assert_eq!(prepared.uidvalidity, Some(1234));
         assert_eq!(prepared.last_uid, Some(987));
         assert_eq!(prepared.highest_modseq, Some(7000));
+        assert!(prepared.history_complete);
     }
 
     #[test]
@@ -2238,8 +3849,8 @@ mod tests {
     }
 
     #[test]
-    fn non_inbox_retryable_initial_sync_folder_failure_fails_initial_sync() {
-        assert!(should_fail_initial_sync_for_folder_error(None, true));
+    fn non_inbox_retryable_initial_sync_folder_failure_does_not_block_inbox_history() {
+        assert!(!should_fail_initial_sync_for_folder_error(None, true));
     }
 
     #[test]
@@ -2275,6 +3886,16 @@ mod tests {
     fn imap_windows_connection_abort_is_retryable_for_polling() {
         let error = pebble_core::PebbleError::Network(
             "SELECT failed: io: 你的主机中的软件中止了一个已建立的连接。 (os error 10053)"
+                .to_string(),
+        );
+
+        assert!(is_retryable_imap_connection_error(&error));
+    }
+
+    #[test]
+    fn imap_chinese_remote_host_forced_close_is_retryable_for_polling() {
+        let error = pebble_core::PebbleError::Network(
+            "SELECT failed: io: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
                 .to_string(),
         );
 
@@ -2435,5 +4056,34 @@ mod tests {
             &local,
             ImapPollScope::Full
         ));
+    }
+
+    #[test]
+    fn custom_new_mail_probe_excludes_system_and_role_folders() {
+        let mut custom = test_folder(None, "Customers/Acme");
+        custom.is_system = false;
+        let mut templates = test_folder(None, "Templates");
+        templates.is_system = true;
+        let sent = test_folder(Some(pebble_core::FolderRole::Sent), "Sent");
+
+        assert!(should_probe_custom_folder_for_new_mail(&custom));
+        assert!(!should_probe_custom_folder_for_new_mail(&templates));
+        assert!(!should_probe_custom_folder_for_new_mail(&sent));
+    }
+
+    #[test]
+    fn custom_folder_probe_inherits_resolved_account_interval() {
+        for interval in [3, 15, 60, 300] {
+            let config = SyncConfig {
+                poll_interval_secs: interval,
+                ..SyncConfig::default()
+            };
+            assert_eq!(custom_folder_poll_interval_secs(&config), Some(interval));
+        }
+        let manual = SyncConfig {
+            poll_interval_secs: 0,
+            ..SyncConfig::default()
+        };
+        assert_eq!(custom_folder_poll_interval_secs(&manual), None);
     }
 }

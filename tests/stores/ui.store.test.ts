@@ -108,7 +108,7 @@ describe("UIStore", () => {
     expect(state.pendingRuleDraftText).toBe("unsubscribe");
   });
 
-  it("keeps the user on compose when dirty and shows confirmation", () => {
+  it("switches tabs without discarding or closing a dirty compose", () => {
     useUIStore.setState({
       activeView: "compose",
       previousView: "inbox",
@@ -122,12 +122,11 @@ describe("UIStore", () => {
 
     const state = useUIStore.getState();
     const composeState = useComposeStore.getState();
-    // Should stay on compose and show confirmation dialog
-    expect(state.activeView).toBe("compose");
+    expect(state.activeView).toBe("search");
     expect(composeState.composeMode).toBe("new");
     expect(composeState.composeDirty).toBe(true);
-    expect(composeState.showComposeLeaveConfirm).toBe(true);
-    expect(composeState.pendingView).toBe("search");
+    expect(composeState.showComposeLeaveConfirm).toBe(false);
+    expect(composeState.pendingView).toBeNull();
   });
 
   it("closeCompose respects unsaved-draft protection", () => {

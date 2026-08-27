@@ -1,8 +1,13 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Copy, Check, X } from "lucide-react";
 import { translateText } from "@/lib/api";
 import { profileLocalStorage } from "@/lib/profileStorage";
+import {
+  getTranslationTargetLanguage,
+  setTranslationTargetLanguage,
+  TRANSLATION_TARGET_LANGUAGES,
+} from "@/lib/translationPreferences";
 
 interface Props {
   text: string;
@@ -16,8 +21,12 @@ export default function TranslatePopover({ text, position, onClose }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
-  const uiLang = profileLocalStorage.getItem("pebble-language") || "zh";
-  const [targetLang, setTargetLang] = useState(uiLang === "en" ? "zh" : "en");
+  const [targetLang, setTargetLang] = useState(getTranslationTargetLanguage);
+  const [windowPosition, setWindowPosition] = useState(() => ({
+    x: Math.max(8, Math.min(position.x, window.innerWidth - 348)),
+    y: Math.max(8, Math.min(position.y + 10, window.innerHeight - 208)),
+  }));
+  const dragRef = useRef<{ pointerX: number; pointerY: number; startX: number; startY: number } | null>(null);
 
   const [privacyAcked, setPrivacyAcked] = useState(() =>
     profileLocalStorage.getItem("pebble-translate-privacy-ack") === "1",
@@ -55,13 +64,47 @@ export default function TranslatePopover({ text, position, onClose }: Props) {
     setTimeout(() => setCopied(false), 1500);
   }
 
+  function startDragging(event: React.PointerEvent<HTMLDivElement>) {
+    if ((event.target as HTMLElement).closest("button,select")) return;
+    dragRef.current = {
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      startX: windowPosition.x,
+      startY: windowPosition.y,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+
+  function dragWindow(event: React.PointerEvent<HTMLDivElement>) {
+    const drag = dragRef.current;
+    if (!drag) return;
+    setWindowPosition({
+      x: Math.max(0, Math.min(window.innerWidth - 120, drag.startX + event.clientX - drag.pointerX)),
+      y: Math.max(0, Math.min(window.innerHeight - 44, drag.startY + event.clientY - drag.pointerY)),
+    });
+  }
+
+  function stopDragging(event: React.PointerEvent<HTMLDivElement>) {
+    dragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
   return (
     <div
       style={{
         position: "fixed",
-        left: Math.min(position.x, window.innerWidth - 340),
-        top: Math.min(position.y + 10, window.innerHeight - 200),
+        left: windowPosition.x,
+        top: windowPosition.y,
         width: "320px",
+        minWidth: "260px",
+        minHeight: "140px",
+        maxWidth: "calc(100vw - 16px)",
+        maxHeight: "calc(100vh - 16px)",
+        resize: "both",
+        overflow: "auto",
         padding: "12px",
         borderRadius: "8px",
         border: "1px solid var(--color-border)",
@@ -73,13 +116,23 @@ export default function TranslatePopover({ text, position, onClose }: Props) {
       onClick={(e) => e.stopPropagation()}
     >
       {/* Header with target lang selector */}
-      <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
+      <div
+        onPointerDown={startDragging}
+        onPointerMove={dragWindow}
+        onPointerUp={stopDragging}
+        onPointerCancel={stopDragging}
+        title="拖动此处移动窗口；拖动右下角调整大小"
+        style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px", cursor: "move", userSelect: "none", touchAction: "none" }}
+      >
         <span style={{ fontSize: "11px", fontWeight: 600, color: "var(--color-text-secondary)", textTransform: "uppercase", flex: 1 }}>
           {t("translate.title")}
         </span>
         <select
           value={targetLang}
-          onChange={(e) => setTargetLang(e.target.value)}
+          onChange={(e) => {
+            setTargetLang(e.target.value);
+            setTranslationTargetLanguage(e.target.value);
+          }}
           style={{
             fontSize: "11px",
             padding: "2px 4px",
@@ -89,13 +142,9 @@ export default function TranslatePopover({ text, position, onClose }: Props) {
             color: "var(--color-text-primary)",
           }}
         >
-          <option value="zh">{t("languages.chinese", "Chinese")}</option>
-          <option value="en">{t("languages.english", "English")}</option>
-          <option value="ja">{t("languages.japanese", "Japanese")}</option>
-          <option value="ko">{t("languages.korean", "Korean")}</option>
-          <option value="fr">{t("languages.french", "French")}</option>
-          <option value="de">{t("languages.german", "German")}</option>
-          <option value="es">{t("languages.spanish", "Spanish")}</option>
+          {TRANSLATION_TARGET_LANGUAGES.map((language) => (
+            <option key={language.value} value={language.value}>{language.label}</option>
+          ))}
         </select>
         <button
           onClick={onClose}

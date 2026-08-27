@@ -6,7 +6,7 @@ use pebble_core::{FolderRole, Message, PebbleError, ProviderType};
 use pebble_store::Store;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use tracing::{info, warn};
 
 /// Group messages by account_id and resolve their provider type.
@@ -354,6 +354,7 @@ pub async fn batch_delete(
                                         json!({ "trash": true }),
                                         &e.to_string(),
                                     )?;
+                                    queued_for_local_commit_ids.push(msg.id.clone());
                                 }
                             }
                         }
@@ -382,66 +383,78 @@ pub async fn batch_delete(
                                         json!({ "trash": true }),
                                         &e.to_string(),
                                     )?;
+                                    queued_for_local_commit_ids.push(msg.id.clone());
                                 }
                             }
                         }
                     }
                     ConnectedProvider::Imap(imap) => {
-                        if let Ok(trash_folder) =
-                            find_folder_by_role(&state, account_id, FolderRole::Trash)
-                        {
-                            for msg in messages {
-                                if let Ok(uid) = parse_imap_uid(&msg.remote_id) {
-                                    if let Ok(src) =
-                                        find_message_folder(&state, &msg.id, account_id)
-                                    {
-                                        if src.id != trash_folder.id {
-                                            match imap
-                                                .move_message(
-                                                    &src.remote_id,
-                                                    uid,
-                                                    &trash_folder.remote_id,
-                                                )
-                                                .await
-                                            {
-                                                Ok(_) => deleted_ids.push(msg.id.clone()),
-                                                Err(e) => {
-                                                    warn!(
-                                                        "IMAP batch delete failed for {}: {e}",
-                                                        msg.id
-                                                    );
-                                                    queue_batch_pending_op(
-                                                        &state,
-                                                        msg,
-                                                        "delete",
-                                                        json!({
-                                                            "source_folder_id": src.id,
-                                                            "source_folder_remote_id": src.remote_id,
-                                                            "trash_folder_id": trash_folder.id,
-                                                            "trash_folder_remote_id": trash_folder.remote_id,
-                                                        }),
-                                                        &e.to_string(),
-                                                    )?;
+                        match find_folder_by_role(&state, account_id, FolderRole::Trash) {
+                            Ok(trash_folder) => {
+                                for msg in messages {
+                                    if let Ok(uid) = parse_imap_uid(&msg.remote_id) {
+                                        if let Ok(src) =
+                                            find_message_folder(&state, &msg.id, account_id)
+                                        {
+                                            if src.id != trash_folder.id {
+                                                match imap
+                                                    .move_message(
+                                                        &src.remote_id,
+                                                        uid,
+                                                        &trash_folder.remote_id,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(_) => deleted_ids.push(msg.id.clone()),
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "IMAP batch delete failed for {}: {e}",
+                                                            msg.id
+                                                        );
+                                                        queue_batch_pending_op(
+                                                            &state,
+                                                            msg,
+                                                            "delete",
+                                                            json!({
+                                                                "source_folder_id": src.id,
+                                                                "source_folder_remote_id": src.remote_id,
+                                                                "trash_folder_id": trash_folder.id,
+                                                                "trash_folder_remote_id": trash_folder.remote_id,
+                                                            }),
+                                                            &e.to_string(),
+                                                        )?;
+                                                        queued_for_local_commit_ids.push(msg.id.clone());
+                                                    }
+                                                }
+                                            } else {
+                                                match imap.delete_message(&src.remote_id, uid).await {
+                                                    Ok(_) => deleted_ids.push(msg.id.clone()),
+                                                    Err(e) => {
+                                                        warn!("IMAP batch permanent delete failed for {}: {e}", msg.id);
+                                                        queue_batch_pending_op(
+                                                            &state,
+                                                            msg,
+                                                            "delete_permanent",
+                                                            json!({
+                                                                "source_folder_id": src.id,
+                                                                "source_folder_remote_id": src.remote_id,
+                                                                "permanent": true,
+                                                            }),
+                                                            &e.to_string(),
+                                                        )?;
+                                                        queued_for_local_commit_ids.push(msg.id.clone());
+                                                    }
                                                 }
                                             }
                                         } else {
-                                            match imap.delete_message(&src.remote_id, uid).await {
-                                                Ok(_) => deleted_ids.push(msg.id.clone()),
-                                                Err(e) => {
-                                                    warn!("IMAP batch permanent delete failed for {}: {e}", msg.id);
-                                                    queue_batch_pending_op(
-                                                        &state,
-                                                        msg,
-                                                        "delete_permanent",
-                                                        json!({
-                                                            "source_folder_id": src.id,
-                                                            "source_folder_remote_id": src.remote_id,
-                                                            "permanent": true,
-                                                        }),
-                                                        &e.to_string(),
-                                                    )?;
-                                                }
-                                            }
+                                            queue_batch_pending_op(
+                                                &state,
+                                                msg,
+                                                "delete",
+                                                json!({ "trash_folder_id": trash_folder.id }),
+                                                "Source folder lookup failed",
+                                            )?;
+                                            queued_for_local_commit_ids.push(msg.id.clone());
                                         }
                                     } else {
                                         queue_batch_pending_op(
@@ -449,17 +462,31 @@ pub async fn batch_delete(
                                             msg,
                                             "delete",
                                             json!({ "trash_folder_id": trash_folder.id }),
-                                            "Source folder lookup failed",
+                                            "Invalid IMAP UID",
                                         )?;
+                                        queued_for_local_commit_ids.push(msg.id.clone());
                                     }
-                                } else {
+                                }
+                            }
+                            Err(_) => {
+                                // 本地没有回收站文件夹（例如服务器异常导致文件夹曾被清空）
+                                // 时，不能静默失败：先把邮件本地软删（列表立即消失），
+                                // 远程删除操作排队稍后重试。
+                                warn!(
+                                    "Trash folder not found for account {}; falling back to local-only delete for {} message(s)",
+                                    account_id,
+                                    messages.len()
+                                );
+                                deleted_ids.extend(messages.iter().map(|msg| msg.id.clone()));
+                                for msg in messages {
                                     queue_batch_pending_op(
                                         &state,
                                         msg,
                                         "delete",
-                                        json!({ "trash_folder_id": trash_folder.id }),
-                                        "Invalid IMAP UID",
+                                        json!({ "trash": true }),
+                                        "Trash folder not found; queued for retry",
                                     )?;
+                                    queued_for_local_commit_ids.push(msg.id.clone());
                                 }
                             }
                         }
@@ -520,7 +547,108 @@ pub async fn batch_mark_read(
     message_ids: Vec<String>,
     is_read: bool,
 ) -> std::result::Result<u32, PebbleError> {
-    let Some(groups) = prepare_batch(state.store.clone(), &message_ids).await? else {
+    batch_mark_read_inner(&state, &message_ids, is_read).await
+}
+
+/// Mark every unread message in a folder as read (remote + local), reusing the
+/// same per-message sync path as the batch command.
+#[tauri::command]
+pub async fn mark_folder_all_read(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    account_id: String,
+    folder_id: String,
+) -> std::result::Result<u32, PebbleError> {
+    info!("mark_folder_all_read called: account={account_id} folder={folder_id}");
+    let folder = state
+        .store
+        .get_folder(&folder_id)?
+        .ok_or_else(|| PebbleError::Validation("文件夹不存在或已被删除".to_string()))?;
+    if folder.account_id != account_id {
+        return Err(PebbleError::Validation("文件夹不属于当前账号".to_string()));
+    }
+
+    let mut unread_ids: Vec<String> = Vec::new();
+    let mut offset: u32 = 0;
+    loop {
+        let summaries = state.store.list_messages_by_folder(&folder_id, 500, offset)?;
+        if summaries.is_empty() {
+            break;
+        }
+        unread_ids.extend(
+            summaries
+                .into_iter()
+                .filter(|summary| !summary.is_read)
+                .map(|summary| summary.id),
+        );
+        offset += 500;
+        if offset > 20_000 {
+            break;
+        }
+    }
+    if unread_ids.is_empty() {
+        let _ = app.emit(
+            "mail:flags-changed",
+            serde_json::json!({
+                "account_id": account_id,
+                "folder_id": folder_id,
+                "kind": "mark_folder_all_read",
+                "count": 0,
+            }),
+        );
+        return Ok(0);
+    }
+
+    let count = unread_ids.len() as u32;
+
+    // 1) Mark read LOCALLY right away (optimistic) so the UI updates instantly
+    //    instead of waiting for a slow per-message IMAP sync.
+    let local_ids = unread_ids.clone();
+    let local_changes: Vec<(String, Option<bool>, Option<bool>)> = local_ids
+        .iter()
+        .map(|id| (id.clone(), Some(true), None))
+        .collect();
+    state.store.bulk_update_flags(&local_changes)?;
+
+    // 2) Enqueue pending ops so the background worker syncs the read flags to
+    //    the remote server asynchronously (one IMAP round trip per message can
+    //    take minutes for hundreds of mails — it must not block the UI).
+    let messages = state.store.get_messages_batch(&local_ids)?;
+    for msg in messages {
+        let payload = json!({
+            "folder_remote_id": folder.remote_id,
+            "is_read": true,
+            "is_starred": null,
+        });
+        state.store.insert_pending_mail_op(
+            &msg.account_id,
+            &msg.id,
+            "update_flags",
+            &payload.to_string(),
+        )?;
+    }
+
+    // 3) Notify the frontend so message + unread-count caches refresh.
+    let _ = app.emit(
+        "mail:flags-changed",
+        serde_json::json!({
+            "account_id": account_id,
+            "folder_id": folder_id,
+            "kind": "mark_folder_all_read",
+            "count": count,
+        }),
+    );
+    // 用户正在处理邮件：托盘上的"未读角标"随之清除（回到原 LOGO）。
+    crate::commands::notifications::clear_attention_indicator(&app);
+    Ok(count)
+}
+
+async fn batch_mark_read_inner(
+    state: &AppState,
+    message_ids: &[String],
+    is_read: bool,
+) -> std::result::Result<u32, PebbleError> {
+    let Some(groups) = prepare_batch(state.store.clone(), message_ids).await? else {
         return Ok(0);
     };
 
@@ -555,6 +683,7 @@ pub async fn batch_mark_read(
                                         json!({ "is_read": is_read, "is_starred": null }),
                                         &e.to_string(),
                                     )?;
+                                    queued_for_local_commit_ids.push(msg.id.clone());
                                 }
                             }
                         }
@@ -572,6 +701,7 @@ pub async fn batch_mark_read(
                                         json!({ "is_read": is_read, "is_starred": null }),
                                         &e.to_string(),
                                     )?;
+                                    queued_for_local_commit_ids.push(msg.id.clone());
                                 }
                             }
                         }
@@ -602,6 +732,7 @@ pub async fn batch_mark_read(
                                                 }),
                                                 &e.to_string(),
                                             )?;
+                                            queued_for_local_commit_ids.push(msg.id.clone());
                                         }
                                     }
                                 } else {
@@ -612,6 +743,7 @@ pub async fn batch_mark_read(
                                         json!({ "is_read": is_read, "is_starred": null }),
                                         "Source folder lookup failed",
                                     )?;
+                                    queued_for_local_commit_ids.push(msg.id.clone());
                                 }
                             } else {
                                 queue_batch_pending_op(
@@ -621,6 +753,7 @@ pub async fn batch_mark_read(
                                     json!({ "is_read": is_read, "is_starred": null }),
                                     "Invalid IMAP UID",
                                 )?;
+                                queued_for_local_commit_ids.push(msg.id.clone());
                             }
                         }
                     }
@@ -644,7 +777,7 @@ pub async fn batch_mark_read(
     }
 
     let ids_to_update =
-        batch_local_commit_ids(&message_ids, &synced_ids, &queued_for_local_commit_ids);
+        batch_local_commit_ids(message_ids, &synced_ids, &queued_for_local_commit_ids);
 
     // Local bulk flag update: only for messages that succeeded remotely (or all if offline).
     let changes: Vec<(String, Option<bool>, Option<bool>)> = ids_to_update

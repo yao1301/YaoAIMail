@@ -52,6 +52,9 @@ pub struct OutgoingMessage {
     pub body_html: Option<String>,
     pub in_reply_to: Option<String>,
     pub attachment_paths: Vec<String>,
+    /// 发送时生成的 Message-ID（本地"已发送"副本与 SMTP 头部共用，
+    /// 保证同步去重能按 Message-ID 匹配，避免"已发送"重复两封）。
+    pub message_id: Option<String>,
 }
 
 pub struct StructuredQuery {
@@ -80,6 +83,10 @@ pub struct SearchHit {
     pub from_address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_attachment: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folder_ids: Vec<String>,
 }
 
 #[async_trait]

@@ -142,6 +142,19 @@ export default function PrivacyTab() {
         </p>
       </div>
 
+      <div style={{
+        padding: "12px 16px",
+        borderRadius: "6px",
+        backgroundColor: "var(--color-bg-hover)",
+        marginBottom: "24px",
+        fontSize: "13px",
+      }}>
+        <strong>AI 内容发送说明</strong>
+        <p style={{ margin: "4px 0 0", color: "var(--color-text-secondary)", fontSize: "12px", lineHeight: 1.6 }}>
+          AI 写作只会把当前任务需要的邮件上下文、你主动拖入或粘贴的文件，以及必要的写作资料发送给你配置的 AI 服务商；不会自动上传整个邮箱。邮件和索引优先保存在本地。请仅配置你信任的 AI 服务商和 API Key。
+        </p>
+      </div>
+
       {/* Trusted senders */}
       <div>
         <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "12px" }}>

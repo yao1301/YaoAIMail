@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, Copy, Languages, LayoutGrid, MoreHorizontal, Search, ShieldCheck, X } from "lucide-react";
+import { Check, Copy, Languages, MoreHorizontal, Search, ShieldCheck, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 interface Props {
@@ -8,7 +8,6 @@ interface Props {
   onTranslate: (text: string, position: { x: number; y: number }) => void;
   onSearch: (text: string) => void;
   onCreateRule: (text: string) => void;
-  onAddToKanbanNote: (text: string) => void;
   onClose: () => void;
 }
 
@@ -18,7 +17,6 @@ export default function SelectionActionPopover({
   onTranslate,
   onSearch,
   onCreateRule,
-  onAddToKanbanNote,
   onClose,
 }: Props) {
   const { t } = useTranslation();
@@ -121,15 +119,6 @@ export default function SelectionActionPopover({
             >
               <ShieldCheck size={14} />
               <span>{t("selection.createRule", "Create rule")}</span>
-            </button>
-            <button
-              role="menuitem"
-              onClick={() => onAddToKanbanNote(text)}
-              aria-label={t("selection.addToKanbanNote", "Add selected text as kanban note")}
-              style={menuButtonStyle}
-            >
-              <LayoutGrid size={14} />
-              <span>{t("selection.addToKanbanNoteLabel", "Add to Kanban note")}</span>
             </button>
           </div>
         )}

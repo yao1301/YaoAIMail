@@ -154,12 +154,18 @@ fn dotenv_contents() -> Option<String> {
         candidates.push(current_dir.join(".env"));
         candidates.push(current_dir.join("..").join(".env"));
     }
-    candidates.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env"));
-    candidates.push(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join(".env"),
-    );
+    // Source-tree fallbacks are only useful while developing. Keeping
+    // CARGO_MANIFEST_DIR out of release builds avoids embedding the builder's
+    // private absolute workspace path in distributable binaries.
+    #[cfg(debug_assertions)]
+    {
+        candidates.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env"));
+        candidates.push(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(".env"),
+        );
+    }
 
     candidates
         .into_iter()

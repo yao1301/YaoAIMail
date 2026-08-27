@@ -423,7 +423,10 @@ impl GmailProvider {
         debug!(
             gmail_id = %gm.id,
             header_count = hdrs.len(),
-            headers = ?hdrs.iter().map(|h| format!("{}={}", h.name, &h.value[..h.value.len().min(60)])).collect::<Vec<_>>(),
+            headers = ?hdrs.iter().map(|h| {
+                let preview_end = h.value.floor_char_boundary(h.value.len().min(60));
+                format!("{}={}", h.name, &h.value[..preview_end])
+            }).collect::<Vec<_>>(),
             "Parsing Gmail message headers"
         );
 
@@ -1188,6 +1191,7 @@ fn build_draft_raw(draft: &DraftMessage) -> Result<Vec<u8>> {
         body_html: draft.body_html.clone(),
         in_reply_to: draft.in_reply_to.clone(),
         attachment_paths: draft.attachment_paths.clone(),
+        message_id: None,
     };
     build_raw_message(&message)
 }
@@ -1544,6 +1548,7 @@ mod tests {
             }],
             cc: vec![],
             bcc: vec![],
+            message_id: None,
             subject: "Test Subject".to_string(),
             body_text: "Hello".to_string(),
             body_html: None,
@@ -1567,6 +1572,7 @@ mod tests {
             }],
             cc: vec![],
             bcc: vec![],
+            message_id: None,
             subject: "Hello\r\nBcc: victim@example.com".to_string(),
             body_text: "Body".to_string(),
             body_html: None,
@@ -1586,6 +1592,7 @@ mod tests {
             }],
             cc: vec![],
             bcc: vec![],
+            message_id: None,
             subject: "Attachment".to_string(),
             body_text: "Body".to_string(),
             body_html: None,
@@ -1609,6 +1616,7 @@ mod tests {
             }],
             cc: vec![],
             bcc: vec![],
+            message_id: None,
             subject: "Attachment".to_string(),
             body_text: "Body".to_string(),
             body_html: None,
@@ -1633,6 +1641,7 @@ mod tests {
             }],
             cc: vec![],
             bcc: vec![],
+            message_id: None,
             subject: "HTML update".to_string(),
             body_text: "Plain text body".to_string(),
             body_html: Some("<p>HTML body</p>".to_string()),
@@ -1660,6 +1669,7 @@ mod tests {
                 address: "bob@example.com".to_string(),
             }],
             bcc: vec![],
+            message_id: None,
             subject: "Re: Hello".to_string(),
             body_text: "Reply body".to_string(),
             body_html: None,
@@ -1688,6 +1698,7 @@ mod tests {
             body_html: Some("<p><strong>HTML</strong> body</p>".to_string()),
             in_reply_to: None,
             attachment_paths: vec![],
+            message_id: None,
         };
 
         let raw = String::from_utf8(build_raw_message(&msg).unwrap()).unwrap();

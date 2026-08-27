@@ -5,6 +5,10 @@ import {
   openDefaultMailSettings,
   getAutostartEnabled,
   setAutostartEnabled,
+  getProfileLocation,
+  chooseProfileFolder,
+  scheduleProfileMigration,
+  type ProfileLocationInfo,
 } from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
 import { useUIStore, type RealtimePreference } from "@/stores/ui.store";
@@ -50,6 +54,8 @@ export default function GeneralTab() {
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
   const [testingNotification, setTestingNotification] = useState(false);
+  const [profileLocation, setProfileLocation] = useState<ProfileLocationInfo | null>(null);
+  const [schedulingMigration, setSchedulingMigration] = useState(false);
   const realtimeMode = useUIStore((s) => s.realtimeMode);
   const setRealtimeMode = useUIStore((s) => s.setRealtimeMode);
   const notificationsEnabled = useUIStore((s) => s.notificationsEnabled);
@@ -108,6 +114,36 @@ export default function GeneralTab() {
     };
   }, []);
 
+  useEffect(() => {
+    if (typeof getProfileLocation === "function") {
+      getProfileLocation()
+        .then(setProfileLocation)
+        .catch((err) => console.warn("Failed to read profile location", err));
+    }
+  }, []);
+
+  const handleChooseProfileLocation = useCallback(async () => {
+    setSchedulingMigration(true);
+    try {
+      const destination = await chooseProfileFolder();
+      if (!destination) return;
+      await scheduleProfileMigration(destination);
+      addToast({
+        message: `已选择 ${destination}。请完全退出软件后重新打开，数据会自动迁移并切换到新位置。`,
+        type: "success",
+        duration: 12_000,
+      });
+    } catch (err) {
+      addToast({
+        message: `无法更改数据位置：${err instanceof Error ? err.message : String(err)}`,
+        type: "error",
+        duration: 10_000,
+      });
+    } finally {
+      setSchedulingMigration(false);
+    }
+  }, [addToast]);
+
   const toggleLaunchAtStartup = useCallback(async () => {
     const next = !launchAtStartup;
     setLaunchAtStartup(next); // optimistic; revert below if the OS rejects it
@@ -132,10 +168,32 @@ export default function GeneralTab() {
   return (
     <div>
       <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "8px" }}>
-        {t("settings.realtimeMode", "Realtime Mode")}
+        用户数据存放位置
+      </h3>
+      <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", margin: "0 0 8px" }}>
+        邮件、附件、搜索索引、账号配置和 AI 风格档案都保存在这里。建议放到非系统盘并定期备份。
+      </p>
+      <div style={{ padding: "10px 12px", border: "1px solid var(--color-border)", borderRadius: "6px", background: "var(--color-bg-secondary)", fontSize: "12px", wordBreak: "break-all", marginBottom: "10px" }}>
+        当前：{profileLocation?.currentPath ?? "正在读取…"}
+        {profileLocation?.isCustom ? "（自定义位置）" : "（系统默认位置）"}
+      </div>
+      <button
+        type="button"
+        disabled={schedulingMigration}
+        onClick={handleChooseProfileLocation}
+        style={{ padding: "8px 14px", border: "none", borderRadius: "6px", background: "var(--color-accent)", color: "#fff", cursor: "pointer", opacity: schedulingMigration ? 0.6 : 1 }}
+      >
+        {schedulingMigration ? "正在准备…" : "修改保存位置…"}
+      </button>
+      <p style={{ fontSize: "11px", color: "var(--color-text-secondary)", margin: "8px 0 28px" }}>
+        为防止数据库损坏，实际复制会在下次启动、数据库尚未打开时进行。目标必须是空文件夹；旧数据不会自动删除，可确认新位置正常后自行备份或删除。
+      </p>
+
+      <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "8px" }}>
+        默认同步频率（未单独设置账号时）
       </h3>
       <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", marginBottom: "12px", marginTop: 0 }}>
-        {t("settings.realtimeModeDesc", "Choose how aggressively Pebble checks for new mail.")}
+        这里是所有邮箱账号的默认值。若在“设置 → 邮箱账户”中单独设置了某个账号，则该账号优先使用自己的同步频率。
       </p>
       <div
         role="group"

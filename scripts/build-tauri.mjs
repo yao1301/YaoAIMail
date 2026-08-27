@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { existsSync } from "node:fs";
 
 const BUNDLE_TARGETS_BY_PLATFORM = {
   win32: "nsis",
@@ -37,6 +38,12 @@ if (isEntrypoint()) {
   const result = spawnSync("pnpm", args, {
     stdio: "inherit",
     shell: process.platform === "win32",
+    env: process.platform === "win32" && existsSync("D:\\tools\\mingw64\\bin")
+      ? {
+          ...process.env,
+          PATH: `D:\\tools\\mingw64\\bin;${process.env.PATH ?? ""}`,
+        }
+      : process.env,
   });
 
   process.exit(result.status ?? 1);

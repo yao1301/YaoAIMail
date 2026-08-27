@@ -30,7 +30,6 @@ const DEFAULT_BINDINGS: Record<string, string> = {
   "forward": "F",
   "focus-search": "/",
   "toggle-view-inbox": "Ctrl+Shift+I",
-  "toggle-view-kanban": "Ctrl+Shift+K",
   "open-search": "Ctrl+Shift+F",
   "open-cloud-settings": "Ctrl+Shift+B",
   "toggle-notifications": "Ctrl+Shift+N",

@@ -39,5 +39,19 @@ pnpm-debug.log
 *.sqlite-wal
 *.sqlite-shm
 
+# Local build artifacts & temp files (YaoAIMail fork)
+dist_old_*/
+package.json.tmp
+vite-quick-test.*.log
+release-share/
+releases/
+tmp/
+tmp_pnpm/
+tmp_pnpm2/
+tmp_*.tgz
+package-lock.json
+src-tauri/icons/.bak/
+src/assets/app-icon.bak.png
+
 # Claude Code
 .claude/

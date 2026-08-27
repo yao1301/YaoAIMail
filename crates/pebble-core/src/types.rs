@@ -125,6 +125,8 @@ pub struct MessageSummary {
     pub cc_list: Vec<EmailAddress>,
     pub bcc_list: Vec<EmailAddress>,
     pub has_attachments: bool,
+    /// Whether a non-draft stored message replies to this message.
+    pub has_replies: bool,
     pub is_read: bool,
     pub is_starred: bool,
     pub is_draft: bool,
@@ -211,6 +213,10 @@ pub struct Rule {
     pub conditions: String,
     pub actions: String,
     pub is_enabled: bool,
+    /// 该规则归属的账号 ID；空字符串表示适用于所有账号（兼容旧数据）。
+    pub account_id: String,
+    /// 触发时机 JSON 数组，例如 ["on_receive","on_send"]。
+    pub trigger_when: String,
     pub created_at: i64,
     pub updated_at: i64,
 }

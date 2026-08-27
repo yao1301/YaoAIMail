@@ -2,13 +2,25 @@ import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Image, Trash2, Upload } from "lucide-react";
 import { useUIStore } from "@/stores/ui.store";
-import type { BackgroundImageFit, Language, Theme } from "@/stores/ui.store";
+import type { AppFontFamily, BackgroundImageFit, Language, Theme } from "@/stores/ui.store";
 import { backgroundImageUrl, deleteBackgroundImage, importBackgroundImage } from "@/lib/backgroundImage";
 
 const THEMES: { id: Theme; labelKey: string; descKey: string }[] = [
   { id: "light", labelKey: "settings.themeLight", descKey: "settings.themeLightDesc" },
   { id: "dark", labelKey: "settings.themeDark", descKey: "settings.themeDarkDesc" },
   { id: "system", labelKey: "settings.themeSystem", descKey: "settings.themeSystemDesc" },
+  { id: "warm", labelKey: "settings.themeWarm", descKey: "settings.themeWarmDesc" },
+  { id: "ocean", labelKey: "settings.themeOcean", descKey: "settings.themeOceanDesc" },
+  { id: "forest", labelKey: "settings.themeForest", descKey: "settings.themeForestDesc" },
+  { id: "highContrast", labelKey: "settings.themeHighContrast", descKey: "settings.themeHighContrastDesc" },
+];
+
+const FONT_FAMILIES: Array<{ id: AppFontFamily; label: string }> = [
+  { id: "system", label: "系统默认" },
+  { id: "yahei", label: "微软雅黑" },
+  { id: "songti", label: "宋体" },
+  { id: "rounded", label: "清晰圆体" },
+  { id: "mono", label: "等宽字体" },
 ];
 
 const LANGUAGES: { id: Language; label: string }[] = [
@@ -35,6 +47,10 @@ export default function AppearanceTab() {
   const [error, setError] = useState<string | null>(null);
   const theme = useUIStore((s) => s.theme);
   const setTheme = useUIStore((s) => s.setTheme);
+  const fontFamily = useUIStore((s) => s.fontFamily);
+  const setFontFamily = useUIStore((s) => s.setFontFamily);
+  const fontScale = useUIStore((s) => s.fontScale);
+  const setFontScale = useUIStore((s) => s.setFontScale);
   const language = useUIStore((s) => s.language);
   const setLanguage = useUIStore((s) => s.setLanguage);
   const backgroundImage = useUIStore((s) => s.backgroundImage);
@@ -82,7 +98,7 @@ export default function AppearanceTab() {
   return (
     <div>
       <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px" }}>{t("settings.theme")}</h3>
-      <div style={{ display: "flex", gap: "12px" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "12px" }}>
         {THEMES.map((th) => (
           <button
             key={th.id}
@@ -102,6 +118,36 @@ export default function AppearanceTab() {
             <div style={{ fontSize: "12px", color: "var(--color-text-secondary)" }}>{t(th.descKey)}</div>
           </button>
         ))}
+      </div>
+
+      <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "8px", marginTop: "32px" }}>
+        字体与显示大小
+      </h3>
+      <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", margin: "0 0 12px" }}>
+        调大后，邮件列表、正文、菜单和右侧 AI 工具会一起放大。
+      </p>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", alignItems: "end" }}>
+        <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600 }}>
+          <span>字体</span>
+          <select
+            value={fontFamily}
+            onChange={(event) => setFontFamily(event.currentTarget.value as AppFontFamily)}
+            style={{ padding: "8px 10px", border: "1px solid var(--color-border)", borderRadius: "6px", background: "var(--color-bg)", color: "var(--color-text-primary)" }}
+          >
+            {FONT_FAMILIES.map((font) => <option key={font.id} value={font.id}>{font.label}</option>)}
+          </select>
+        </label>
+        <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600 }}>
+          <span>界面大小：{Math.round(fontScale * 100)}%</span>
+          <input
+            type="range"
+            min={0.9}
+            max={1.35}
+            step={0.05}
+            value={fontScale}
+            onChange={(event) => setFontScale(Number(event.currentTarget.value))}
+          />
+        </label>
       </div>
 
       <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>

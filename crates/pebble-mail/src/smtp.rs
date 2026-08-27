@@ -53,6 +53,7 @@ impl SmtpSender {
         body_html: Option<&str>,
         in_reply_to: Option<&str>,
         attachment_paths: &[String],
+        message_id: Option<&str>,
     ) -> Result<()> {
         if to.is_empty() {
             return Err(PebbleError::Internal("No recipients".to_string()));
@@ -65,6 +66,12 @@ impl SmtpSender {
         let mut builder = lettre::Message::builder()
             .from(from_mailbox)
             .subject(subject);
+
+        // 使用调用方指定的 Message-ID（与本地"已发送"副本一致），
+        // 覆盖 lettre 自动生成的随机 Message-ID，保证同步去重可匹配。
+        if let Some(mid) = message_id {
+            builder = builder.message_id(Some(mid.to_string()));
+        }
 
         for addr in to {
             let mailbox: Mailbox = addr
@@ -91,24 +98,13 @@ impl SmtpSender {
             builder = builder.in_reply_to(reply_to.to_string());
         }
 
-        let alternative_body = MultiPart::alternative()
-            .singlepart(
-                SinglePart::builder()
-                    .content_type(ContentType::TEXT_PLAIN)
-                    .body(body_text.to_string()),
-            )
-            .singlepart(
-                SinglePart::builder()
-                    .content_type(ContentType::TEXT_HTML)
-                    .body(body_html.unwrap_or(body_text).to_string()),
-            );
-
         let email = if attachment_paths.is_empty() {
-            builder
-                .multipart(alternative_body)
-                .map_err(|e| PebbleError::Internal(format!("Failed to build email: {e}")))?
+            build_body_only_message(builder, body_text, body_html)?
         } else {
-            let mut mixed = MultiPart::mixed().multipart(alternative_body);
+            let mut mixed = match body_html {
+                Some(html) => MultiPart::mixed().multipart(alternative_body(body_text, html)),
+                None => MultiPart::mixed().singlepart(plain_text_body(body_text)),
+            };
 
             for path_str in attachment_paths {
                 let path = Path::new(path_str);
@@ -291,6 +287,34 @@ impl SmtpSender {
 
         Ok(())
     }
+}
+
+fn plain_text_body(body_text: &str) -> SinglePart {
+    SinglePart::builder()
+        .content_type(ContentType::TEXT_PLAIN)
+        .body(body_text.to_string())
+}
+
+fn alternative_body(body_text: &str, body_html: &str) -> MultiPart {
+    MultiPart::alternative()
+        .singlepart(plain_text_body(body_text))
+        .singlepart(
+            SinglePart::builder()
+                .content_type(ContentType::TEXT_HTML)
+                .body(body_html.to_string()),
+        )
+}
+
+fn build_body_only_message(
+    builder: lettre::message::MessageBuilder,
+    body_text: &str,
+    body_html: Option<&str>,
+) -> Result<lettre::Message> {
+    match body_html {
+        Some(html) => builder.multipart(alternative_body(body_text, html)),
+        None => builder.singlepart(plain_text_body(body_text)),
+    }
+    .map_err(|e| PebbleError::Internal(format!("Failed to build email: {e}")))
 }
 
 fn smtp_tls_parameters(host: &str, accept_invalid_certs: bool) -> Result<TlsParameters> {
@@ -522,7 +546,26 @@ fn mime_type_from_extension(ext: &str) -> ContentType {
 
 #[cfg(test)]
 mod tls_config_tests {
-    use super::{build_native_tls_connector, build_rustls_client_config};
+    use super::{build_body_only_message, build_native_tls_connector, build_rustls_client_config};
+
+    #[test]
+    fn plain_text_message_does_not_add_a_fake_html_alternative() {
+        let message = build_body_only_message(
+            lettre::Message::builder()
+                .from("sender@example.com".parse().unwrap())
+                .to("recipient@example.com".parse().unwrap())
+                .subject("Formatting"),
+            "First paragraph.\n\nSecond paragraph.\n\nBest regards,\nJeremy",
+            None,
+        )
+        .unwrap();
+        let formatted = String::from_utf8(message.formatted()).unwrap();
+
+        assert!(formatted.contains("Content-Type: text/plain"));
+        assert!(!formatted.contains("Content-Type: text/html"));
+        assert!(formatted.contains("First paragraph.\r\n\r\nSecond paragraph."));
+        assert!(formatted.contains("Best regards,\r\nJeremy"));
+    }
 
     #[test]
     fn build_rustls_client_config_returns_result() {

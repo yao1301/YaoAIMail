@@ -1,5 +1,5 @@
 import { useInfiniteQuery, type InfiniteData, type QueryClient } from "@tanstack/react-query";
-import { listMessages } from "@/lib/api";
+import { listMessages, listUnreadMessages } from "@/lib/api";
 import type { MessageSummary } from "@/lib/api";
 
 export const MESSAGES_PAGE_SIZE = 50;
@@ -9,22 +9,41 @@ export const messagesQueryKey = (folderId: string, folderIds?: string[]) =>
 
 /**
  * Paginated message list backed by React Query's useInfiniteQuery.
- * Each page is a MessageSummary[] fetched by offset; `data` flattens them
+ * Each page is a MessageSummary[] fetched by a stable date/id cursor; `data` flattens them
  * so render code keeps the flat-array shape it already expects.
+ * `unreadOnly`（"所有未读"视图）走 list_unread_messages，与文件夹无关。
  */
 export function useMessagesQuery(
   folderId: string | null,
   folderIds?: string[],
+  unreadOnly = false,
 ) {
   const query = useInfiniteQuery({
-    queryKey: messagesQueryKey(folderId ?? "", folderIds),
+    queryKey: messagesQueryKey(unreadOnly ? "__unread__" : folderId ?? "", unreadOnly ? undefined : folderIds),
     queryFn: ({ pageParam }) =>
-      listMessages(folderId!, MESSAGES_PAGE_SIZE, pageParam as number, folderIds),
-    initialPageParam: 0,
-    getNextPageParam: (lastPage, allPages) =>
-      lastPage.length < MESSAGES_PAGE_SIZE ? undefined : allPages.length * MESSAGES_PAGE_SIZE,
-    enabled: !!folderId,
-    staleTime: 60_000,
+      unreadOnly
+        ? listUnreadMessages(
+            MESSAGES_PAGE_SIZE,
+            typeof pageParam === "number" ? pageParam : 0,
+          )
+        : listMessages(
+          folderId!,
+          MESSAGES_PAGE_SIZE,
+          0,
+          folderIds,
+          pageParam === 0 ? null : (pageParam as { date: number; id: string }),
+        ),
+    initialPageParam: 0 as number | { date: number; id: string },
+    getNextPageParam: (lastPage, allPages) => {
+      if (lastPage.length < MESSAGES_PAGE_SIZE) return undefined;
+      if (unreadOnly) return allPages.length * MESSAGES_PAGE_SIZE;
+      const last = lastPage[lastPage.length - 1];
+      return { date: last.date, id: last.id };
+    },
+    enabled: !!folderId || unreadOnly,
+    // 15s staleTime：新邮件到达后（mail:new 事件 invalidate）立即刷新；
+    // 即使事件偶发丢失，也最多 15 秒出现在列表，不会干等 60 秒。
+    staleTime: 15_000,
   });
 
   const data: MessageSummary[] = query.data?.pages.flat() ?? [];

@@ -1,6 +1,8 @@
 import { Component, type ErrorInfo, type ReactNode, useEffect } from "react";
 import i18next from "i18next";
 import Layout from "./app/Layout";
+import OnboardingOverlay from "./components/OnboardingOverlay";
+import ComposeWindowApp from "./features/compose/ComposeWindowApp";
 import { logStartupTiming } from "@/lib/startupTiming";
 
 class ErrorBoundary extends Component<
@@ -49,7 +51,11 @@ class ErrorBoundary extends Component<
 }
 
 export default function App() {
+  // 独立写信窗口（?compose=1）：只渲染写信界面，不加载主布局
+  const isComposeWindow = new URLSearchParams(window.location.search).get("compose") === "1";
+
   useEffect(() => {
+    if (isComposeWindow) return; // 独立写信窗口不播放主界面启动动画
     logStartupTiming("react app mounted");
     const splash = document.getElementById("splash");
     if (!splash) return;
@@ -67,11 +73,20 @@ export default function App() {
         logStartupTiming("splash removed");
       }, 500);
     }, remaining);
-  }, []);
+  }, [isComposeWindow]);
+
+  if (isComposeWindow) {
+    return (
+      <ErrorBoundary>
+        <ComposeWindowApp />
+      </ErrorBoundary>
+    );
+  }
 
   return (
     <ErrorBoundary>
       <Layout />
+      <OnboardingOverlay />
     </ErrorBoundary>
   );
 }

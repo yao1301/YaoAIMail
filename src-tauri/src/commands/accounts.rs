@@ -414,11 +414,10 @@ pub async fn add_account(
         };
         state.store.update_sync_state(&account.id, |s| {
             s.provider = Some(provider_slug.to_string());
-            // New IMAP accounts start with Inbox only. Users can opt into
-            // additional mailboxes from the account editor after the account
-            // exists and its saved credentials can be used for IMAP LIST.
+            // No explicit selection means "sync every server folder". The
+            // account editor can later persist a narrower user selection.
             if provider == ProviderType::Imap {
-                s.selected_imap_folder_remote_ids = Some(Vec::new());
+                s.selected_imap_folder_remote_ids = None;
             }
         })?;
         Ok(())
@@ -596,6 +595,138 @@ pub async fn update_account(
     state.store.set_auth_data(&account_id, &encrypted)?;
 
     Ok(())
+}
+
+/// Read the full existing configuration for one account so the edit dialog can
+/// prefill every field. The password is intentionally NOT returned — the UI
+/// must keep the password empty and only rewrite it when the user types a new
+/// one.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountDetails {
+    pub email: String,
+    pub display_name: String,
+    pub color: Option<String>,
+    pub provider: String,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub imap_username: String,
+    pub imap_security: ConnectionSecurity,
+    pub imap_accept_invalid_certs: bool,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    pub smtp_security: ConnectionSecurity,
+    pub smtp_accept_invalid_certs: bool,
+    pub proxy_mode: String,
+    pub proxy_host: String,
+    pub proxy_port: u16,
+}
+
+fn credentials_to_details(creds: AccountCredentials) -> AccountDetails {
+    AccountDetails {
+        email: String::new(),
+        display_name: String::new(),
+        color: None,
+        provider: String::new(),
+        imap_host: creds.imap.host,
+        imap_port: creds.imap.port,
+        imap_username: creds.imap.username,
+        imap_security: creds.imap.security,
+        imap_accept_invalid_certs: creds.imap.accept_invalid_certs,
+        smtp_host: creds.smtp.host,
+        smtp_port: creds.smtp.port,
+        smtp_username: creds.smtp.username,
+        smtp_security: creds.smtp.security,
+        smtp_accept_invalid_certs: creds.smtp.accept_invalid_certs,
+        proxy_mode: serde_json::to_value(&creds.proxy_mode)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "inherit".to_string()),
+        proxy_host: creds
+            .imap
+            .proxy
+            .as_ref()
+            .map(|p| p.host.clone())
+            .unwrap_or_default(),
+        proxy_port: creds
+            .imap
+            .proxy
+            .as_ref()
+            .map(|p| p.port)
+            .unwrap_or_default(),
+    }
+}
+
+#[tauri::command]
+pub async fn get_account_details(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> std::result::Result<AccountDetails, PebbleError> {
+    let account = state
+        .store
+        .get_account(&account_id)?
+        .ok_or_else(|| PebbleError::Internal(format!("Account not found: {account_id}")))?;
+
+    let mut details = match state.store.get_auth_data(&account_id)? {
+        Some(encrypted) => {
+            let decrypted = state.crypto.decrypt(&encrypted)
+                .map_err(|e| PebbleError::Internal(format!("decrypt failed: {e}")))?;
+            match deserialize_account_credentials(&decrypted) {
+                Ok(creds) => credentials_to_details(creds),
+                Err(_) => credentials_to_details(AccountCredentials {
+                    proxy_mode: AccountProxyMode::Inherit,
+                    imap: ImapConfig {
+                        host: String::new(),
+                        port: 0,
+                        username: String::new(),
+                        password: String::new(),
+                        security: ConnectionSecurity::default(),
+                        accept_invalid_certs: false,
+                        proxy: None,
+                    },
+                    smtp: SmtpConfig {
+                        host: String::new(),
+                        port: 0,
+                        username: String::new(),
+                        password: String::new(),
+                        security: ConnectionSecurity::default(),
+                        accept_invalid_certs: false,
+                        proxy: None,
+                    },
+                    allow_plaintext: false,
+                }),
+            }
+        }
+        None => credentials_to_details(AccountCredentials {
+            proxy_mode: AccountProxyMode::Inherit,
+            imap: ImapConfig {
+                host: String::new(),
+                port: 0,
+                username: String::new(),
+                password: String::new(),
+                security: ConnectionSecurity::default(),
+                accept_invalid_certs: false,
+                proxy: None,
+            },
+            smtp: SmtpConfig {
+                host: String::new(),
+                port: 0,
+                username: String::new(),
+                password: String::new(),
+                security: ConnectionSecurity::default(),
+                accept_invalid_certs: false,
+                proxy: None,
+            },
+            allow_plaintext: false,
+        }),
+    };
+
+    details.email = account.email;
+    details.display_name = account.display_name;
+    details.color = account.color;
+    details.provider = format!("{:?}", account.provider).to_lowercase();
+    Ok(details)
 }
 
 #[tauri::command]

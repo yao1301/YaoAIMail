@@ -69,6 +69,152 @@ import type {
   TrustedSender,
 } from "./ipc-types";
 
+export interface ProfileLocationInfo {
+  currentPath: string;
+  defaultPath: string;
+  isCustom: boolean;
+}
+
+export async function getProfileLocation(): Promise<ProfileLocationInfo> {
+  return invoke<ProfileLocationInfo>("get_profile_location");
+}
+
+export async function openDataDir(): Promise<void> {
+  await invoke("open_profile_folder");
+}
+
+export async function getDataDir(): Promise<string> {
+  const info = await getProfileLocation();
+  return info.currentPath;
+}
+
+export async function chooseProfileFolder(): Promise<string | null> {
+  return invoke<string | null>("choose_profile_folder");
+}
+
+export async function scheduleProfileMigration(destination: string): Promise<void> {
+  return invoke<void>("schedule_profile_migration", { destination });
+}
+
+export interface DashboardData {
+  exchangeDate: string | null;
+  usdRates: Record<string, number>;
+  holidays: Array<{
+    date: string;
+    localName: string;
+    name: string;
+    countryCode: string;
+  }>;
+  warnings: string[];
+}
+
+export async function getDashboardData(year = new Date().getFullYear()): Promise<DashboardData> {
+  return invoke<DashboardData>("get_dashboard_data", { year });
+}
+
+export interface ResearchSource {
+  title: string;
+  url: string;
+  status: "checked" | "no_match" | "unavailable" | "manual_check";
+}
+
+export interface PublicCompanyMatch {
+  legalName: string;
+  country: string;
+  city: string;
+  address: string;
+  registrationStatus: string;
+  lei: string;
+  sourceUrl: string;
+  website?: string;
+  description?: string;
+  sourceName?: string;
+  publicEmails?: string[];
+  recommendationReason?: string;
+  discoveryBasis?: string[];
+  companyIntroduction?: string;
+  emailEvidence?: Array<{
+    email: string; source: string; sourceUrl: string; confidence?: number;
+    verification: string; emailType?: string; person?: string; suitability?: string;
+  }>;
+  contactStatus?: "可联系" | "待补全" | string;
+  websiteStatus?: "已核验" | "待核验" | "无法访问" | "身份不匹配" | string;
+  websiteStatusReason?: string;
+}
+
+export interface CompanyResearchReport {
+  id: string;
+  companyName: string;
+  website: string;
+  country: string;
+  websiteTitle: string;
+  websiteDescription: string;
+  publicEmails: string[];
+  legalMatches: PublicCompanyMatch[];
+  sources: ResearchSource[];
+  warnings: string[];
+  analysis: string;
+  createdAt: number;
+}
+
+export async function researchCompany(
+  companyName: string,
+  website: string,
+  country: string,
+): Promise<CompanyResearchReport> {
+  return invoke<CompanyResearchReport>("research_company", { companyName, website, country });
+}
+
+export async function listCompanyResearch(): Promise<CompanyResearchReport[]> {
+  return invoke<CompanyResearchReport[]>("list_company_research");
+}
+
+export async function deleteCompanyResearch(id: string): Promise<CompanyResearchReport[]> {
+  return invoke<CompanyResearchReport[]>("delete_company_research", { id });
+}
+
+export async function saveCompanyResearchAnalysis(id: string, analysis: string): Promise<CompanyResearchReport> {
+  return invoke<CompanyResearchReport>("save_company_research_analysis", { id, analysis });
+}
+
+export async function searchPublicCompanies(query: string): Promise<PublicCompanyMatch[]> {
+  return invoke<PublicCompanyMatch[]>("search_public_companies", { query });
+}
+
+export async function aiFindCompanies(
+  product: string,
+  market: string,
+  buyerType: string,
+): Promise<PublicCompanyMatch[]> {
+  return invoke<PublicCompanyMatch[]>("ai_find_companies", {
+    product,
+    market,
+    buyerType,
+  });
+}
+
+/** Agent-driven lead discovery (Tool Calling): the model searches the target
+ *  market autonomously and returns structured candidates. */
+export async function findCompaniesAgent(
+  industry: string,
+  market: string,
+  keywords?: string,
+): Promise<Array<Record<string, unknown>>> {
+  return invoke<Array<Record<string, unknown>>>("find_companies_agent", {
+    industry,
+    market,
+    keywords,
+  });
+}
+
+/** Agent-driven deep credit/diligence report (Tool Calling). */
+export async function researchCompanyAgent(
+  companyName: string,
+  website?: string,
+): Promise<Record<string, unknown>> {
+  return invoke<Record<string, unknown>>("research_company_agent", { companyName, website });
+}
+
 // ─── Account API ─────────────────────────────────────────────────────────────
 
 export async function healthCheck(): Promise<string> {
@@ -243,10 +389,44 @@ export async function deleteAccount(accountId: string): Promise<void> {
   return invoke<void>("delete_account", { accountId });
 }
 
+export interface AccountDetails {
+  email: string;
+  displayName: string;
+  color: string | null;
+  provider: string;
+  imapHost: string;
+  imapPort: number;
+  imapUsername: string;
+  imapSecurity: "tls" | "starttls" | "plain";
+  imapAcceptInvalidCerts: boolean;
+  smtpHost: string;
+  smtpPort: number;
+  smtpUsername: string;
+  smtpSecurity: "tls" | "starttls" | "plain";
+  smtpAcceptInvalidCerts: boolean;
+  proxyMode: string;
+  proxyHost: string;
+  proxyPort: number;
+}
+
+export async function getAccountDetails(accountId: string): Promise<AccountDetails> {
+  return invoke<AccountDetails>("get_account_details", { accountId });
+}
+
 // ─── Folder API ──────────────────────────────────────────────────────────────
 
 export async function listFolders(accountId: string): Promise<Folder[]> {
   return invoke<Folder[]>("list_folders", { accountId });
+}
+
+export interface BodyBackfillStat {
+  account_id: string;
+  remaining: number;
+}
+
+/** 各账号正文/附件下载进度（remaining = 还有多少封只有邮件头）。 */
+export async function getBodyBackfillStats(): Promise<BodyBackfillStat[]> {
+  return invoke<BodyBackfillStat[]>("get_body_backfill_stats");
 }
 
 export async function getImapSyncFolders(accountId: string): Promise<ImapSyncFolderSettings> {
@@ -263,6 +443,36 @@ export async function updateImapSyncFolders(
   });
 }
 
+export async function createFolder(accountId: string, name: string, parentFolderId?: string | null): Promise<Folder> {
+  return invoke<Folder>("create_folder", { accountId, name, parentFolderId: parentFolderId ?? null });
+}
+
+/** 拖动文件夹：改变层级（newParentFolderId）与同级顺序（afterFolderId，null=该层最前）。 */
+export async function moveFolder(
+  accountId: string,
+  folderId: string,
+  newParentFolderId: string | null,
+  afterFolderId: string | null,
+): Promise<Folder[]> {
+  return invoke<Folder[]>("move_folder", { accountId, folderId, newParentFolderId, afterFolderId });
+}
+
+export async function renameFolder(
+  accountId: string,
+  folderId: string,
+  newName: string,
+): Promise<Folder> {
+  return invoke<Folder>("rename_folder", { accountId, folderId, newName });
+}
+
+export async function deleteFolder(accountId: string, folderId: string): Promise<Folder[]> {
+  return invoke<Folder[]>("delete_folder", { accountId, folderId });
+}
+
+export async function markFolderAllRead(accountId: string, folderId: string): Promise<number> {
+  return invoke<number>("mark_folder_all_read", { accountId, folderId });
+}
+
 // ─── Message API ─────────────────────────────────────────────────────────────
 
 export async function listMessages(
@@ -270,8 +480,68 @@ export async function listMessages(
   limit: number,
   offset: number,
   folderIds?: string[],
+  cursor?: { date: number; id: string } | null,
 ): Promise<MessageSummary[]> {
-  return invoke<MessageSummary[]>("list_messages", { folderId, folderIds, limit, offset });
+  return invoke<MessageSummary[]>("list_messages", {
+    folderId,
+    folderIds,
+    limit,
+    offset,
+    cursorDate: cursor?.date ?? null,
+    cursorId: cursor?.id ?? null,
+  });
+}
+
+export async function searchLeadCompanies(
+  product: string,
+  market: string,
+  buyerType: string,
+  batchMode: boolean,
+): Promise<PublicCompanyMatch[]> {
+  return invoke<PublicCompanyMatch[]>("search_lead_companies", {
+    product, market, buyerType, batchMode,
+  });
+}
+
+export async function aiFindCompanyBatch(
+  product: string,
+  market: string,
+  buyerType: string,
+  focus: string,
+  exclusions: string[],
+): Promise<PublicCompanyMatch[]> {
+  return invoke<PublicCompanyMatch[]>("ai_find_company_batch", {
+    product, market, buyerType, focus, exclusions,
+  });
+}
+
+export async function enrichLeadCandidate(candidate: PublicCompanyMatch): Promise<PublicCompanyMatch> {
+  return invoke<PublicCompanyMatch>("enrich_lead_candidate", { candidate });
+}
+
+export async function summarizeLeadCandidates(candidates: PublicCompanyMatch[]): Promise<PublicCompanyMatch[]> {
+  return invoke<PublicCompanyMatch[]>("summarize_lead_candidates", { candidates });
+}
+
+export interface LeadFinderPersistedData {
+  searchSessions: unknown[];
+  savedLeads: unknown[];
+}
+
+export async function loadLeadFinderData(): Promise<LeadFinderPersistedData | null> {
+  return invoke<LeadFinderPersistedData | null>("load_lead_finder_data");
+}
+
+export async function saveLeadFinderData(data: LeadFinderPersistedData): Promise<void> {
+  return invoke<void>("save_lead_finder_data", { data });
+}
+
+/** "所有未读"视图：全部账户的未读邮件。 */
+export async function listUnreadMessages(
+  limit: number,
+  offset: number,
+): Promise<MessageSummary[]> {
+  return invoke<MessageSummary[]>("list_unread_messages", { limit, offset });
 }
 
 export async function listStarredMessages(
@@ -348,6 +618,14 @@ export async function emptyTrash(accountId: string): Promise<number> {
   return invoke<number>("empty_trash", { accountId });
 }
 
+export async function emptySpam(accountId: string): Promise<number> {
+  return invoke<number>("empty_spam", { accountId });
+}
+
+export async function emptyDrafts(accountId: string): Promise<number> {
+  return invoke<number>("empty_drafts", { accountId });
+}
+
 export async function getPendingMailOpsSummary(
   accountId: string | null,
 ): Promise<PendingMailOpsSummary> {
@@ -398,8 +676,9 @@ export async function isTrustedSender(accountId: string, email: string): Promise
 export async function searchMessages(
   query: string,
   limit?: number,
+  accountId?: string,
 ): Promise<SearchHit[]> {
-  return invoke<SearchHit[]>("search_messages", { query, limit });
+  return invoke<SearchHit[]>("search_messages", { query, limit, accountId });
 }
 
 export async function advancedSearch(
@@ -459,8 +738,34 @@ export async function getAttachmentPath(attachmentId: string): Promise<string | 
   return invoke<string | null>("get_attachment_path", { attachmentId });
 }
 
+export async function getAttachmentDragIconPath(): Promise<string> {
+  return invoke<string>("get_attachment_drag_icon_path");
+}
+
+export interface ReadAttachmentFileResult {
+  name: string;
+  mime_type: string;
+  bytes: number[];
+}
+
+export async function readAttachmentFile(attachmentId: string): Promise<ReadAttachmentFileResult> {
+  return invoke<ReadAttachmentFileResult>("read_attachment_file", { attachmentId });
+}
+
+export async function openAttachment(attachmentId: string): Promise<void> {
+  return invoke<void>("open_attachment", { attachmentId });
+}
+
 export async function downloadAttachment(attachmentId: string, saveTo: string): Promise<string> {
   return invoke<string>("download_attachment", { attachmentId, saveTo });
+}
+
+export async function saveAttachmentsAs(attachmentIds: string[]): Promise<string[]> {
+  return invoke<string[]>("save_attachments_as", { attachmentIds });
+}
+
+export async function copyAttachmentsToClipboard(attachmentIds: string[]): Promise<void> {
+  return invoke<void>("copy_attachments_to_clipboard", { attachmentIds });
 }
 
 // ─── Kanban API ──────────────────────────────────────────────────────────────
@@ -510,12 +815,12 @@ export async function listSnoozed(): Promise<SnoozedMessage[]> {
 
 // ─── Rules API ───────────────────────────────────────────────────────────────
 
-export async function createRule(name: string, priority: number, conditions: string, actions: string): Promise<Rule> {
-  return invoke<Rule>("create_rule", { name, priority, conditions, actions });
+export async function createRule(rule: Rule): Promise<Rule> {
+  return invoke<Rule>("create_rule", { rule });
 }
 
-export async function listRules(): Promise<Rule[]> {
-  return invoke<Rule[]>("list_rules");
+export async function listRules(accountId?: string): Promise<Rule[]> {
+  return invoke<Rule[]>("list_rules", { accountId: accountId ?? "" });
 }
 
 export async function updateRule(rule: Rule): Promise<void> {
@@ -524,6 +829,20 @@ export async function updateRule(rule: Rule): Promise<void> {
 
 export async function deleteRule(ruleId: string): Promise<void> {
   return invoke<void>("delete_rule", { ruleId });
+}
+
+/** 手动执行规则：对指定文件夹下的邮件套用规则。现在改为后台执行——命令立即返回，
+ * 实际进度通过事件 rules:apply-progress 推送，完成报告通过 rules:apply-done 推送。 */
+export async function applyRulesToFolder(
+  accountId: string,
+  folderId: string,
+  ruleIds?: string[],
+): Promise<void> {
+  await invoke<void>("apply_rules_to_folder", {
+    accountId,
+    folderId,
+    ruleIds: ruleIds ?? null,
+  });
 }
 
 // ─── Compose API ─────────────────────────────────────────────────────────────
@@ -582,6 +901,375 @@ export async function saveTranslateConfig(providerType: string, config: string, 
 
 export async function testTranslateConnection(config: string): Promise<string> {
   return invoke<string>("test_translate_connection", { config });
+}
+
+export interface ExternalServiceKeyStatus {
+  tavilyConfigured: boolean;
+  braveConfigured: boolean;
+  firecrawlConfigured: boolean;
+  hunterConfigured: boolean;
+  tavilyKeyCount: number;
+  braveKeyCount: number;
+  firecrawlKeyCount: number;
+  hunterKeyCount: number;
+}
+
+export interface ExternalServiceUsage {
+  provider: "tavily" | "brave" | "firecrawl" | "hunter";
+  supported: boolean;
+  valid: boolean;
+  used?: number | null;
+  limit?: number | null;
+  remaining?: number | null;
+  unit: string;
+  resetAt?: string | null;
+  message: string;
+  checkedAt: number;
+}
+
+export async function validateExternalServiceApiKey(provider: ExternalServiceUsage["provider"], apiKey: string): Promise<ExternalServiceUsage> {
+  return invoke<ExternalServiceUsage>("validate_external_service_api_key", { provider, apiKey });
+}
+
+export async function getExternalServiceUsage(provider: ExternalServiceUsage["provider"]): Promise<ExternalServiceUsage> {
+  return invoke<ExternalServiceUsage>("get_external_service_usage", { provider });
+}
+
+export async function getExternalServiceKeyStatus(): Promise<ExternalServiceKeyStatus> {
+  return invoke<ExternalServiceKeyStatus>("get_external_service_key_status");
+}
+
+export async function saveExternalServiceApiKey(provider: "tavily" | "brave" | "firecrawl" | "hunter", apiKey: string): Promise<ExternalServiceKeyStatus> {
+  return invoke<ExternalServiceKeyStatus>("save_external_service_api_key", { provider, apiKey });
+}
+
+export async function deleteExternalServiceApiKey(provider: "tavily" | "brave" | "firecrawl" | "hunter"): Promise<ExternalServiceKeyStatus> {
+  return invoke<ExternalServiceKeyStatus>("delete_external_service_api_key", { provider });
+}
+
+// ─── AI (外贸 AI 邮件客户端) API ────────────────────────────────────────────
+
+export interface ChatTurn {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+/** Single-shot AI completion. `system` sets the persona/instructions, `user` is the prompt. */
+export async function aiPrompt(system: string, user: string): Promise<string> {
+  return invoke<string>("ai_prompt", { system, user });
+}
+
+/** Multi-turn AI chat for iterative draft/reply refinement. */
+export async function aiChat(turns: ChatTurn[]): Promise<string> {
+  return invoke<string>("ai_chat", { turns });
+}
+
+/** Agent run with Tool Calling: the model can search the web / fetch pages
+ *  / query GLEIF on its own, then continue reasoning. */
+export async function agentRun(
+  system: string,
+  user: string,
+): Promise<{ content: string; sources: string[]; toolCalls: number }> {
+  return invoke<{ content: string; sources: string[]; toolCalls: number }>("agent_run", {
+    system,
+    user,
+  });
+}
+
+// ─── AI 写作风格 (Style Engine) API ────────────────────────────────────────
+
+export interface StyleProfile {
+  id: string;
+  name: string;
+  description: string;
+  profile: string;
+  isActive: boolean;
+  /** null/undefined means shared by all mailbox accounts */
+  accountIds?: string[] | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface StyleSample {
+  subject: string;
+  body: string;
+}
+
+/** List all writing-style profiles. */
+export async function listStyleProfiles(): Promise<StyleProfile[]> {
+  return invoke<StyleProfile[]>("list_style_profiles");
+}
+
+/** Create or update a style profile (upserted by id). */
+export async function saveStyleProfile(input: {
+  id?: string;
+  name: string;
+  description: string;
+  profile: string;
+  isActive?: boolean;
+  accountIds?: string[] | null;
+}): Promise<StyleProfile> {
+  return invoke<StyleProfile>("save_style_profile", { input });
+}
+
+/** Delete a style profile; returns the remaining profiles. */
+export async function deleteStyleProfile(id: string): Promise<StyleProfile[]> {
+  return invoke<StyleProfile[]>("delete_style_profile", { id });
+}
+
+/** Collect samples of the user's SENT emails for learning a style. */
+export async function getSentSamples(limit: number, accountId?: string | null): Promise<StyleSample[]> {
+  return invoke<StyleSample[]>("get_sent_samples", { limit, accountId: accountId ?? null });
+}
+
+export interface KnowledgeItem {
+  id: string;
+  name: string;
+  accountId?: string | null;
+  /** null/undefined means shared by all mailbox accounts */
+  accountIds?: string[] | null;
+  sourceType: string;
+  content: string;
+  createdAt: number;
+  updatedAt: number;
+  chunks: Array<{ id: string; content: string; locator: string; section: string; ordinal: number }>;
+}
+
+export interface KnowledgeSnippet {
+  id: string;
+  name: string;
+  content: string;
+  score: number;
+  chunkId: string;
+  sourceType: string;
+  locator: string;
+  section: string;
+}
+
+export async function listKnowledgeItems(accountId?: string | null): Promise<KnowledgeItem[]> {
+  return invoke<KnowledgeItem[]>("list_knowledge_items", { accountId: accountId ?? null });
+}
+
+export async function saveKnowledgeItem(input: {
+  id?: string;
+  name: string;
+  accountId?: string | null;
+  accountIds?: string[] | null;
+  sourceType?: string;
+  content: string;
+}): Promise<KnowledgeItem> {
+  return invoke<KnowledgeItem>("save_knowledge_item", { input });
+}
+
+export async function deleteKnowledgeItem(id: string): Promise<void> {
+  return invoke<void>("delete_knowledge_item", { id });
+}
+
+export async function searchKnowledgeBase(query: string, limit = 3, accountId?: string | null): Promise<KnowledgeSnippet[]> {
+  return invoke<KnowledgeSnippet[]>("search_knowledge_base", { query, limit, accountId: accountId ?? null });
+}
+
+// ─── 客户记忆 (Customer Memory) API ──────────────────────────────────────────
+
+export interface FollowUpEntry {
+  id: string;
+  date: number;
+  channel: string;
+  note: string;
+}
+
+export interface FollowUpSequenceStep {
+  id: string;
+  dayOffset: number;
+  title: string;
+  instruction: string;
+  status: "pending" | "draft_ready" | "completed" | "skipped";
+  dueAt: number;
+}
+
+export interface CustomerMemory {
+  id: string;
+  email: string;
+  name: string;
+  company: string;
+  summary: string;
+  /** Detailed structured context used as AI grounding when drafting. */
+  profile: string;
+  messageCount: number;
+  contacts: Array<{
+    email: string;
+    name: string;
+    jobTitle: string;
+  }>;
+  /** Manual tag: where this customer came from (展会/社媒/谷歌开发...). */
+  source: string;
+  /** Manual tag: current development stage (开发中/已成交...). */
+  status: string;
+  /** Follow-up stage (mutually exclusive). */
+  stage: string;
+  /** Characteristic tags (multi-select). */
+  tags: string[];
+  /** Customer tier: A / B / C. */
+  tier: string;
+  /** Unix seconds of next scheduled follow-up (0 = none). */
+  nextFollowUp: number;
+  /** Follow-up timeline. */
+  followUps: FollowUpEntry[];
+  /** 接触过该客户的账号（生成记忆时从往来邮件记录；空 = 旧数据/未知） */
+  accountIds?: string[];
+  followUpSequence: FollowUpSequenceStep[];
+  followUpSequencePaused: boolean;
+  updatedAt: number;
+}
+
+/** List all customer memories. */
+export async function listCustomerMemories(): Promise<CustomerMemory[]> {
+  return invoke<CustomerMemory[]>("list_customer_memories");
+}
+
+/** Create or update a customer memory (upserted by id / email). */
+export async function saveCustomerMemory(input: {
+  id?: string;
+  email: string;
+  name?: string;
+  company?: string;
+  summary?: string;
+  profile?: string;
+  source?: string;
+  status?: string;
+  stage?: string;
+  tags?: string[];
+  tier?: string;
+  nextFollowUp?: number;
+  followUps?: FollowUpEntry[];
+  accountIds?: string[];
+  followUpSequence?: FollowUpSequenceStep[];
+  followUpSequencePaused?: boolean;
+}): Promise<CustomerMemory> {
+  return invoke<CustomerMemory>("save_customer_memory", { input });
+}
+
+/** Delete a customer memory; returns the remaining memories. */
+export async function deleteCustomerMemory(id: string): Promise<CustomerMemory[]> {
+  return invoke<CustomerMemory[]>("delete_customer_memory", { id });
+}
+
+/** Build a temp .eml file for "forward as attachment"; returns file path. */
+export async function buildForwardEml(messageId: string): Promise<string> {
+  return invoke<string>("build_forward_eml", { messageId });
+}
+
+/** Export a message as .eml via save dialog; returns saved path. */
+export async function exportMessageEml(messageId: string): Promise<string> {
+  return invoke<string>("export_message_eml", { messageId });
+}
+
+/** Build / refresh a customer memory from email history with `email`.
+ *  `existingProfile` 传入后为增量更新（保留原有画像有效信息，按新邮件补充修正）。 */
+export async function buildCustomerMemory(email: string, limit: number, existingProfile?: string): Promise<CustomerMemory> {
+  return invoke<CustomerMemory>("build_customer_memory", { email, limit, existingProfile });
+}
+
+// ─── 发送防呆 (Send Guard) API ────────────────────────────────────────────────
+
+export type ContactRole =
+  | "customer"
+  | "supplier"
+  /** Freight forwarder, customs broker, certification/inspection body, bank, platform. */
+  | "service"
+  | "neutral"
+  | "unknown";
+export type RoleSource = "manual" | "inferred" | "imported";
+export type GuardMode = "soft" | "strict";
+
+export interface SendGuardConfig {
+  enabled: boolean;
+  mode: GuardMode;
+}
+
+export interface ContactRoleEntry {
+  email: string;
+  role: ContactRole;
+  source: RoleSource;
+  /** 0..1 confidence of the inferred role (1 for manual). */
+  confidence?: number;
+  /** Short human-readable reasons behind the classification. */
+  reasons?: string[];
+  /** Unix seconds when this entry was last computed. */
+  inferredAt?: number;
+}
+
+export interface RecipientRole {
+  email: string;
+  role: ContactRole;
+}
+
+export interface SendGuardVerdict {
+  /** "ok" | "warn" | "block" */
+  level: string;
+  reasons: string[];
+  recipients: RecipientRole[];
+  /** "customer" | "supplier" | "unknown" — what the draft looks intended for. */
+  draftIntent?: string;
+}
+
+export async function getSendGuardConfig(): Promise<SendGuardConfig> {
+  return invoke<SendGuardConfig>("get_send_guard_config");
+}
+
+export async function setSendGuardConfig(config: SendGuardConfig): Promise<SendGuardConfig> {
+  return invoke<SendGuardConfig>("set_send_guard_config", { config });
+}
+
+export async function listContactRoles(): Promise<ContactRoleEntry[]> {
+  return invoke<ContactRoleEntry[]>("list_contact_roles");
+}
+
+export async function setContactRole(email: string, role: ContactRole): Promise<ContactRoleEntry[]> {
+  return invoke<ContactRoleEntry[]>("set_contact_role", { email, role });
+}
+
+export async function deleteContactRole(email: string): Promise<ContactRoleEntry[]> {
+  return invoke<ContactRoleEntry[]>("delete_contact_role", { email });
+}
+
+export async function inferContactRole(
+  accountId: string,
+  email: string,
+): Promise<ContactRoleEntry> {
+  return invoke<ContactRoleEntry>("infer_contact_role", { accountId, email });
+}
+
+export async function importCustomerRoles(): Promise<ContactRoleEntry[]> {
+  return invoke<ContactRoleEntry[]>("import_customer_roles");
+}
+
+/** Lightweight, AI-free classification of ALL contacts from their email addresses. */
+export async function autoClassifyContacts(accountId: string): Promise<ContactRoleEntry[]> {
+  return invoke<ContactRoleEntry[]>("auto_classify_contacts", { accountId });
+}
+
+/** Full multi-dimensional AI inference for ALL contacts (costs API calls). */
+export async function inferAllContactRoles(accountId: string): Promise<ContactRoleEntry[]> {
+  return invoke<ContactRoleEntry[]>("infer_all_contact_roles", { accountId });
+}
+
+export async function checkSendGuard(params: {
+  accountId: string;
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  subject: string;
+  bodyText: string;
+}): Promise<SendGuardVerdict> {
+  return invoke<SendGuardVerdict>("check_send_guard", {
+    accountId: params.accountId,
+    to: params.to,
+    cc: params.cc,
+    bcc: params.bcc,
+    subject: params.subject,
+    bodyText: params.bodyText,
+  });
 }
 
 // ─── Thread API ──────────────────────────────────────────────────────────────
@@ -694,7 +1382,60 @@ export async function searchContacts(
   return invoke<KnownContact[]>("search_contacts", { accountId, query, limit });
 }
 
+export interface AddressBookContact {
+  id: string;
+  email: string;
+  name: string;
+  company: string;
+  jobTitle: string;
+  role: ContactRole;
+  notes: string;
+  tags: string[];
+  createdAt: number;
+  updatedAt: number;
+  /** 归属账号（从该账号的往来邮件导入时记录；null = 未归属/手动添加） */
+  accountId?: string | null;
+}
+
+export async function listAddressBookContacts(): Promise<AddressBookContact[]> {
+  return invoke<AddressBookContact[]>("list_address_book_contacts");
+}
+
+export async function saveAddressBookContact(input: {
+  id?: string;
+  email: string;
+  name?: string;
+  company?: string;
+  jobTitle?: string;
+  role?: ContactRole;
+  notes?: string;
+  tags?: string[];
+  accountId?: string | null;
+}): Promise<AddressBookContact> {
+  return invoke<AddressBookContact>("save_address_book_contact", { input });
+}
+
+export async function deleteAddressBookContact(id: string): Promise<void> {
+  return invoke<void>("delete_address_book_contact", { id });
+}
+
+export async function importMailContactsToAddressBook(accountId: string): Promise<number> {
+  return invoke<number>("import_mail_contacts_to_address_book", { accountId });
+}
+
 // ─── Drafts API ──────────────────────────────────────────────────────────────
+
+/** 在独立窗口中打开写信界面（多窗口模式）。prefill 会序列化传给新窗口。 */
+export async function openComposeWindow(prefill?: {
+  to?: string[];
+  cc?: string[];
+  bcc?: string[];
+  subject?: string;
+  body?: string;
+}): Promise<void> {
+  const json = prefill ? JSON.stringify(prefill) : undefined;
+  await invoke("open_compose_window", { prefill: json });
+}
 
 export async function saveDraft(args: {
   accountId: string;

@@ -1,4 +1,6 @@
 use crate::{events, state::AppState};
+use std::collections::{HashMap, HashSet};
+
 use pebble_core::traits::{FolderProvider, LabelProvider, MailTransport};
 use pebble_core::{FolderRole, Message, PebbleError, ProviderType};
 use pebble_store::pending_ops::{PendingMailOp, PendingMailOpsSummary};
@@ -15,7 +17,76 @@ use super::messages::{
 };
 
 const WORKER_INTERVAL_SECS: u64 = 30;
-const WORKER_BATCH_LIMIT: i64 = 20;
+const WORKER_BATCH_LIMIT: i64 = 100;
+
+async fn rebind_imap_destination_uid(
+    state: &AppState,
+    imap: &pebble_mail::ImapProvider,
+    message: &pebble_core::Message,
+    target_remote_id: &str,
+) -> std::result::Result<(), PebbleError> {
+    let Some(message_id_header) = message.message_id_header.as_deref() else {
+        return Ok(());
+    };
+    let destination_uid = imap
+        .find_uid_by_message_id(target_remote_id, message_id_header)
+        .await?
+        .ok_or_else(|| {
+            PebbleError::Sync(format!(
+                "Destination UID for moved message {} is not visible yet",
+                message.id
+            ))
+        })?;
+    persist_imap_destination_uid(state, message, target_remote_id, destination_uid)?;
+    Ok(())
+}
+
+fn persist_imap_destination_uid(
+    state: &AppState,
+    message: &pebble_core::Message,
+    target_remote_id: &str,
+    destination_uid: u32,
+) -> std::result::Result<(), PebbleError> {
+    let target_folder = state
+        .store
+        .list_folders(&message.account_id)?
+        .into_iter()
+        .find(|folder| folder.remote_id == target_remote_id)
+        .ok_or_else(|| {
+            PebbleError::Internal(format!(
+                "Destination folder {target_remote_id} is missing locally"
+            ))
+        })?;
+    let Some(message_id_header) = message.message_id_header.as_deref() else {
+        state
+            .store
+            .update_remote_id(&message.id, &destination_uid.to_string())?;
+        return Ok(());
+    };
+    let canonical = state
+        .store
+        .reconcile_moved_message_by_header(
+            &message.account_id,
+            &target_folder.id,
+            message_id_header,
+            &destination_uid.to_string(),
+            Some(&message.id),
+        )?
+        .ok_or_else(|| {
+            PebbleError::Internal(format!(
+                "Moved message {} is missing from local destination folder",
+                message.id
+            ))
+        })?;
+    if canonical != message.id {
+        debug!(
+            original_message_id = %message.id,
+            canonical_message_id = %canonical,
+            "completed moved-message reconciliation using a replacement local row"
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PendingMailOpsSummaryResponse {
@@ -143,12 +214,16 @@ pub async fn process_pending_mail_ops(
         .list_retryable_pending_mail_ops(WORKER_BATCH_LIMIT)?;
     let mut changed = false;
     let mut completed = 0usize;
+    // Reuse one authenticated IMAP session per account for the whole pass.
+    // Rule runs can enqueue hundreds of moves; reconnecting for every message
+    // turns a small batch into minutes of TLS/login overhead.
+    let mut imap_connections: HashMap<String, pebble_mail::ImapProvider> = HashMap::new();
 
     for op in ops {
         state.store.mark_pending_mail_op_in_progress(&op.id)?;
         changed = true;
 
-        match replay_pending_mail_op(state, &op).await {
+        match replay_pending_mail_op(state, &op, &mut imap_connections).await {
             Ok(()) => {
                 state.store.mark_pending_mail_op_done(&op.id)?;
                 completed += 1;
@@ -168,6 +243,10 @@ pub async fn process_pending_mail_ops(
                 warn!("Pending mail op {} retry failed: {e}", op.id);
             }
         }
+    }
+
+    for provider in imap_connections.into_values() {
+        let _ = provider.disconnect().await;
     }
 
     if changed {
@@ -207,6 +286,7 @@ fn emit_pending_ops_changed(app: Option<&tauri::AppHandle>) {
 async fn replay_pending_mail_op(
     state: &AppState,
     op: &PendingMailOp,
+    imap_connections: &mut HashMap<String, pebble_mail::ImapProvider>,
 ) -> std::result::Result<(), PebbleError> {
     let Some(message) = state.store.get_message(&op.message_id)? else {
         debug!("Pending mail op {} skipped because message is gone", op.id);
@@ -216,6 +296,19 @@ async fn replay_pending_mail_op(
         debug!("Pending mail op {} skipped because account is gone", op.id);
         return Ok(());
     };
+
+    // Imported/local messages do not have a provider-side identifier. Older
+    // builds queued remote flag/move operations for them anyway, which can
+    // never succeed and caused an ever-growing "remote writes" counter.
+    // Local state was already applied when the action was initiated, so the
+    // safe recovery is to acknowledge the impossible remote replay.
+    if message.remote_id.trim().is_empty() {
+        debug!(
+            "Pending mail op {} completed locally because message {} has no remote id",
+            op.id, message.id
+        );
+        return Ok(());
+    }
 
     let payload = op_payload(op)?;
     match op.op_type.as_str() {
@@ -245,7 +338,32 @@ async fn replay_pending_mail_op(
             replay_remote_delete(state, account.provider, &message, &payload, true).await?;
         }
         "move_to_folder" => {
-            replay_remote_move_to_folder(state, account.provider, &message, &payload).await?;
+            if account.provider == ProviderType::Imap {
+                if !imap_connections.contains_key(&account.id) {
+                    let provider = connect_imap(state, &account.id).await?;
+                    imap_connections.insert(account.id.clone(), provider);
+                }
+                let imap = imap_connections
+                    .get(&account.id)
+                    .expect("IMAP connection inserted above");
+                replay_remote_move_to_folder(
+                    state,
+                    account.provider,
+                    &message,
+                    &payload,
+                    Some(imap),
+                )
+                .await?;
+            } else {
+                replay_remote_move_to_folder(
+                    state,
+                    account.provider,
+                    &message,
+                    &payload,
+                    None,
+                )
+                .await?;
+            }
         }
         "send" => {
             replay_remote_send(state, account.provider.clone(), &account, &message).await?;
@@ -379,6 +497,16 @@ async fn replay_remote_archive(
                     message.message_id_header.as_deref(),
                 )
                 .await;
+            let result = match result {
+                Ok(()) => rebind_imap_destination_uid(
+                    state,
+                    &imap,
+                    message,
+                    &target_remote_id,
+                )
+                .await,
+                Err(error) => Err(error),
+            };
             let _ = imap.disconnect().await;
             result
         }
@@ -437,6 +565,16 @@ async fn replay_remote_restore(
                     message.message_id_header.as_deref(),
                 )
                 .await;
+            let result = match result {
+                Ok(()) => rebind_imap_destination_uid(
+                    state,
+                    &imap,
+                    message,
+                    &target_remote_id,
+                )
+                .await,
+                Err(error) => Err(error),
+            };
             let _ = imap.disconnect().await;
             result
         }
@@ -478,6 +616,7 @@ async fn replay_remote_delete(
             let source_remote_id = source_folder_remote_id(state, message, payload)?;
             let uid = parse_uid(message)?;
             let imap = connect_imap(state, &message.account_id).await?;
+            let mut moved_target: Option<String> = None;
             let result = if permanent {
                 imap.delete_message(&source_remote_id, uid).await
             } else if let Some(trash_remote_id) = string_field(payload, "trash_folder_remote_id")
@@ -490,6 +629,7 @@ async fn replay_remote_delete(
                 if trash_remote_id == source_remote_id {
                     imap.delete_message(&source_remote_id, uid).await
                 } else {
+                    moved_target = Some(trash_remote_id.clone());
                     imap.move_message_with_dedup(
                         &source_remote_id,
                         uid,
@@ -501,6 +641,12 @@ async fn replay_remote_delete(
             } else {
                 imap.delete_message(&source_remote_id, uid).await
             };
+            let result = match (result, moved_target.as_deref()) {
+                (Ok(()), Some(target_remote_id)) => {
+                    rebind_imap_destination_uid(state, &imap, message, target_remote_id).await
+                }
+                (result, _) => result,
+            };
             let _ = imap.disconnect().await;
             result
         }
@@ -508,11 +654,101 @@ async fn replay_remote_delete(
     }
 }
 
+/// Locate the message by Message-ID before moving it. IMAP UIDs are scoped to
+/// a mailbox, and a locally moved row may still carry its old source UID.
+/// Returning `None` means the message is already present in the destination.
+async fn locate_imap_move_source(
+    state: &AppState,
+    imap: &pebble_mail::ImapProvider,
+    message: &pebble_core::Message,
+    payload: &Value,
+    target_remote_id: &str,
+) -> std::result::Result<Option<(String, u32)>, PebbleError> {
+    let Some(message_id_header) = message
+        .message_id_header
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(Some((
+            source_folder_remote_id(state, message, payload)?,
+            parse_uid(message)?,
+        )));
+    };
+
+    if let Some(destination_uid) = imap
+        .find_uid_by_message_id(target_remote_id, message_id_header)
+        .await?
+    {
+        persist_imap_destination_uid(
+            state,
+            message,
+            target_remote_id,
+            destination_uid,
+        )?;
+        return Ok(None);
+    }
+
+    let account = state.store.get_account(&message.account_id)?;
+    let sent_first = account
+        .as_ref()
+        .is_some_and(|account| message.from_address.eq_ignore_ascii_case(&account.email));
+    let mut folders = state.store.list_folders(&message.account_id)?;
+    folders.sort_by_key(|folder| {
+        if sent_first && folder.role == Some(FolderRole::Sent) {
+            0
+        } else if !sent_first && folder.role == Some(FolderRole::Inbox) {
+            0
+        } else if matches!(folder.role, Some(FolderRole::Inbox | FolderRole::Sent)) {
+            1
+        } else if folder.role == Some(FolderRole::Archive) {
+            2
+        } else if folder.role.is_none() {
+            3
+        } else {
+            4
+        }
+    });
+
+    let mut candidates = Vec::new();
+    if let Ok(source) = source_folder_remote_id(state, message, payload) {
+        candidates.push(source);
+    }
+    candidates.extend(folders.into_iter().map(|folder| folder.remote_id));
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if candidate == target_remote_id
+            || candidate.starts_with("__local_")
+            || !seen.insert(candidate.clone())
+        {
+            continue;
+        }
+        match imap
+            .find_uid_by_message_id(&candidate, message_id_header)
+            .await
+        {
+            Ok(Some(uid)) => return Ok(Some((candidate, uid))),
+            Ok(None) => {}
+            Err(error) => {
+                debug!(
+                    "Skipping IMAP source candidate {} for moved message {}: {}",
+                    candidate, message.id, error
+                );
+            }
+        }
+    }
+
+    Err(PebbleError::Sync(format!(
+        "Cannot locate message {} in any source mailbox by Message-ID",
+        message.id
+    )))
+}
+
 async fn replay_remote_move_to_folder(
     state: &AppState,
     provider_type: ProviderType,
     message: &pebble_core::Message,
     payload: &Value,
+    shared_imap: Option<&pebble_mail::ImapProvider>,
 ) -> std::result::Result<(), PebbleError> {
     match provider_type {
         ProviderType::Gmail => {
@@ -539,20 +775,40 @@ async fn replay_remote_move_to_folder(
             Ok(())
         }
         ProviderType::Imap => {
-            let source_remote_id = source_folder_remote_id(state, message, payload)?;
             let target_remote_id =
                 target_folder_remote_id(state, message, payload, FolderRole::Inbox)?;
-            let uid = parse_uid(message)?;
-            let imap = connect_imap(state, &message.account_id).await?;
-            let result = imap
-                .move_message_with_dedup(
-                    &source_remote_id,
-                    uid,
-                    &target_remote_id,
-                    message.message_id_header.as_deref(),
-                )
-                .await;
-            let _ = imap.disconnect().await;
+            let owned_imap = if shared_imap.is_none() {
+                Some(connect_imap(state, &message.account_id).await?)
+            } else {
+                None
+            };
+            let imap = shared_imap
+                .or(owned_imap.as_ref())
+                .expect("shared or owned IMAP connection");
+            let result = match locate_imap_move_source(
+                state,
+                imap,
+                message,
+                payload,
+                &target_remote_id,
+            )
+            .await?
+            {
+                None => Ok(()),
+                Some((source_remote_id, uid)) => {
+                    imap.move_message_with_dedup(
+                        &source_remote_id,
+                        uid,
+                        &target_remote_id,
+                        message.message_id_header.as_deref(),
+                    )
+                    .await?;
+                    rebind_imap_destination_uid(state, imap, message, &target_remote_id).await
+                }
+            };
+            if let Some(imap) = owned_imap {
+                let _ = imap.disconnect().await;
+            }
             result
         }
         ProviderType::Pop3 => Ok(()),
@@ -587,7 +843,18 @@ async fn replay_remote_send(
                 .await
         }
         ProviderType::Imap | ProviderType::Pop3 => {
-            compose::send_imap_smtp_message(state, account, &outgoing).await
+            // 重试发送也用统一 Message-ID，成功后再存"已发送"副本时保持一致。
+            let message_id = compose::send_imap_smtp_message(state, account, &outgoing).await?;
+            let mut sent_outgoing = outgoing;
+            sent_outgoing.message_id = Some(message_id);
+            let _ = compose::save_outgoing_message_and_refresh_search(
+                state,
+                account,
+                &sent_outgoing,
+                compose::LocalOutgoingState::Sent,
+                &state.attachments_dir,
+            );
+            Ok(())
         }
     }
 }

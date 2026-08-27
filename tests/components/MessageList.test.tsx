@@ -195,6 +195,23 @@ describe("MessageList", () => {
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
   });
 
+  it("offers a manual pagination fallback and loads the next page", () => {
+    const onLoadMore = vi.fn();
+    render(
+      <MessageList
+        messages={Array.from({ length: 50 }, (_, index) => makeMessage(`m-${index + 1}`))}
+        selectedMessageId={null}
+        onSelectMessage={vi.fn()}
+        loading={false}
+        onLoadMore={onLoadMore}
+        hasNextPage
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "加载更多邮件" }));
+    expect(onLoadMore).toHaveBeenCalled();
+  });
+
   it("passes the active folder role to message items", () => {
     render(
       <MessageList

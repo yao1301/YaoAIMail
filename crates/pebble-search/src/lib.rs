@@ -54,6 +54,10 @@ fn schema_needs_rebuild(existing_schema: &Schema) -> bool {
             schema::NGRAM_TOKENIZER,
             false,
         )
+        || existing_schema
+            .get_field("has_attachment")
+            .map(|field| !existing_schema.get_field_entry(field).is_stored())
+            .unwrap_or(true)
 }
 
 fn make_snippet(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {
@@ -73,6 +77,7 @@ pub struct AdvancedSearchParams<'a> {
     pub date_from: Option<i64>,
     pub date_to: Option<i64>,
     pub has_attachment: Option<bool>,
+    pub account_id: Option<&'a str>,
     pub folder_id: Option<&'a str>,
     pub limit: usize,
 }
@@ -359,6 +364,14 @@ impl TantivySearch {
                 .get_first(ss.date)
                 .and_then(|v| v.as_datetime())
                 .map(|dt| dt.into_timestamp_secs());
+            let has_attachment = doc
+                .get_first(ss.has_attachment)
+                .and_then(|v| v.as_str())
+                .map(|value| value == "true");
+            let folder_ids = doc
+                .get_all(ss.folder_id)
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect();
 
             hits.push(SearchHit {
                 message_id,
@@ -367,6 +380,8 @@ impl TantivySearch {
                 subject,
                 from_address,
                 date,
+                has_attachment,
+                folder_ids,
             });
         }
 
@@ -382,6 +397,7 @@ impl TantivySearch {
             date_from,
             date_to,
             has_attachment,
+            account_id,
             folder_id,
             limit,
         } = params;
@@ -456,6 +472,16 @@ impl TantivySearch {
             sub_queries.push((Occur::Must, Box::new(term_query)));
         }
 
+        // Account filter. This scopes the query to every indexed folder that
+        // belongs to the selected account; folder_id can still narrow it down.
+        if let Some(aid) = account_id {
+            if !aid.is_empty() {
+                let term = Term::from_field_text(ss.account_id, aid);
+                let term_query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+                sub_queries.push((Occur::Must, Box::new(term_query)));
+            }
+        }
+
         // Folder filter
         if let Some(fid) = folder_id {
             if !fid.is_empty() {
@@ -502,6 +528,14 @@ impl TantivySearch {
                 .get_first(ss.date)
                 .and_then(|v| v.as_datetime())
                 .map(|dt| dt.into_timestamp_secs());
+            let has_attachment = doc
+                .get_first(ss.has_attachment)
+                .and_then(|v| v.as_str())
+                .map(|value| value == "true");
+            let folder_ids = doc
+                .get_all(ss.folder_id)
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect();
 
             hits.push(SearchHit {
                 message_id,
@@ -510,6 +544,8 @@ impl TantivySearch {
                 subject,
                 from_address,
                 date,
+                has_attachment,
+                folder_ids,
             });
         }
 
@@ -618,6 +654,33 @@ mod tests {
     }
 
     #[test]
+    fn test_search_can_scope_all_folders_to_one_account() {
+        let engine = TantivySearch::open_in_memory().unwrap();
+        let first = make_test_message("account-1-inbox", "Shared quotation", "same product", "one@example.com");
+        let mut second = make_test_message("account-2-sent", "Shared quotation", "same product", "two@example.com");
+        second.account_id = "account-2".to_string();
+        engine.index_message(&first, &["inbox-a".to_string()]).unwrap();
+        engine.index_message(&second, &["sent-b".to_string()]).unwrap();
+        engine.commit().unwrap();
+
+        let hits = engine.advanced_search(AdvancedSearchParams {
+            text: Some("quotation"),
+            from: None,
+            to: None,
+            subject: None,
+            date_from: None,
+            date_to: None,
+            has_attachment: None,
+            account_id: Some("account-2"),
+            folder_id: None,
+            limit: 10,
+        }).unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "account-2-sent");
+    }
+
+    #[test]
     fn test_subject_search_is_case_insensitive() {
         let engine = TantivySearch::open_in_memory().unwrap();
         let msg = make_test_message(
@@ -642,6 +705,7 @@ mod tests {
                 date_from: None,
                 date_to: None,
                 has_attachment: None,
+                account_id: None,
                 folder_id: None,
                 limit: 10,
             })
@@ -816,6 +880,7 @@ mod tests {
                 date_from: None,
                 date_to: None,
                 has_attachment: None,
+                account_id: None,
                 folder_id: Some("inbox"),
                 limit: 10,
             })
@@ -964,6 +1029,7 @@ mod tests {
                 date_from: None,
                 date_to: None,
                 has_attachment: None,
+                account_id: None,
                 folder_id: None,
                 limit: 10,
             })

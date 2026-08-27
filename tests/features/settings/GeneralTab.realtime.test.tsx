@@ -9,6 +9,12 @@ vi.mock("../../../src/lib/api", () => ({
   openDefaultMailSettings: vi.fn().mockResolvedValue(undefined),
   getAutostartEnabled: vi.fn().mockResolvedValue(false),
   setAutostartEnabled: vi.fn().mockResolvedValue(undefined),
+  getProfileLocation: vi.fn().mockResolvedValue({
+    path: "D:\\MailData",
+    isCustom: true,
+  }),
+  chooseProfileLocation: vi.fn(),
+  resetProfileLocation: vi.fn(),
 }));
 
 vi.mock("react-i18next", () => ({

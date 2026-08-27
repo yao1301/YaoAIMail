@@ -1,6 +1,5 @@
-import { Reply, ReplyAll, Forward, Star, Archive, Trash2, LayoutGrid, RotateCcw } from "lucide-react";
+import { Reply, ReplyAll, Forward, Star, Archive, Trash2, RotateCcw } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useKanbanStore } from "@/stores/kanban.store";
 import { useToastStore } from "@/stores/toast.store";
 import { useTranslation } from "react-i18next";
 import { useUpdateFlagsMutation } from "@/hooks/mutations/useUpdateFlagsMutation";
@@ -12,7 +11,7 @@ import {
   snapshotMessagesCache,
   restoreMessagesCache,
 } from "@/hooks/queries";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import ConfirmDialog from "./ConfirmDialog";
 
 interface Props {
@@ -32,8 +31,6 @@ export default function MessageActionToolbar({
   const openCompose = useComposeStore((s) => s.openCompose);
   const queryClient = useQueryClient();
   const flagsMutation = useUpdateFlagsMutation();
-  const inKanban = useKanbanStore((s) => s.cardIdSet.has(message.id));
-  const [showKanbanPicker, setShowKanbanPicker] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   function invalidateMessageViews(includeUnreadCounts = false) {
@@ -41,35 +38,6 @@ export default function MessageActionToolbar({
     queryClient.invalidateQueries({ queryKey: ["threads"] });
     if (includeUnreadCounts) {
       queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
-    }
-  }
-
-  useEffect(() => {
-    if (!showKanbanPicker) return;
-    function handleClick() { setShowKanbanPicker(false); }
-    // Delay to avoid catching the same click that opened the picker
-    const timer = setTimeout(() => {
-      document.addEventListener("click", handleClick);
-    }, 0);
-    return () => {
-      clearTimeout(timer);
-      document.removeEventListener("click", handleClick);
-    };
-  }, [showKanbanPicker]);
-
-  async function handleAddToKanban(column: "todo" | "waiting" | "done") {
-    setShowKanbanPicker(false);
-    try {
-      await useKanbanStore.getState().addCard(message.id, column);
-      useToastStore.getState().addToast({
-        message: t("messageActions.kanbanSuccess", "Added to kanban board"),
-        type: "success",
-      });
-    } catch {
-      useToastStore.getState().addToast({
-        message: t("messageActions.kanbanFailed", "Failed to add to kanban"),
-        type: "error",
-      });
     }
   }
 
@@ -186,74 +154,6 @@ export default function MessageActionToolbar({
             <Icon size={16} />
           </button>
         ))}
-        {/* Kanban button + picker */}
-        <div style={{ position: "relative" }}>
-          <button
-            onClick={() => setShowKanbanPicker(true)}
-            title={t("messageActions.addToKanban")}
-            aria-label={t("messageActions.addToKanban")}
-            style={{
-              background: "none",
-              border: "none",
-              cursor: "pointer",
-              padding: "6px 8px",
-              borderRadius: "4px",
-              color: inKanban ? "var(--color-accent)" : "var(--color-text-secondary)",
-              display: "flex",
-              alignItems: "center",
-              transition: "background-color 0.12s ease, color 0.12s ease",
-            }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = "var(--color-bg-hover)"; }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = "transparent"; }}
-          >
-            <LayoutGrid size={16} />
-          </button>
-          {showKanbanPicker && (
-            <div
-              onClick={(e) => e.stopPropagation()}
-              style={{
-                position: "absolute",
-                right: "0px",
-                top: "100%",
-                marginTop: "4px",
-                backgroundColor: "var(--color-bg)",
-                border: "1px solid var(--color-border)",
-                borderRadius: "8px",
-                boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
-                padding: "4px",
-                zIndex: 10,
-                minWidth: "140px",
-              }}
-            >
-              {([
-                { col: "todo" as const, label: t("kanban.todo", "To Do") },
-                { col: "waiting" as const, label: t("kanban.waiting", "Waiting") },
-                { col: "done" as const, label: t("kanban.done", "Done") },
-              ]).map(({ col, label }) => (
-                <button
-                  key={col}
-                  onClick={() => handleAddToKanban(col)}
-                  style={{
-                    display: "block",
-                    width: "100%",
-                    padding: "8px 12px",
-                    border: "none",
-                    background: "transparent",
-                    cursor: "pointer",
-                    fontSize: "13px",
-                    color: "var(--color-text-primary)",
-                    borderRadius: "4px",
-                    textAlign: "left",
-                  }}
-                  onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = "var(--color-bg-hover)"; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = "transparent"; }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
       </div>
 
       {showDeleteConfirm && (

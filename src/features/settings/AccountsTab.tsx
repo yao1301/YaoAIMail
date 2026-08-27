@@ -6,6 +6,7 @@ import type { TFunction } from "i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   deleteAccount,
+  getAccountDetails,
   getImapSyncFolders,
   getOAuthAccountProxySetting,
   testAccountConnection,
@@ -26,9 +27,22 @@ import { useUIStore, type RealtimeStatus } from "@/stores/ui.store";
 import { useToastStore } from "@/stores/toast.store";
 import AccountSetup from "@/components/AccountSetup";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
-import { getSignature, setSignature } from "@/lib/signatures";
+import { listEmailSignatures, saveEmailSignature, deleteEmailSignature, setDefaultEmailSignature, type EmailSignature } from "@/lib/signatures";
+import SignatureEditor from "./SignatureEditor";
 import { ACCOUNT_COLOR_PRESETS, assignAccountColors, getAccountColor } from "@/lib/accountColors";
 import { inputStyle, labelStyle } from "../../styles/form";
+import {
+  getAccountSyncPreference,
+  setAccountSyncPreference,
+  type AccountSyncPreference,
+} from "@/lib/accountSyncPreferences";
+
+const ACCOUNT_SYNC_OPTIONS: Array<{ value: AccountSyncPreference; label: string }> = [
+  { value: "realtime", label: "实时（约 3 秒）" },
+  { value: "balanced", label: "平衡（15 秒）" },
+  { value: "battery", label: "省电（60 秒）" },
+  { value: "manual", label: "仅手动收取" },
+];
 
 export default function AccountsTab() {
   const { t } = useTranslation();
@@ -36,11 +50,27 @@ export default function AccountsTab() {
   const { data: accounts = [] } = useAccountsQuery();
   const accountColorsById = useMemo(() => assignAccountColors(accounts), [accounts]);
   const realtimeStatusByAccount = useUIStore((state) => state.realtimeStatusByAccount);
+  const globalRealtimeMode = useUIStore((state) => state.realtimeMode);
+  const focusAccountId = useUIStore((s) => s.focusAccountId);
+  const setFocusAccountId = useUIStore((s) => s.setFocusAccountId);
   const [showSetup, setShowSetup] = useState(false);
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; email: string } | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ id: string; ok: boolean; message: string } | null>(null);
+  const [changingSyncId, setChangingSyncId] = useState<string | null>(null);
+  const [, setSyncPreferenceVersion] = useState(0);
+
+  // When the sidebar's account context menu picks "账户设置", open the edit
+  // dialog directly for that account.
+  useEffect(() => {
+    if (!focusAccountId) return;
+    const target = accounts.find((a) => a.id === focusAccountId);
+    if (target) {
+      setEditingAccount(target);
+    }
+    setFocusAccountId(null);
+  }, [focusAccountId, accounts, setFocusAccountId]);
 
   async function doTestConnection(accountId: string) {
     setTestingId(accountId);
@@ -73,6 +103,25 @@ export default function AccountsTab() {
         message: t("settings.deleteAccountFailed", "Failed to remove account: {{error}}", { error: msg }),
         type: "error",
       });
+    }
+  }
+
+  async function changeAccountSyncPreference(accountId: string, preference: AccountSyncPreference) {
+    setChangingSyncId(accountId);
+    try {
+      setAccountSyncPreference(accountId, preference);
+      setSyncPreferenceVersion((version) => version + 1);
+      useToastStore.getState().addToast({
+        message: preference === "manual" ? "已改为仅手动收取" : `已设置为${ACCOUNT_SYNC_OPTIONS.find((item) => item.value === preference)?.label}`,
+        type: "success",
+      });
+    } catch (err) {
+      useToastStore.getState().addToast({
+        message: `修改同步频率失败：${extractErrorMessage(err)}`,
+        type: "error",
+      });
+    } finally {
+      setChangingSyncId(null);
     }
   }
 
@@ -222,6 +271,18 @@ export default function AccountsTab() {
                       {realtimeLabel}
                     </span>
                   )}
+                  <label style={{ display: "flex", alignItems: "center", gap: "6px", marginTop: "4px", fontSize: "11px", color: "var(--color-text-secondary)" }}>
+                    <span>本账号同步频率</span>
+                    <select
+                      aria-label={`${account.display_name}同步频率`}
+                      value={getAccountSyncPreference(account.id) ?? (globalRealtimeMode === "manual" ? "manual" : globalRealtimeMode)}
+                      disabled={changingSyncId === account.id}
+                      onChange={(event) => void changeAccountSyncPreference(account.id, event.target.value as AccountSyncPreference)}
+                      style={{ padding: "2px 5px", border: "1px solid var(--color-border)", borderRadius: "4px", background: "var(--color-bg)", color: "var(--color-text-primary)", fontSize: "11px" }}
+                    >
+                      {ACCOUNT_SYNC_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                    </select>
+                  </label>
                 </div>
                 <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
                   <button
@@ -417,7 +478,11 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
   const [oauthProxyMode, setOauthProxyMode] = useState<AccountProxyMode>("inherit");
   const [proxyHost, setProxyHost] = useState("");
   const [proxyPort, setProxyPort] = useState("");
-  const [signature, setSignatureValue] = useState("");
+  const [signatures, setSignatures] = useState<EmailSignature[]>([]);
+  const [editingSigId, setEditingSigId] = useState<string | null>(null);
+  const [editingSigName, setEditingSigName] = useState("");
+  const [editingSigContent, setEditingSigContent] = useState("");
+  const [savingSig, setSavingSig] = useState(false);
   const [imapFolderSettings, setImapFolderSettings] = useState<ImapSyncFolderSettings | null>(null);
   const [selectedImapFolderIds, setSelectedImapFolderIds] = useState<Set<string>>(new Set());
   const [folderLoading, setFolderLoading] = useState(false);
@@ -436,12 +501,39 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
 
   useEffect(() => {
     let cancelled = false;
-    getSignature(account.id)
-      .then((loaded) => {
-        if (!cancelled) setSignatureValue(loaded);
+    listEmailSignatures(account.id)
+      .then((list) => {
+        if (!cancelled) setSignatures(list);
       })
       .catch((err) => {
-        console.warn("Failed to load signature:", err);
+        console.warn("Failed to load signatures:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [account.id]);
+
+  // Prefill every editable field from the persisted account config so the user
+  // can see what is currently set. Password is intentionally left empty — the
+  // user only needs to type a new one to change it.
+  useEffect(() => {
+    let cancelled = false;
+    getAccountDetails(account.id)
+      .then((details) => {
+        if (cancelled) return;
+        setImapHost(details.imapHost);
+        setImapPort(details.imapPort ? String(details.imapPort) : "");
+        setImapSecurity(details.imapSecurity || "");
+        setAcceptInvalidCerts(details.imapAcceptInvalidCerts ? "true" : "false");
+        setSmtpHost(details.smtpHost);
+        setSmtpPort(details.smtpPort ? String(details.smtpPort) : "");
+        setSmtpSecurity(details.smtpSecurity || "");
+        setProxyHost(details.proxyHost);
+        setProxyPort(details.proxyPort ? String(details.proxyPort) : "");
+        setOauthProxyMode((details.proxyMode as AccountProxyMode) || "inherit");
+      })
+      .catch((err) => {
+        console.warn("Failed to load account details:", err);
       });
     return () => {
       cancelled = true;
@@ -592,7 +684,8 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
         ]);
       }
 
-      await setSignature(account.id, signature);
+      // 签名已改为多签名即时保存（见下方“邮件签名”区），这里不再处理。
+
       onSaved();
     } catch (err) {
       setError(extractErrorMessage(err));
@@ -605,6 +698,15 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
     display: "flex",
     flexDirection: "column",
   };
+  const signatureSmallButton = (background: string, color: string): React.CSSProperties => ({
+    padding: "5px 12px",
+    fontSize: "12px",
+    border: "none",
+    borderRadius: "6px",
+    background,
+    color,
+    cursor: "pointer",
+  });
   const colorInputValue = /^#[0-9a-fA-F]{6}$/.test(accountColor) ? accountColor : initialColor;
   const proxyFields = (
     <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "12px" }}>
@@ -958,15 +1060,157 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
               </div>
             )}
 
-            {/* Signature */}
+            {/* Signature（多签名管理） */}
             <div style={fieldStyle}>
-              <label style={labelStyle}>{t("settings.signature", "Signature")} <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>({t("settings.optional", "optional")})</span></label>
-              <textarea
-                style={{ ...inputStyle, minHeight: "80px", resize: "vertical", fontFamily: "inherit" }}
-                value={signature}
-                onChange={(e) => setSignatureValue(e.target.value)}
-                placeholder={t("settings.signaturePlaceholder", "Your email signature...")}
-              />
+              <label style={labelStyle}>邮件签名 <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>（每个邮箱可设置多个；AI 写作默认使用“默认”签名）</span></label>
+              {signatures.length === 0 && (
+                <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8 }}>尚未设置签名，可在下方新增。</div>
+              )}
+              {signatures.map((sig) => {
+                const isEditing = editingSigId === sig.id;
+                const isCurrentDefault = sig.is_default;
+                return (
+                  <div key={sig.id} style={{ border: "1px solid var(--color-border)", borderRadius: 6, padding: 8, marginBottom: 8, background: "var(--color-bg-secondary)" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                      <strong style={{ fontSize: 12 }}>{sig.name}</strong>
+                      {isCurrentDefault && (
+                        <span style={{ fontSize: 10, color: "#22c55e", border: "1px solid #22c55e", borderRadius: 8, padding: "0 6px" }}>默认</span>
+                      )}
+                    </div>
+                    {isEditing ? (
+                      <>
+                        <input
+                          style={{ ...inputStyle, marginBottom: 6 }}
+                          value={editingSigName}
+                          onChange={(e) => setEditingSigName(e.target.value)}
+                          placeholder="签名名称（如：正式版 / 简洁版）"
+                        />
+                        <SignatureEditor value={editingSigContent} onChange={setEditingSigContent} />
+                        <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                          <button
+                            type="button"
+                            disabled={savingSig}
+                            onClick={async () => {
+                              setSavingSig(true);
+                              try {
+                                const next = await saveEmailSignature(account.id, sig.id, editingSigName, editingSigContent);
+                                setSignatures(next);
+                                setEditingSigId(null);
+                                useToastStore.getState().addToast({ message: "签名已保存", type: "success" });
+                              } catch (err) {
+                                useToastStore.getState().addToast({ message: `保存签名失败：${extractErrorMessage(err)}`, type: "error" });
+                              } finally {
+                                setSavingSig(false);
+                              }
+                            }}
+                            style={signatureSmallButton("var(--color-accent)", "#fff")}
+                          >
+                            保存
+                          </button>
+                          <button type="button" onClick={() => setEditingSigId(null)} style={signatureSmallButton("var(--color-bg-hover)", "var(--color-text-primary)")}>
+                            取消
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div style={{ fontSize: 12, color: "var(--color-text-secondary)", whiteSpace: "pre-wrap", maxHeight: 90, overflow: "auto", marginBottom: 6 }}>
+                          {sig.content || "（空）"}
+                        </div>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <button
+                            type="button"
+                            onClick={() => { setEditingSigId(sig.id); setEditingSigName(sig.name); setEditingSigContent(sig.content); }}
+                            style={signatureSmallButton("var(--color-bg-hover)", "var(--color-text-primary)")}
+                          >
+                            编辑
+                          </button>
+                          {!isCurrentDefault && (
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                try {
+                                  const next = await setDefaultEmailSignature(account.id, sig.id);
+                                  setSignatures(next);
+                                  useToastStore.getState().addToast({ message: "已设为默认签名", type: "success" });
+                                } catch (err) {
+                                  useToastStore.getState().addToast({ message: `设置默认失败：${extractErrorMessage(err)}`, type: "error" });
+                                }
+                              }}
+                              style={signatureSmallButton("var(--color-bg-hover)", "var(--color-text-primary)")}
+                            >
+                              设为默认
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                const next = await deleteEmailSignature(account.id, sig.id);
+                                setSignatures(next);
+                                if (editingSigId === sig.id) setEditingSigId(null);
+                              } catch (err) {
+                                useToastStore.getState().addToast({ message: `删除签名失败：${extractErrorMessage(err)}`, type: "error" });
+                              }
+                            }}
+                            style={signatureSmallButton("var(--color-bg-hover)", "#dc3545")}
+                          >
+                            删除
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                );
+              })}
+              {editingSigId === "__new__" ? (
+                <div style={{ border: "1px dashed var(--color-accent)", borderRadius: 6, padding: 8, marginBottom: 8, background: "var(--color-bg-secondary)" }}>
+                  <input
+                    style={{ ...inputStyle, marginBottom: 6 }}
+                    value={editingSigName}
+                    onChange={(e) => setEditingSigName(e.target.value)}
+                    placeholder="签名名称（如：正式版 / 简洁版）"
+                  />
+                  <SignatureEditor value={editingSigContent} onChange={setEditingSigContent} />
+                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                    <button
+                      type="button"
+                      disabled={savingSig}
+                      onClick={async () => {
+                        if (!editingSigName.trim()) {
+                          useToastStore.getState().addToast({ message: "请填写签名名称", type: "error" });
+                          return;
+                        }
+                        setSavingSig(true);
+                        try {
+                          const next = await saveEmailSignature(account.id, null, editingSigName, editingSigContent);
+                          setSignatures(next);
+                          setEditingSigId(null);
+                          useToastStore.getState().addToast({ message: "签名已添加", type: "success" });
+                        } catch (err) {
+                          useToastStore.getState().addToast({ message: `添加签名失败：${extractErrorMessage(err)}`, type: "error" });
+                        } finally {
+                          setSavingSig(false);
+                        }
+                      }}
+                      style={signatureSmallButton("var(--color-accent)", "#fff")}
+                    >
+                      保存
+                    </button>
+                    <button type="button" onClick={() => setEditingSigId(null)} style={signatureSmallButton("var(--color-bg-hover)", "var(--color-text-primary)")}>
+                      取消
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => { setEditingSigId("__new__"); setEditingSigName(""); setEditingSigContent(""); }}
+                  style={signatureSmallButton("var(--color-bg-hover)", "var(--color-accent)")}
+                >
+                  + 新增签名
+                </button>
+              )}
             </div>
 
             {error && (

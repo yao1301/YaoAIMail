@@ -113,6 +113,32 @@ describe("ShadowDomEmail", () => {
     expect(content.querySelector(".hero")?.textContent).toBe("Styled body");
   });
 
+  it("caps inline images without expanding small signature logos", async () => {
+    const html = `
+      <img
+        src="data:image/png;base64,AA=="
+        width="111"
+        height="62"
+        style="max-width: unset; width: 110.787px; height: 61.9px"
+        alt="RSG Logistics"
+      >
+    `;
+
+    const { container } = render(<ShadowDomEmail html={html} />);
+    const host = container.firstChild as HTMLDivElement | null;
+
+    await waitFor(() => {
+      expect(host?.shadowRoot?.querySelector("img")).not.toBeNull();
+    });
+
+    const image = host!.shadowRoot!.querySelector("img") as HTMLImageElement;
+    expect(image.style.width).toBe("110.787px");
+    expect(image.style.getPropertyValue("max-width")).toBe("100%");
+    expect(image.style.getPropertyPriority("max-width")).toBe("important");
+    expect(image.style.height).toBe("auto");
+    expect(image.style.getPropertyPriority("height")).toBe("important");
+  });
+
   it("opens http and https links through the external URL command", async () => {
     const { container } = render(
       <ShadowDomEmail html={'<a href="http://pebble.byebug.cn/">Pebble</a>'} />,

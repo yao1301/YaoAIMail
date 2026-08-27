@@ -4,6 +4,24 @@ export interface ComposeAttachment {
   size: number;
 }
 
+/** In-memory snapshot used when the compose view is unmounted by navigation. */
+export interface ComposeDraftSnapshot {
+  /** Existing backend draft being edited. Reused on auto-save instead of creating a duplicate. */
+  sourceDraftId?: string;
+  accountId: string;
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  subject: string;
+  rawSource: string;
+  richTextHtml: string;
+  editorMode: "rich" | "markdown" | "html";
+  attachments: ComposeAttachment[];
+  /** Stable copy of the original message quote for reply/reply-all drafts. */
+  quotedReplyHtml?: string;
+  savedAt: number;
+}
+
 export interface ComposeDraftInput {
   to: string[];
   cc: string[];

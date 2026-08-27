@@ -1,21 +1,119 @@
 use crate::state::AppState;
+use crate::commands::messages::{connect_imap, find_message_folder, refresh_search_document};
 use pebble_core::{Message, PebbleError, PrivacyMode, RenderedHtml, TrustType};
+use pebble_mail::parser::parse_raw_email;
+use pebble_mail::persist_message_attachments;
 use pebble_privacy::PrivacyGuard;
 use pebble_store::Store;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
+
+/// 打开 headers-only 邮件：立即返回邮件头（不等待 IMAP），后台异步补全正文，
+/// 补全成功后 emit "message:hydrated" 供前端刷新。失败不阻塞打开、不报错，
+/// 只记录日志，下次打开或再次触发时自动重试。
+async fn hydrate_header_only_message(
+    state: &AppState,
+    app: &AppHandle,
+    message: Message,
+) -> std::result::Result<Message, PebbleError> {
+    if message.remote_version.as_deref() != Some("headers-only") {
+        return Ok(message);
+    }
+    let message_id = message.id.clone();
+    // 防同一封邮件并发重复拉取
+    {
+        let mut hydrating = state.hydrating_messages.lock().await;
+        if hydrating.contains(&message_id) {
+            return Ok(message);
+        }
+        hydrating.insert(message_id.clone());
+    }
+    let state_clone = state.clone();
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        let result: std::result::Result<(), PebbleError> = (async {
+            let mut msg = state_clone
+                .store
+                .get_message(&message_id)?
+                .ok_or_else(|| PebbleError::Internal(format!("Message {message_id} disappeared")))?;
+            hydrate_message_body(&state_clone, &mut msg).await
+        })
+        .await;
+        {
+            let mut hydrating = state_clone.hydrating_messages.lock().await;
+            hydrating.remove(&message_id);
+        }
+        match result {
+            Ok(()) => {
+                tracing::info!("Hydrated message {message_id}");
+                let _ = app_clone.emit("message:hydrated", message_id);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Background hydration failed for {} (headers retained; will retry on next open): {}",
+                    message_id, error
+                );
+                // 通知前端正文加载失败，避免正文区永远停留在"加载中"；
+                // 前端收到后显示失败提示，用户可点击重试。
+                let _ = app_clone.emit("message:hydrate-failed", message_id);
+            }
+        }
+    });
+    Ok(message)
+}
+
+async fn hydrate_message_body(
+    state: &AppState,
+    message: &mut Message,
+) -> std::result::Result<(), PebbleError> {
+    let folder = find_message_folder(state, &message.id, &message.account_id)?;
+    let uid = message.remote_id.parse::<u32>()
+        .map_err(|_| PebbleError::Internal(format!("Invalid remote UID: {}", message.remote_id)))?;
+    let provider = connect_imap(state, &message.account_id).await?;
+
+    // 大邮件根治：fetch_message_raw_by_uid 内部按 1 MiB 分块拉取
+    // （RFC 3501 BODY.PEEK[]<offset.length>），单块永不超时，
+    // 附件随完整 MIME 一起完整下载到本地——不做"按需下载"。
+    let raw = provider
+        .fetch_message_raw_by_uid(&folder.remote_id, uid)
+        .await?;
+    let _ = provider.disconnect().await;
+    let parsed = parse_raw_email(&raw)?;
+    message.body_text = parsed.body_text.clone();
+    message.body_html_raw = parsed.body_html.clone();
+    message.snippet = parsed.snippet.clone();
+    message.has_attachments = parsed.has_attachments;
+    message.remote_version = None;
+    state.store.update_message_content(
+        &message.id,
+        &message.body_text,
+        &message.body_html_raw,
+        &message.snippet,
+        message.has_attachments,
+        None,
+    )?;
+    persist_message_attachments(
+        &state.store,
+        &state.attachments_dir,
+        &message.id,
+        parsed.attachments,
+    );
+    let _ = refresh_search_document(state, &message.id);
+    Ok(())
+}
 
 #[tauri::command]
 pub async fn get_rendered_html(
+    app: AppHandle,
     state: State<'_, AppState>,
     message_id: String,
     privacy_mode: PrivacyMode,
 ) -> std::result::Result<RenderedHtml, PebbleError> {
-    let store = state.store.clone();
+    let state_ref = state.inner();
+    let message = state_ref.store.get_message(&message_id)?
+        .ok_or_else(|| PebbleError::Internal(format!("Message not found: {message_id}")))?;
+    let message = hydrate_header_only_message(state_ref, &app, message).await?;
+    let store = state_ref.store.clone();
     tokio::task::spawn_blocking(move || {
-        let message = store
-            .get_message(&message_id)?
-            .ok_or_else(|| PebbleError::Internal(format!("Message not found: {message_id}")))?;
-
         let effective_mode = resolve_privacy_mode(&store, &message, privacy_mode)?;
         let guard = PrivacyGuard::new();
         Ok(guard.render_message_html(&message.body_html_raw, &message.body_text, &effective_mode))
@@ -26,13 +124,19 @@ pub async fn get_rendered_html(
 
 #[tauri::command]
 pub async fn get_message_with_html(
+    app: AppHandle,
     state: State<'_, AppState>,
     message_id: String,
     privacy_mode: PrivacyMode,
 ) -> std::result::Result<Option<(Message, RenderedHtml)>, PebbleError> {
-    let store = state.store.clone();
+    let state_ref = state.inner();
+    let message = match state_ref.store.get_message(&message_id)? {
+        Some(message) => Some(hydrate_header_only_message(state_ref, &app, message).await?),
+        None => None,
+    };
+    let store = state_ref.store.clone();
     tokio::task::spawn_blocking(move || {
-        let message = match store.get_message(&message_id)? {
+        let message = match message {
             Some(m) => m,
             None => return Ok(None),
         };

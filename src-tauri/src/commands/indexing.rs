@@ -9,11 +9,11 @@ use crate::commands::pending_mail_ops::queue_pending_mail_op;
 use crate::events;
 use crate::state::AppState;
 use pebble_core::{FolderRole, PebbleError};
-use pebble_rules::RuleEngine;
+use pebble_rules::{RuleEngine, RuleTrigger};
 use pebble_search::TantivySearch;
 use pebble_store::Store;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -93,11 +93,31 @@ fn new_mail_event_payload(stored: &pebble_mail::StoredMessage) -> serde_json::Va
     })
 }
 
+fn rule_trigger_for_stored_message(
+    store: &Store,
+    stored: &pebble_mail::StoredMessage,
+) -> RuleTrigger {
+    let folder_ids: HashSet<&str> = stored.folder_ids.iter().map(String::as_str).collect();
+    let is_sent = store
+        .list_folders(&stored.message.account_id)
+        .map(|folders| {
+            folders.iter().any(|folder| {
+                folder.role == Some(FolderRole::Sent) && folder_ids.contains(folder.id.as_str())
+            })
+        })
+        .unwrap_or(false);
+    if is_sent {
+        RuleTrigger::Send
+    } else {
+        RuleTrigger::Receive
+    }
+}
+
 fn should_send_new_mail_notification(
     store: &Store,
     stored: &pebble_mail::StoredMessage,
 ) -> pebble_core::Result<bool> {
-    if !stored.notify || stored.message.is_deleted || stored.message.is_draft {
+    if !stored.notify || stored.message.is_read || stored.message.is_deleted || stored.message.is_draft {
         return Ok(false);
     }
 
@@ -108,7 +128,9 @@ fn should_send_new_mail_notification(
 
     let folders = store.list_folders(&stored.message.account_id)?;
     Ok(folders.iter().any(|folder| {
-        folder.role == Some(FolderRole::Inbox) && folder_ids.contains(folder.id.as_str())
+        let eligible = folder.role == Some(FolderRole::Inbox)
+            || (folder.role.is_none() && !folder.is_system);
+        eligible && folder_ids.contains(folder.id.as_str())
     }))
 }
 
@@ -160,7 +182,7 @@ fn open_message_from_notification(app: &tauri::AppHandle, account_id: &str, mess
 fn show_default_new_mail_notification(app: &tauri::AppHandle, body: &str) -> Result<(), String> {
     app.notification()
         .builder()
-        .title("Pebble - New Mail")
+        .title("YaoAIMail - New Mail")
         .body(body)
         .show()
         .map_err(|e| e.to_string())
@@ -177,9 +199,9 @@ fn show_linux_new_mail_notification(
 
     let mut notification = notify_rust::Notification::new();
     notification
-        .summary("Pebble - New Mail")
+        .summary("YaoAIMail - New Mail")
         .body(body)
-        .appname("Pebble")
+        .appname("YaoAIMail")
         .auto_icon()
         .action("default", "Open");
 
@@ -237,7 +259,7 @@ fn show_macos_new_mail_notification(
             let _ = mac_notification_sys::set_application(&app_id);
             let mut notification = mac_notification_sys::Notification::new();
             notification
-                .title("Pebble - New Mail")
+                .title("YaoAIMail - New Mail")
                 .message(&body)
                 .main_button(mac_notification_sys::MainButton::SingleAction("Open"))
                 .wait_for_click(true);
@@ -266,7 +288,7 @@ fn show_windows_new_mail_notification(
     let account_id = account_id.to_string();
     let message_id = message_id.to_string();
     tauri_winrt_notification::Toast::new(&notifications::windows_notification_app_id(app))
-        .title("Pebble - New Mail")
+        .title("YaoAIMail - New Mail")
         .text1(body)
         .duration(tauri_winrt_notification::Duration::Short)
         .add_button("Open", NOTIFICATION_OPEN_ACTION)
@@ -292,6 +314,13 @@ fn show_new_mail_notification(
 
     #[cfg(windows)]
     {
+        let version = windows_version::OsVersion::current();
+        if version.major == 6 && version.minor == 1 {
+            // Windows 7 has no actionable WinRT toast. The notification plugin's
+            // windows7-compat path uses a native balloon without loading the
+            // unsupported packaged-app notification APIs.
+            return show_default_new_mail_notification(app, &body);
+        }
         match show_windows_new_mail_notification(
             app,
             &body,
@@ -327,6 +356,9 @@ fn maybe_send_new_mail_notification(
     store: &Store,
     stored: &pebble_mail::StoredMessage,
 ) {
+    // 托盘徽章：有新邮件就亮（不依赖通知开关，用户要求"只要有新邮件图标就有提示"）
+    notifications::mark_attention_indicator(app);
+
     let notifications_enabled = app
         .try_state::<AppState>()
         .is_some_and(|state| state.notifications_enabled.load(Ordering::SeqCst));
@@ -356,14 +388,14 @@ pub async fn index_new_messages(
     rx: &mut mpsc::UnboundedReceiver<pebble_mail::StoredMessage>,
     app: Option<tauri::AppHandle>,
 ) {
-    const COMMIT_BATCH_SIZE: u32 = 20;
+    const COMMIT_BATCH_SIZE: u32 = 50;
     const COMMIT_IDLE_SECS: u64 = 2;
 
     // Rules are reloaded at each batch boundary so edits made mid-sync take
     // effect within ~20 messages (or ~2s idle) rather than waiting for the
     // next full sync session.
-    let load_engine = |store: &Arc<Store>| -> Option<RuleEngine> {
-        match store.list_rules() {
+    let load_engine = |store: &Arc<Store>, account_id: &str| -> Option<RuleEngine> {
+        match store.list_rules(account_id) {
             Ok(rules) if !rules.is_empty() => Some(RuleEngine::new(&rules)),
             Ok(_) => None,
             Err(e) => {
@@ -372,12 +404,20 @@ pub async fn index_new_messages(
             }
         }
     };
-    let mut engine = load_engine(store);
-    if let Some(ref e) = engine {
-        info!("Rule engine loaded with {} rules", e.rule_count());
+    // Keep one compiled engine per account. Loading `list_rules("")` once
+    // for the whole process made every message walk every account's rules.
+    // Account-local engines also make the ownership boundary explicit.
+    let mut engines: HashMap<String, Option<RuleEngine>> = HashMap::new();
+
+    // Recover index work left behind by a previous crash or failed Tantivy
+    // commit before consuming new mail. The durable queue prevents a locally
+    // stored body from becoming permanently unsearchable.
+    if let Err(error) = recover_pending_search_index(store, search) {
+        error!("Failed to recover pending search index work: {error}");
     }
 
     let mut pending = 0u32;
+    let mut pending_index: Vec<(pebble_core::Message, Vec<String>)> = Vec::new();
     loop {
         let stored = match tokio::time::timeout(
             tokio::time::Duration::from_secs(COMMIT_IDLE_SECS),
@@ -389,13 +429,18 @@ pub async fn index_new_messages(
             Ok(None) => break,
             Err(_) => {
                 if pending > 0 {
+                    if !pending_index.is_empty() {
+                        if let Err(e) = flush_pending_index(store, search, &mut pending_index) {
+                            error!("Failed to batch index messages after idle flush: {}", e);
+                        }
+                    }
                     if let Err(e) = search.commit() {
                         error!("Failed to commit search index after idle flush: {}", e);
                     }
                     pending = 0;
                 }
                 // Idle — take the opportunity to refresh rules.
-                engine = load_engine(store);
+                engines.clear();
                 continue;
             }
         };
@@ -405,8 +450,13 @@ pub async fn index_new_messages(
             maybe_send_new_mail_notification(app, store, &stored);
         }
 
-        if let Some(ref engine) = engine {
-            let actions = engine.evaluate(&stored.message);
+        let account_id = stored.message.account_id.clone();
+        let engine = engines
+            .entry(account_id.clone())
+            .or_insert_with(|| load_engine(store, &account_id));
+        if let Some(engine) = engine.as_ref() {
+            let trigger = rule_trigger_for_stored_message(store, &stored);
+            let actions = engine.evaluate_for_trigger(&stored.message, trigger);
             for action in actions {
                 if let Err(e) = apply_rule_action(
                     store,
@@ -452,9 +502,8 @@ pub async fn index_new_messages(
                         );
                         continue;
                     }
-                } else if let Err(e) = search.index_message(&message, &folder_ids) {
-                    warn!("Failed to index message {}: {}", message_id, e);
-                    continue;
+                } else {
+                    pending_index.push((message, folder_ids));
                 }
             }
             Some(_) | None => {
@@ -470,19 +519,82 @@ pub async fn index_new_messages(
         pending += 1;
 
         if pending >= COMMIT_BATCH_SIZE {
+            if !pending_index.is_empty() {
+                if let Err(e) = flush_pending_index(store, search, &mut pending_index) {
+                    error!("Failed to batch index messages: {}", e);
+                }
+            }
             if let Err(e) = search.commit() {
                 error!("Failed to commit search index: {}", e);
             }
             pending = 0;
-            engine = load_engine(store);
+            engines.clear();
         }
     }
 
     if pending > 0 {
+        if !pending_index.is_empty() {
+            if let Err(e) = flush_pending_index(store, search, &mut pending_index) {
+                error!("Failed to batch index messages on close: {}", e);
+            }
+        }
         if let Err(e) = search.commit() {
             error!("Failed to commit search index on close: {}", e);
         }
     }
+}
+
+fn flush_pending_index(
+    store: &Store,
+    search: &TantivySearch,
+    batch: &mut Vec<(pebble_core::Message, Vec<String>)>,
+) -> pebble_core::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    search.index_messages_batch(batch)?;
+    let ids: Vec<String> = batch.iter().map(|(message, _)| message.id.clone()).collect();
+    store.clear_search_pending(&ids)?;
+    batch.clear();
+    Ok(())
+}
+
+fn recover_pending_search_index(store: &Store, search: &TantivySearch) -> pebble_core::Result<()> {
+    let pending = store.list_search_pending()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    info!(count = pending.len(), "Recovering durable search index tasks");
+    for chunk in pending.chunks(100) {
+        let ids: Vec<String> = chunk.iter().map(|(id, _)| id.clone()).collect();
+        let messages = store.get_messages_batch(&ids)?;
+        let message_map: HashMap<String, pebble_core::Message> =
+            messages.into_iter().map(|message| (message.id.clone(), message)).collect();
+        let folder_map = store.get_message_folder_ids_batch(&ids)?;
+        let mut upserts = Vec::new();
+        let mut completed = Vec::new();
+        for (id, operation) in chunk {
+            if operation == "remove" {
+                search.remove_message(id)?;
+                completed.push(id.clone());
+            } else if let Some(message) = message_map.get(id) {
+                if message.is_deleted {
+                    search.remove_message(id)?;
+                } else if let Some(folder_ids) = folder_map.get(id) {
+                    upserts.push((message.clone(), folder_ids.clone()));
+                }
+                completed.push(id.clone());
+            }
+        }
+        if !upserts.is_empty() {
+            search.index_messages_batch(&upserts)?;
+        }
+        if !completed.is_empty() {
+            store.clear_search_pending(&completed)?;
+        }
+    }
+    search.commit()?;
+    Ok(())
 }
 
 /// Apply a single rule action to a message.
@@ -527,15 +639,21 @@ fn apply_rule_action(
             store.add_label(message_id, label)?;
             info!("Rule: added label '{}' to message {}", label, message_id);
         }
-        RuleAction::MoveToFolder(folder_name) => {
+        RuleAction::MoveToFolder(folder_ref) => {
             if queue_remote_rule_action(store, account_id, message_id, action)? {
                 info!(
                     "Rule: queued remote move for message {} to folder '{}'",
-                    message_id, folder_name
+                    message_id, folder_ref
                 );
                 return Ok(());
             }
-            if let Some(target_folder) = store.find_folder_by_name(account_id, folder_name)? {
+            // 优先按 folder_id 查找（前端 UI 传 id，准确）；失败时回退按 name 查找
+            // （兼容旧规则数据库中存的字符串是 name 而非 id 的情况）。
+            let target_folder = match store.get_folder(folder_ref) {
+                Ok(Some(folder)) => Some(folder),
+                _ => store.find_folder_by_name(account_id, folder_ref)?,
+            };
+            if let Some(target_folder) = target_folder {
                 store.move_message_to_folder(message_id, &target_folder.id)?;
                 info!(
                     "Rule: moved message {} to folder '{}'",
@@ -544,7 +662,7 @@ fn apply_rule_action(
             } else {
                 warn!(
                     "Rule: target folder '{}' not found for account {}",
-                    folder_name, account_id
+                    folder_ref, account_id
                 );
             }
         }
@@ -645,8 +763,12 @@ fn queue_remote_rule_action(
             queue_pending_mail_op(store, &message, "archive", payload)?;
             Ok(true)
         }
-        RuleAction::MoveToFolder(folder_name) => {
-            let Some(target_folder) = store.find_folder_by_name(account_id, folder_name)? else {
+        RuleAction::MoveToFolder(folder_ref) => {
+            let Some(target_folder) = store
+                .get_folder(folder_ref)?
+                .filter(|folder| folder.account_id == account_id)
+                .or(store.find_folder_by_name(account_id, folder_ref)?)
+            else {
                 return Ok(false);
             };
             if target_folder.remote_id.starts_with("__local_") {
@@ -840,6 +962,26 @@ mod rule_writeback_tests {
         let message = test_message(&account.id);
         let stored = pebble_mail::StoredMessage {
             message,
+            folder_ids: vec![folder.id],
+            notify: true,
+        };
+
+        assert!(should_send_new_mail_notification(&store, &stored).unwrap());
+    }
+
+    #[test]
+    fn realtime_custom_folder_messages_trigger_new_mail_notifications() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let mut folder = test_folder(&account.id);
+        folder.remote_id = "Customers/Acme".to_string();
+        folder.name = "Acme".to_string();
+        folder.role = None;
+        folder.is_system = false;
+        store.insert_folder(&folder).unwrap();
+        let stored = pebble_mail::StoredMessage {
+            message: test_message(&account.id),
             folder_ids: vec![folder.id],
             notify: true,
         };

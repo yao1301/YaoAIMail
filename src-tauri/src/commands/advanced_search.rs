@@ -15,6 +15,7 @@ pub struct AdvancedSearchQuery {
     pub date_from: Option<i64>,
     pub date_to: Option<i64>,
     pub has_attachment: Option<bool>,
+    pub account_id: Option<String>,
     pub folder_id: Option<String>,
 }
 
@@ -25,9 +26,10 @@ pub async fn advanced_search(
     limit: Option<usize>,
 ) -> std::result::Result<Vec<SearchHit>, PebbleError> {
     let search = state.search.clone();
+    let store = state.store.clone();
     let limit = limit.unwrap_or(50);
     tokio::task::spawn_blocking(move || {
-        search.advanced_search(AdvancedSearchParams {
+        let hits = search.advanced_search(AdvancedSearchParams {
             text: query.text.as_deref(),
             from: query.from.as_deref(),
             to: query.to.as_deref(),
@@ -35,9 +37,11 @@ pub async fn advanced_search(
             date_from: query.date_from,
             date_to: query.date_to,
             has_attachment: query.has_attachment,
+            account_id: query.account_id.as_deref(),
             folder_id: query.folder_id.as_deref(),
             limit,
-        })
+        })?;
+        crate::commands::search::hydrate_folder_ids(&store, hits)
     })
     .await
     .map_err(|e| PebbleError::Internal(format!("Task join error: {e}")))?

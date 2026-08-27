@@ -22,10 +22,12 @@ interface Props {
   message?: Message | null;
   isSelected: boolean;
   onClick: () => void;
+  onDoubleClick: () => void;
+  folderLabel?: string;
   query?: string;
 }
 
-export default function SearchResultItem({ hit, message, isSelected, onClick, query = "" }: Props) {
+export default function SearchResultItem({ hit, message, isSelected, onClick, onDoubleClick, folderLabel, query = "" }: Props) {
   const { t } = useTranslation();
   const subject = hit.subject || message?.subject || hit.snippet || t("common.noSubject");
   const from = hit.from_address || message?.from_address || "";
@@ -37,6 +39,7 @@ export default function SearchResultItem({ hit, message, isSelected, onClick, qu
       aria-selected={isSelected}
       tabIndex={0}
       onClick={onClick}
+      onDoubleClick={onDoubleClick}
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); } }}
       style={{
         padding: "10px 14px",
@@ -90,11 +93,15 @@ export default function SearchResultItem({ hit, message, isSelected, onClick, qu
         >
           {highlightTerms(hit.snippet, query)}
         </div>
-        {date && (
-          <div style={{ fontSize: "11px", color: "var(--color-text-tertiary)", flexShrink: 0 }}>
-            {date}
-          </div>
-        )}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: "7px", maxWidth: "52%", fontSize: "11px", color: "var(--color-text-tertiary)", flexShrink: 0 }}>
+          {folderLabel && (
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--color-accent)" }} title={`文件夹：${folderLabel}`}>
+              {folderLabel}
+            </span>
+          )}
+          {hit.has_attachment && <span title="含附件" aria-label="含附件">📎</span>}
+          {date && <span>{date}</span>}
+        </div>
       </div>
     </div>
   );

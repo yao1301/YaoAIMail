@@ -7,6 +7,25 @@ import {
 } from "../../lib/api";
 import { useToastStore } from "@/stores/toast.store";
 import { extractErrorMessage } from "../../lib/extractErrorMessage";
+import { getPreset } from "../../lib/llmPresets";
+import {
+  getTranslationTargetLanguage,
+  setTranslationTargetLanguage,
+  TRANSLATION_TARGET_LANGUAGES,
+} from "@/lib/translationPreferences";
+
+type LlmProviderKind = "openai" | "deepseek" | "gemini" | "custom";
+
+interface LlmProvider {
+  id: string;
+  name: string;
+  kind: LlmProviderKind;
+  base_url: string;
+  chat_path: string;
+  api_key: string;
+  model: string;
+  mode: "completions" | "responses";
+}
 
 type ProviderType = "deeplx" | "deepl" | "generic_api" | "llm";
 
@@ -14,7 +33,7 @@ const PROVIDER_OPTIONS: { value: ProviderType; label: string }[] = [
   { value: "deeplx", label: "DeepLX" },
   { value: "deepl", label: "DeepL" },
   { value: "generic_api", label: "Generic API" },
-  { value: "llm", label: "LLM" },
+  { value: "llm", label: "AI 模型 (LLM)" },
 ];
 
 const labelStyle: React.CSSProperties = {
@@ -69,16 +88,17 @@ export default function TranslateTab() {
   const [genericTextParam, setGenericTextParam] = useState("text");
   const [genericResultPath, setGenericResultPath] = useState("data");
 
-  // LLM fields
-  const [llmEndpoint, setLlmEndpoint] = useState("");
-  const [llmApiKey, setLlmApiKey] = useState("");
-  const [llmModel, setLlmModel] = useState("");
-  const [llmMode, setLlmMode] = useState<"completions" | "responses">("completions");
+  // LLM providers (multiple: presets + custom)
+  const [llmProviders, setLlmProviders] = useState<LlmProvider[]>([]);
+  const [llmActiveId, setLlmActiveId] = useState("");
 
   const [statusMsg, setStatusMsg] = useState("");
   const [statusType, setStatusType] = useState<"success" | "error" | "">("");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [translationTargetLanguage, setTranslationTargetLanguageState] = useState(
+    getTranslationTargetLanguage,
+  );
 
   useEffect(() => {
     loadConfig();
@@ -110,10 +130,13 @@ export default function TranslateTab() {
           setGenericResultPath(parsed.result_path || "data");
           break;
         case "llm":
-          setLlmEndpoint(parsed.endpoint || "");
-          setLlmApiKey(parsed.api_key || "");
-          setLlmModel(parsed.model || "");
-          setLlmMode(parsed.mode || "completions");
+          if (parsed.providers && Array.isArray(parsed.providers)) {
+            setLlmProviders(parsed.providers);
+            const requestedId = typeof parsed.active_id === "string" ? parsed.active_id : "";
+            setLlmActiveId(parsed.providers.some((provider: LlmProvider) => provider.id === requestedId)
+              ? requestedId
+              : (parsed.providers[0]?.id || ""));
+          }
           break;
       }
     } catch (err) {
@@ -141,10 +164,8 @@ export default function TranslateTab() {
       case "llm":
         return JSON.stringify({
           type: "llm",
-          endpoint: llmEndpoint,
-          api_key: llmApiKey,
-          model: llmModel,
-          mode: llmMode,
+          providers: llmProviders,
+          active_id: llmActiveId,
         });
     }
   }
@@ -189,6 +210,175 @@ export default function TranslateTab() {
     } finally {
       setTesting(false);
     }
+  }
+
+  function addProvider(kind: LlmProviderKind) {
+    const id = `p_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    if (kind === "custom") {
+      setLlmProviders((prev) => [
+        ...prev,
+        {
+          id,
+          name: "自定义模型",
+          kind: "custom",
+          base_url: "",
+          chat_path: "/chat/completions",
+          api_key: "",
+          model: "",
+          mode: "completions",
+        },
+      ]);
+    } else {
+      const preset = getPreset(kind);
+      if (!preset) return;
+      setLlmProviders((prev) => [
+        ...prev,
+        {
+          id,
+          name: preset.label,
+          kind: preset.kind,
+          base_url: preset.baseUrl,
+          chat_path: preset.chatPath,
+          api_key: "",
+          model: preset.models[0],
+          mode: "completions",
+        },
+      ]);
+    }
+    setLlmActiveId(id);
+  }
+
+  function updateProvider(id: string, patch: Partial<LlmProvider>) {
+    setLlmProviders((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  }
+
+  function removeProvider(id: string) {
+    setLlmProviders((prev) => {
+      const next = prev.filter((p) => p.id !== id);
+      if (llmActiveId === id) setLlmActiveId(next[0]?.id || "");
+      return next;
+    });
+  }
+
+  function renderLlmProviderManager() {
+    const selected = llmProviders.find((provider) => provider.id === llmActiveId) || llmProviders[0];
+    const preset = selected?.kind !== "custom" ? getPreset(selected?.kind || "custom") : undefined;
+    return (
+      <>
+        <div style={fieldGroupStyle}>
+          <label style={labelStyle}>当前大模型</label>
+          <select
+            id="llm-active-provider"
+            style={inputStyle}
+            value={selected?.id || ""}
+            onChange={(event) => {
+              const value = event.target.value;
+              if (value.startsWith("__add_")) addProvider(value.slice(6) as LlmProviderKind);
+              else setLlmActiveId(value);
+            }}
+          >
+            {!selected && <option value="">请选择或添加大模型</option>}
+            {llmProviders.map((provider) => (
+              <option key={provider.id} value={provider.id}>{provider.name || provider.model || "未命名模型"}</option>
+            ))}
+            <option disabled>──────── 添加 ────────</option>
+            <option value="__add_openai">＋ OpenAI</option>
+            <option value="__add_deepseek">＋ DeepSeek</option>
+            <option value="__add_gemini">＋ Google Gemini</option>
+            <option value="__add_custom">＋ 自定义</option>
+          </select>
+        </div>
+        <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", marginTop: 0, marginBottom: "12px" }}>
+          下拉框中选中的模型就是当前默认模型；下方只编辑这一项。
+        </p>
+        {!selected && (
+          <div style={{ fontSize: "13px", color: "var(--color-text-secondary)" }}>
+            请从下拉框添加一个服务商或自定义模型。
+          </div>
+        )}
+        {selected && (
+          <div style={{ border: "1px solid var(--color-border)", borderRadius: 8, padding: 12 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "10px" }}>
+                <input
+                  style={{ ...inputStyle, flex: 1 }}
+                  value={selected.name}
+                  onChange={(e) => updateProvider(selected.id, { name: e.target.value })}
+                  placeholder="名称"
+                  autoComplete="off"
+                />
+                <button
+                  type="button"
+                  style={{ ...buttonStyle, background: "rgba(220,53,69,0.12)", color: "#dc3545" }}
+                  onClick={() => removeProvider(selected.id)}
+                >
+                  删除
+                </button>
+              </div>
+              <div style={fieldGroupStyle}>
+                <label style={labelStyle}>模型</label>
+                {preset ? (
+                  <select
+                    style={inputStyle}
+                    value={selected.model}
+                    onChange={(e) => updateProvider(selected.id, { model: e.target.value })}
+                  >
+                    {preset.models.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    style={inputStyle}
+                    value={selected.model}
+                    onChange={(e) => updateProvider(selected.id, { model: e.target.value })}
+                    placeholder="模型 ID，如 gpt-4o-mini"
+                    autoComplete="off"
+                  />
+                )}
+              </div>
+              <div style={fieldGroupStyle}>
+                <label style={labelStyle}>API Key（必填）</label>
+                <input
+                  style={inputStyle}
+                  type="password"
+                  value={selected.api_key}
+                  onChange={(e) => updateProvider(selected.id, { api_key: e.target.value })}
+                  placeholder="sk-..."
+                  autoComplete="current-password"
+                />
+              </div>
+              <div style={fieldGroupStyle}>
+                <label style={labelStyle}>接口地址</label>
+                <input
+                  style={{ ...inputStyle, opacity: preset ? 0.7 : 1 }}
+                  value={selected.base_url}
+                  onChange={(e) => updateProvider(selected.id, { base_url: e.target.value })}
+                  placeholder="https://api.openai.com/v1"
+                  readOnly={!!preset}
+                  autoComplete="off"
+                />
+              </div>
+              {selected.kind === "custom" && (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 150px", gap: 10 }}>
+                  <div style={fieldGroupStyle}>
+                    <label style={labelStyle}>请求路径</label>
+                    <input style={inputStyle} value={selected.chat_path} onChange={(e) => updateProvider(selected.id, { chat_path: e.target.value })} placeholder="/chat/completions" autoComplete="off" />
+                  </div>
+                  <div style={fieldGroupStyle}>
+                    <label style={labelStyle}>接口协议</label>
+                    <select style={inputStyle} value={selected.mode} onChange={(e) => updateProvider(selected.id, { mode: e.target.value as LlmProvider["mode"] })}>
+                      <option value="completions">Chat Completions</option>
+                      <option value="responses">Responses</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+          </div>
+        )}
+      </>
+    );
   }
 
   function renderProviderFields() {
@@ -317,61 +507,7 @@ export default function TranslateTab() {
         );
 
       case "llm":
-        return (
-          <>
-            <div style={fieldGroupStyle}>
-              <label htmlFor="translate-llm-endpoint" style={labelStyle}>{t("translate.endpoint")}</label>
-              <input
-                id="translate-llm-endpoint"
-                name="llm_endpoint"
-                type="url"
-                style={inputStyle}
-                value={llmEndpoint}
-                onChange={(e) => setLlmEndpoint(e.target.value)}
-                placeholder="https://api.openai.com/v1"
-                autoComplete="off"
-              />
-            </div>
-            <div style={fieldGroupStyle}>
-              <label htmlFor="translate-llm-api-key" style={labelStyle}>{t("translate.apiKey")}</label>
-              <input
-                id="translate-llm-api-key"
-                name="llm_api_key"
-                style={inputStyle}
-                type="password"
-                value={llmApiKey}
-                onChange={(e) => setLlmApiKey(e.target.value)}
-                placeholder="your-api-key"
-                autoComplete="current-password"
-              />
-            </div>
-            <div style={fieldGroupStyle}>
-              <label htmlFor="translate-llm-model" style={labelStyle}>{t("translate.model")}</label>
-              <input
-                id="translate-llm-model"
-                name="llm_model"
-                style={inputStyle}
-                value={llmModel}
-                onChange={(e) => setLlmModel(e.target.value)}
-                placeholder="gpt-4o-mini"
-                autoComplete="off"
-              />
-            </div>
-            <div style={fieldGroupStyle}>
-              <label htmlFor="translate-llm-mode" style={labelStyle}>{t("translate.mode")}</label>
-              <select
-                id="translate-llm-mode"
-                name="llm_mode"
-                style={inputStyle}
-                value={llmMode}
-                onChange={(e) => setLlmMode(e.target.value as "completions" | "responses")}
-              >
-                <option value="completions">{t("translate.modeCompletions")}</option>
-                <option value="responses">{t("translate.modeResponses")}</option>
-              </select>
-            </div>
-          </>
-        );
+        return renderLlmProviderManager();
     }
   }
 
@@ -380,6 +516,27 @@ export default function TranslateTab() {
       <h2 style={{ fontSize: "18px", fontWeight: 600, color: "var(--color-text-primary)", marginTop: 0, marginBottom: "20px" }}>
         {t("translate.engineTitle")}
       </h2>
+
+      <div style={fieldGroupStyle}>
+        <label htmlFor="translation-default-target" style={labelStyle}>选中文字后的默认翻译语言</label>
+        <select
+          id="translation-default-target"
+          style={inputStyle}
+          value={translationTargetLanguage}
+          onChange={(event) => {
+            const language = event.target.value;
+            setTranslationTargetLanguageState(language);
+            setTranslationTargetLanguage(language);
+          }}
+        >
+          {TRANSLATION_TARGET_LANGUAGES.map((language) => (
+            <option key={language.value} value={language.value}>{language.label}</option>
+          ))}
+        </select>
+        <p style={{ margin: "6px 0 0", fontSize: 12, color: "var(--color-text-secondary)" }}>
+          来源语言自动识别。默认翻译成中文，也可以在翻译浮窗中临时切换。
+        </p>
+      </div>
 
       {/* Enable toggle */}
       <div style={{ ...fieldGroupStyle, display: "flex", alignItems: "center", gap: "8px" }}>

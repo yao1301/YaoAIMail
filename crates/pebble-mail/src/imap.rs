@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tokio_native_tls as async_native_tls;
 use tokio_rustls::client::TlsStream;
 use tracing::debug;
+use tracing::info;
 
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -329,6 +330,13 @@ type ImapSession = async_imap::Session<PrefixedStream<InnerStream>>;
 
 const IMAP_CONNECT_TIMEOUT_SECS: u64 = 15;
 const IMAP_COMMAND_TIMEOUT_SECS: u64 = 45;
+const IMAP_STATUS_PROBE_TIMEOUT_SECS: u64 = 10;
+// Downloading full RFC822 bodies is materially slower than ordinary IMAP
+// commands, especially when a message contains large attachments. The history
+// sync uses small pages that retry in even smaller sub-pages on timeout, so a
+// 完整 MIME 拉取（含大附件）允许 2 分钟；之前 45s 太短，barn lights
+// 这种带大附件的邮件拉不到正文 → 打开后只能看到邮件头。
+const IMAP_BODY_FETCH_TIMEOUT_SECS: u64 = 120;
 
 fn imap_timeout_error(operation: &str, seconds: u64) -> PebbleError {
     PebbleError::Network(format!("{operation} timed out after {seconds}s"))
@@ -349,15 +357,20 @@ where
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ImapMailboxStatus {
     pub uid_validity: Option<u32>,
+    pub uid_next: Option<u32>,
     pub highest_modseq: Option<u64>,
     /// Number of messages in the mailbox as reported by SELECT.
     pub exists: u32,
 }
 
 /// An IMAP provider that manages a connection and session.
+#[derive(Clone)]
 pub struct ImapProvider {
     config: ImapConfig,
     session: Arc<Mutex<Option<ImapSession>>>,
+    /// 最近一次 SELECT 的 mailbox。同一文件夹连续 FETCH 时跳过重复 SELECT
+    /// （一次 SELECT 是一次完整网络往返，逐封拉取时会显著拖慢）。
+    last_selected: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 /// Build a rustls TLS connector with bundled root certificates.
@@ -514,6 +527,7 @@ impl ImapProvider {
         Self {
             config,
             session: Arc::new(Mutex::new(None)),
+            last_selected: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -1210,6 +1224,10 @@ impl ImapProvider {
                     .or_else(|| detect_folder_role(&raw_name))
                     .or_else(|| detect_folder_role(&display_name));
                 let sort_order = folder_sort_order(&role);
+                // 只有带系统角色（INBOX/Sent/Trash 等）的才算系统文件夹；
+                // 自定义文件夹（含服务器上 Trash/111 这类子文件夹）必须
+                // 可删除/重命名，误标 is_system 会导致右键菜单禁用这些操作。
+                let is_system = role.is_some();
                 Folder {
                     id: new_id(),
                     account_id: account_id.to_string(),
@@ -1219,7 +1237,7 @@ impl ImapProvider {
                     role,
                     parent_id: None,
                     color: None,
-                    is_system: true,
+                    is_system,
                     sort_order,
                 }
             })
@@ -1227,6 +1245,30 @@ impl ImapProvider {
 
         folders.sort_by_key(|f| f.sort_order);
         Ok(folders)
+    }
+
+    /// Return the hierarchy separator announced by the IMAP server (normally
+    /// "/", but some servers use "." or another value). Folder create/move
+    /// must never hard-code "/" or the server and local tree can diverge.
+    pub async fn hierarchy_delimiter(&self) -> Result<String> {
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        let stream = sess
+            .list(Some(""), Some(""))
+            .await
+            .map_err(|e| PebbleError::Network(format!("LIST delimiter failed: {e}")))?;
+        let names: Vec<_> = stream
+            .try_collect()
+            .await
+            .map_err(|e| PebbleError::Network(format!("LIST delimiter collect failed: {e}")))?;
+        Ok(names
+            .first()
+            .and_then(|name| name.delimiter())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("/")
+            .to_string())
     }
 
     /// Fetch raw message bytes from a mailbox.
@@ -1272,7 +1314,12 @@ impl ImapProvider {
                     .await?
                     .into_iter()
                     .collect();
-                    let fetch_uids = incremental_fetch_uids(Some(uid), &searched_uids);
+                    let mut fetch_uids = incremental_fetch_uids(Some(uid), &searched_uids);
+                    // Fetch the oldest outstanding UIDs first. Persisting the
+                    // resulting maximum UID then lets the next poll continue
+                    // without skipping a gap, while bounding memory, download
+                    // time and the amount repeated after a network failure.
+                    fetch_uids.truncate(limit as usize);
                     if fetch_uids.is_empty() {
                         return Ok(Vec::new());
                     }
@@ -1289,7 +1336,7 @@ impl ImapProvider {
                     .await?;
                     let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
                         "UID FETCH collect",
-                        IMAP_COMMAND_TIMEOUT_SECS,
+                        IMAP_BODY_FETCH_TIMEOUT_SECS,
                         fetches.try_collect(),
                     )
                     .await?;
@@ -1317,6 +1364,343 @@ impl ImapProvider {
 
         let results = do_fetch!(sess);
 
+        Ok(results)
+    }
+
+    /// Fetch only RFC822 headers. Message bodies and attachments are fetched
+    /// lazily when the user opens a message.
+    pub async fn fetch_messages_headers(
+        &self,
+        mailbox: &str,
+        since_uid: Option<u32>,
+        limit: u32,
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        let info = with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
+        if info.exists == 0 {
+            return Ok(Vec::new());
+        }
+        let uids = if let Some(uid) = since_uid {
+            let next = uid.checked_add(1).ok_or_else(|| PebbleError::Validation("IMAP UID overflow".into()))?;
+            if !should_search_incremental_uids(next, info.uid_next) {
+                return Ok(Vec::new());
+            }
+            let searched: Vec<u32> = with_imap_timeout(
+                "UID SEARCH",
+                IMAP_COMMAND_TIMEOUT_SECS,
+                sess.uid_search(format!("UID {next}:*")),
+            ).await?.into_iter().collect();
+            let mut uids = incremental_fetch_uids(Some(uid), &searched);
+            // For the visible/realtime path, fetch the newest messages first.
+            // The history cursor separately walks older sequence ranges, so
+            // taking the newest bounded batch cannot permanently skip them.
+            uids.sort_unstable_by(|left, right| right.cmp(left));
+            uids.truncate(limit as usize);
+            if uids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+            let fetches = with_imap_timeout(
+                "UID FETCH headers",
+                IMAP_COMMAND_TIMEOUT_SECS,
+                sess.uid_fetch(&set, "(UID BODY.PEEK[HEADER])"),
+            ).await?;
+            let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
+                "UID FETCH headers collect",
+                IMAP_BODY_FETCH_TIMEOUT_SECS,
+                fetches.try_collect(),
+            ).await?;
+            let results: Vec<(u32, Vec<u8>)> = fetches
+                .into_iter()
+                .filter_map(|f| f.uid.zip(f.header().map(Vec::from)))
+                .collect();
+            return Ok(results);
+        } else {
+            let start = info.exists.saturating_sub(limit).saturating_add(1).max(1);
+            let set = if start == info.exists { start.to_string() } else { format!("{start}:{}", info.exists) };
+            let fetches = with_imap_timeout(
+                "FETCH headers",
+                IMAP_COMMAND_TIMEOUT_SECS,
+                sess.fetch(&set, "(UID BODY.PEEK[HEADER])"),
+            ).await?;
+            let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
+                "FETCH headers collect",
+                IMAP_BODY_FETCH_TIMEOUT_SECS,
+                fetches.try_collect(),
+            ).await?;
+            let results: Vec<(u32, Vec<u8>)> = fetches
+                .into_iter()
+                .filter_map(|f| f.uid.zip(f.header().map(Vec::from)))
+                .collect();
+            results
+        };
+        Ok(uids)
+    }
+
+    /// Fetch ONLY the headers of a sequence range `[start_seq, end_seq]`
+    /// (history backfill). Returns `(uid, header_bytes)` pairs. Headers are
+    /// tiny, so even attachment-heavy mailboxes backfill quickly; the full
+    /// MIME body is downloaded later when the user opens a message
+    /// (`fetch_message_raw_by_uid`).
+    pub async fn fetch_messages_headers_range(
+        &self,
+        mailbox: &str,
+        start_seq: u32,
+        end_seq: u32,
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        if start_seq == 0 || end_seq < start_seq {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+
+        macro_rules! do_fetch {
+            ($s:expr) => {{
+                let mailbox_info = with_imap_timeout(
+                    "SELECT",
+                    IMAP_COMMAND_TIMEOUT_SECS,
+                    $s.select(mailbox),
+                )
+                .await?;
+                if mailbox_info.exists == 0 || start_seq > mailbox_info.exists {
+                    return Ok(Vec::new());
+                }
+                let end = end_seq.min(mailbox_info.exists);
+                let set = if start_seq == end {
+                    start_seq.to_string()
+                } else {
+                    format!("{start_seq}:{end}")
+                };
+                let fetches = with_imap_timeout(
+                    "FETCH headers",
+                    IMAP_COMMAND_TIMEOUT_SECS,
+                    $s.fetch(&set, "(UID BODY.PEEK[HEADER])"),
+                )
+                .await?;
+                let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
+                    "FETCH headers collect",
+                    IMAP_BODY_FETCH_TIMEOUT_SECS,
+                    fetches.try_collect(),
+                )
+                .await?;
+                {
+                    // 诊断：打印本次拉取的 UID 分布，验证 sequence 与 UID 是否错位。
+                    let uids: Vec<u32> = fetches.iter().filter_map(|f| f.uid).collect();
+                    if !uids.is_empty() {
+                        let min = uids.iter().copied().min().unwrap_or(0);
+                        let max = uids.iter().copied().max().unwrap_or(0);
+                        info!(
+                            "fetch_headers {mailbox} seq {start_seq}:{end_seq} -> {} msgs, UID min={min} max={max}",
+                            uids.len()
+                        );
+                    }
+                }
+                Ok(fetches
+                    .into_iter()
+                    .filter_map(|f| f.uid.zip(f.header().map(Vec::from)))
+                    .collect())
+            }};
+        }
+
+        do_fetch!(sess)
+    }
+
+    /// Fetch one complete MIME message by UID when a header-only message is opened.
+    ///
+    /// Root-cause fix for large-message timeouts: instead of one BODY.PEEK[]
+    /// that must transfer the whole message within a single timeout window,
+    /// fetch in 1 MiB chunks using the RFC 3501 `<offset.length>` partial
+    /// fetch syntax. Every chunk is tiny, so the per-command timeout is
+    /// generous and never trips on big attachments; the result is the complete
+    /// raw message (headers + body + all attachments) concatenated in order.
+    pub async fn fetch_message_raw_by_uid(&self, mailbox: &str, uid: u32) -> Result<Vec<u8>> {
+        const CHUNK: usize = 1024 * 1024; // 1 MiB per FETCH command
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        // 同一文件夹连续 FETCH 时跳过重复 SELECT（一次 SELECT 是一整轮网络往返，
+        // 逐封拉取几百封时每封都 SELECT 会拖慢数倍）。
+        let mut last = self.last_selected.lock().await;
+        if last.as_deref() != Some(mailbox) {
+            with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
+            *last = Some(mailbox.to_string());
+        }
+        drop(last);
+
+        let mut result = Vec::new();
+        let mut offset: u64 = 0;
+        loop {
+            let query = format!("(UID BODY.PEEK[]<{offset}.{CHUNK}>)");
+            let fetches = with_imap_timeout(
+                "UID FETCH message chunk",
+                IMAP_COMMAND_TIMEOUT_SECS,
+                sess.uid_fetch(uid.to_string(), &query),
+            )
+            .await?;
+            let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
+                "UID FETCH message chunk collect",
+                IMAP_BODY_FETCH_TIMEOUT_SECS,
+                fetches.try_collect(),
+            )
+            .await?;
+            let chunk = fetches.into_iter().find_map(|f| {
+                (f.uid == Some(uid)).then(|| f.body().map(Vec::from)).flatten()
+            });
+            match chunk {
+                Some(bytes) if !bytes.is_empty() => {
+                    offset += bytes.len() as u64;
+                    result.extend_from_slice(&bytes);
+                    // A chunk shorter than CHUNK means we reached the end of
+                    // the message (server returns only the remaining bytes).
+                    if bytes.len() < CHUNK {
+                        break;
+                    }
+                }
+                // Empty body at a valid offset means the message ended.
+                _ => break,
+            }
+        }
+
+        // Compatibility fallback: a few servers return a valid response for
+        // BODY.PEEK[] but omit the literal for partial BODY[]<offset.length>
+        // requests. One non-partial fetch avoids falsely treating those
+        // messages as missing while keeping the chunked path for large mail.
+        if result.is_empty() {
+            let fetches = with_imap_timeout(
+                "UID FETCH message compatibility fallback",
+                IMAP_COMMAND_TIMEOUT_SECS,
+                sess.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])"),
+            )
+            .await?;
+            let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
+                "UID FETCH message compatibility fallback collect",
+                IMAP_BODY_FETCH_TIMEOUT_SECS,
+                fetches.try_collect(),
+            )
+            .await?;
+            if let Some(body) = fetches.into_iter().find_map(|fetch| {
+                (fetch.uid == Some(uid)).then(|| fetch.body().map(Vec::from)).flatten()
+            }) {
+                result = body;
+            }
+        }
+
+        if result.is_empty() {
+            return Err(PebbleError::Sync(format!("IMAP message UID {uid} has no body")));
+        }
+        Ok(result)
+    }
+
+    /// 批量按 UID 拉取原始邮件（BODY.PEEK[]，无分片）。一次 SELECT + 一次
+    /// UID FETCH 多封，显著减少网络往返（每封 1 次 SELECT 的浪费）。
+    ///
+    /// 调用方应控制 uids 长度（如 ≤10），避免单次 FETCH 响应过大撑爆内存；
+    /// 超大附件邮件仍走 fetch_message_raw_by_uid 的分片路径。返回
+    /// `(uid, raw_bytes)` 按服务器响应顺序。
+    pub async fn fetch_messages_raw_by_uids(
+        &self,
+        mailbox: &str,
+        uids: &[u32],
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        let mut last = self.last_selected.lock().await;
+        if last.as_deref() != Some(mailbox) {
+            with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
+            *last = Some(mailbox.to_string());
+        }
+        drop(last);
+
+        let uid_set = uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetches = with_imap_timeout(
+            "UID FETCH batch",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            sess.uid_fetch(&uid_set, "(UID BODY.PEEK[])"),
+        )
+        .await?;
+        // 批量拉取本来就是为提速：若服务器（如 Zoho）对批量支持差、5 封也要
+        // 拉很久，最多等 30s 就失败，由调用方降级为逐封分片拉取（更稳），
+        // 避免每批都白等 120s 导致整体反而更慢。
+        let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
+            "UID FETCH batch collect",
+            30,
+            fetches.try_collect(),
+        )
+        .await?;
+        let mut results = Vec::with_capacity(fetches.len());
+        for fetch in fetches {
+            if let Some(uid) = fetch.uid {
+                if let Some(body) = fetch.body() {
+                    results.push((uid, Vec::from(body)));
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// 批量按 UID 获取每封邮件的大小（RFC822.SIZE，单位字节）。
+    /// 响应只有 uid+size 两列，极小，几百封一次命令也不会超时——
+    /// 这是"先摸清大小、再决定批量还是单封"的成熟策略的第一步。
+    /// 返回 `(uid, size_bytes)` 按服务器响应顺序。
+    pub async fn fetch_message_sizes_by_uids(
+        &self,
+        mailbox: &str,
+        uids: &[u32],
+    ) -> Result<Vec<(u32, u32)>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        let mut last = self.last_selected.lock().await;
+        if last.as_deref() != Some(mailbox) {
+            with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
+            *last = Some(mailbox.to_string());
+        }
+        drop(last);
+
+        let uid_set = uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetches = with_imap_timeout(
+            "UID FETCH sizes",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            sess.uid_fetch(&uid_set, "(UID RFC822.SIZE)"),
+        )
+        .await?;
+        let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
+            "UID FETCH sizes collect",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            fetches.try_collect(),
+        )
+        .await?;
+        let mut results = Vec::with_capacity(fetches.len());
+        for fetch in fetches {
+            if let Some(uid) = fetch.uid {
+                if let Some(size) = fetch.size {
+                    results.push((uid, size));
+                }
+            }
+        }
         Ok(results)
     }
 
@@ -1380,7 +1764,7 @@ impl ImapProvider {
         .await?;
         let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
             "FETCH collect",
-            IMAP_COMMAND_TIMEOUT_SECS,
+            IMAP_BODY_FETCH_TIMEOUT_SECS,
             fetches.try_collect(),
         )
         .await?;
@@ -1673,6 +2057,37 @@ impl ImapProvider {
         Ok(())
     }
 
+    /// Resolve the UID currently assigned to a Message-ID inside one mailbox.
+    /// This is used after IMAP MOVE/COPY because destination UIDs are mailbox
+    /// scoped and are usually different from the source UID.
+    pub async fn find_uid_by_message_id(
+        &self,
+        mailbox: &str,
+        message_id_header: &str,
+    ) -> Result<Option<u32>> {
+        if message_id_header.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
+        let criteria = format!(
+            "HEADER \"Message-ID\" \"{}\"",
+            message_id_header.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let hits = with_imap_timeout(
+            "UID SEARCH destination Message-ID",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            sess.uid_search(criteria.as_str()),
+        )
+        .await?;
+        let uid = hits.into_iter().max();
+        *self.last_selected.lock().await = Some(mailbox.to_string());
+        Ok(uid)
+    }
+
     /// Delete a message by UID: flag as \Deleted and EXPUNGE.
     pub async fn delete_message(&self, mailbox: &str, uid: u32) -> Result<()> {
         let uid_str = uid.to_string();
@@ -1714,6 +2129,41 @@ impl ImapProvider {
 
         do_delete!(sess);
 
+        Ok(())
+    }
+
+    /// Create a new mailbox on the server.
+    pub async fn create_folder(&self, name: &str) -> Result<()> {
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        with_imap_timeout("CREATE", IMAP_COMMAND_TIMEOUT_SECS, sess.create(name)).await?;
+        Ok(())
+    }
+
+    /// Rename an existing mailbox on the server.
+    pub async fn rename_folder(&self, old_name: &str, new_name: &str) -> Result<()> {
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        with_imap_timeout(
+            "RENAME",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            sess.rename(old_name, new_name),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete an existing mailbox on the server.
+    pub async fn delete_folder(&self, name: &str) -> Result<()> {
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        with_imap_timeout("DELETE", IMAP_COMMAND_TIMEOUT_SECS, sess.delete(name)).await?;
         Ok(())
     }
 
@@ -1793,6 +2243,7 @@ impl ImapProvider {
                         .await?;
                 ImapMailboxStatus {
                     uid_validity: mailbox_info.uid_validity,
+                    uid_next: mailbox_info.uid_next,
                     highest_modseq: mailbox_info.highest_modseq,
                     exists: mailbox_info.exists,
                 }
@@ -1802,6 +2253,28 @@ impl ImapProvider {
         let result = do_select!(sess);
 
         Ok(result)
+    }
+
+    /// Probe a mailbox without selecting it. This is used for custom-folder
+    /// new-mail checks so dozens of folders do not incur full SELECT/SEARCH
+    /// work every few seconds.
+    pub async fn probe_mailbox_status(&self, mailbox: &str) -> Result<ImapMailboxStatus> {
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+        let info = with_imap_timeout(
+            "STATUS",
+            IMAP_STATUS_PROBE_TIMEOUT_SECS,
+            sess.status(mailbox, "(MESSAGES UIDNEXT UIDVALIDITY)"),
+        )
+        .await?;
+        Ok(ImapMailboxStatus {
+            uid_validity: info.uid_validity,
+            uid_next: info.uid_next,
+            highest_modseq: None,
+            exists: info.exists,
+        })
     }
 
     /// Fetch flags for a set of UIDs along with per-message MODSEQ values.

@@ -39,8 +39,9 @@ fn queue_permanent_delete_failure(
     remote_id: &str,
     trash_folder_id: &str,
     trash_folder_remote_id: &str,
+    allow_local_commit: bool,
     error: &str,
-) -> std::result::Result<(), PebbleError> {
+) -> std::result::Result<u32, PebbleError> {
     let payload = json!({
         "provider_account_id": account_id,
         "remote_id": remote_id,
@@ -58,7 +59,12 @@ fn queue_permanent_delete_failure(
         &payload.to_string(),
     )?;
     state.store.mark_pending_mail_op_failed(&op_id, error)?;
-    Ok(())
+    if allow_local_commit {
+        state.store.hard_delete_messages(&[message_id.to_string()])?;
+        remove_search_documents(state, &[message_id.to_string()])?;
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 /// Returns "archived" or "unarchived" so the frontend can show the correct toast.
@@ -497,6 +503,22 @@ pub async fn delete_message(
     let source_folder = find_message_folder(&state, &message_id, &msg.account_id)?;
     let trash_folder = find_folder_by_role(&state, &msg.account_id, FolderRole::Trash).ok();
     let is_permanent = source_folder.role == Some(FolderRole::Trash);
+
+    // 本地消息（本地草稿/从未同步到服务器的邮件）没有服务器 remote_id，
+    // 直接走本地删除；否则 remote_id 为空时 parse_imap_uid("") 会失败，
+    // 表现为"删除失败"（草稿箱删不掉的根因）。
+    if msg.remote_id.is_empty() || msg.remote_id.starts_with("__local_") {
+        if is_permanent {
+            state
+                .store
+                .hard_delete_messages(std::slice::from_ref(&message_id))?;
+            remove_search_documents(&state, std::slice::from_ref(&message_id))?;
+        } else {
+            state.store.soft_delete_message(&message_id)?;
+            refresh_search_document(&state, &message_id)?;
+        }
+        return Ok(());
+    }
 
     let outcome = match provider_type {
         ProviderType::Gmail => match connect_gmail(&state, &msg.account_id).await {
@@ -1116,7 +1138,32 @@ pub async fn empty_trash(
     state: State<'_, AppState>,
     account_id: String,
 ) -> std::result::Result<u32, PebbleError> {
-    let trash = find_folder_by_role(&state, &account_id, FolderRole::Trash)?;
+    empty_folder_impl(state, account_id, FolderRole::Trash).await
+}
+
+#[tauri::command]
+pub async fn empty_spam(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> std::result::Result<u32, PebbleError> {
+    empty_folder_impl(state, account_id, FolderRole::Spam).await
+}
+
+#[tauri::command]
+pub async fn empty_drafts(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> std::result::Result<u32, PebbleError> {
+    empty_folder_impl(state, account_id, FolderRole::Drafts).await
+}
+
+async fn empty_folder_impl(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder_role: FolderRole,
+) -> std::result::Result<u32, PebbleError> {
+    let allow_local_commit = folder_role == FolderRole::Drafts;
+    let trash = find_folder_by_role(&state, &account_id, folder_role)?;
     let provider_type = state
         .store
         .get_account(&account_id)?
@@ -1153,13 +1200,14 @@ pub async fn empty_trash(
                             Err(e) => {
                                 let error = e.to_string();
                                 warn!("Gmail permanent delete failed for {}: {error}", msg.id);
-                                queue_permanent_delete_failure(
+                                total_deleted += queue_permanent_delete_failure(
                                     &state,
                                     &account_id,
                                     &msg.id,
                                     &msg.remote_id,
                                     &trash.id,
                                     &trash.remote_id,
+                                    allow_local_commit,
                                     &error,
                                 )?;
                             }
@@ -1173,13 +1221,14 @@ pub async fn empty_trash(
                             Err(e) => {
                                 let error = e.to_string();
                                 warn!("Outlook permanent delete failed for {}: {error}", msg.id);
-                                queue_permanent_delete_failure(
+                                total_deleted += queue_permanent_delete_failure(
                                     &state,
                                     &account_id,
                                     &msg.id,
                                     &msg.remote_id,
                                     &trash.id,
                                     &trash.remote_id,
+                                    allow_local_commit,
                                     &error,
                                 )?;
                             }
@@ -1194,26 +1243,28 @@ pub async fn empty_trash(
                                 Err(e) => {
                                     let error = e.to_string();
                                     warn!("IMAP permanent delete failed for {}: {error}", msg.id);
-                                    queue_permanent_delete_failure(
+                                    total_deleted += queue_permanent_delete_failure(
                                         &state,
                                         &account_id,
                                         &msg.id,
                                         &msg.remote_id,
                                         &trash.id,
                                         &trash.remote_id,
+                                        allow_local_commit,
                                         &error,
                                     )?;
                                 }
                             }
                         } else {
                             let error = format!("Invalid IMAP UID: {}", msg.remote_id);
-                            queue_permanent_delete_failure(
+                            total_deleted += queue_permanent_delete_failure(
                                 &state,
                                 &account_id,
                                 &msg.id,
                                 &msg.remote_id,
                                 &trash.id,
                                 &trash.remote_id,
+                                allow_local_commit,
                                 &error,
                             )?;
                         }
@@ -1225,13 +1276,14 @@ pub async fn empty_trash(
                 .as_deref()
                 .unwrap_or("Remote provider unavailable");
             for msg in &messages {
-                queue_permanent_delete_failure(
+                total_deleted += queue_permanent_delete_failure(
                     &state,
                     &account_id,
                     &msg.id,
                     &msg.remote_id,
                     &trash.id,
                     &trash.remote_id,
+                    allow_local_commit,
                     error,
                 )?;
             }

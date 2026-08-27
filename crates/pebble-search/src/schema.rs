@@ -184,9 +184,9 @@ pub fn build_schema() -> SearchSchema {
         DateOptions::from(INDEXED | STORED).set_precision(DateTimePrecision::Seconds);
     let date = builder.add_date_field("date", date_options);
 
-    let folder_id = builder.add_text_field("folder_id", STRING);
+    let folder_id = builder.add_text_field("folder_id", STRING | STORED);
     let account_id = builder.add_text_field("account_id", STRING);
-    let has_attachment = builder.add_text_field("has_attachment", STRING);
+    let has_attachment = builder.add_text_field("has_attachment", STRING | STORED);
 
     let schema = builder.build();
 

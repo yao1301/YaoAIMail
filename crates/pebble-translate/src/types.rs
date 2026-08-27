@@ -18,18 +18,41 @@ pub enum TranslateProviderConfig {
     },
     #[serde(rename = "llm")]
     LLM {
-        endpoint: String,
-        api_key: String,
-        model: String,
-        mode: LLMMode,
+        providers: Vec<LlmProvider>,
+        active_id: String,
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LLMMode {
     Completions,
     Responses,
+}
+
+/// Built-in LLM provider families plus a fully custom option.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    OpenAI,
+    DeepSeek,
+    Gemini,
+    Custom,
+}
+
+/// A single configured LLM provider. `base_url` is the API base (e.g.
+/// `https://api.openai.com/v1`); `chat_path` is the route appended for chat
+/// completions (e.g. `/chat/completions`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmProvider {
+    pub id: String,
+    pub name: String,
+    pub kind: ProviderKind,
+    pub base_url: String,
+    pub chat_path: String,
+    pub api_key: String,
+    pub model: String,
+    pub mode: LLMMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -105,6 +105,72 @@ function filterInlineStyles(html: string): string {
   return template.innerHTML;
 }
 
+interface SafeImageDimensions {
+  width?: string;
+  height?: string;
+}
+
+function safeImageDimension(value: string | null): string | undefined {
+  const normalized = value?.trim().replace(/\s*!important\s*$/i, "").trim().toLowerCase();
+  if (!normalized) return undefined;
+  // Email clients commonly serialize signature sizes as decimal pixels. Keep
+  // only plain non-negative lengths so this restoration cannot carry CSS
+  // functions, URLs, escapes, or other executable syntax through sanitizing.
+  const match = normalized.match(/^(\d+(?:\.\d+)?)(px|%)?$/);
+  if (!match) return undefined;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount < 0) return undefined;
+  return `${match[1]}${match[2] ?? "px"}`;
+}
+
+function imageStyleDimension(style: string | null, property: "width" | "height") {
+  let result: string | undefined;
+  for (const declaration of (style ?? "").split(";")) {
+    const colon = declaration.indexOf(":");
+    if (colon < 0) continue;
+    const name = declaration.slice(0, colon).trim().toLowerCase();
+    if (name !== property) continue;
+    const safe = safeImageDimension(declaration.slice(colon + 1));
+    if (safe) result = safe;
+  }
+  return result;
+}
+
+function dimensionAttributeValue(value: string): string {
+  return value.endsWith("px") ? value.slice(0, -2) : value;
+}
+
+function collectImageDimensions(html: string): SafeImageDimensions[] {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  return Array.from(template.content.querySelectorAll<HTMLImageElement>("img"), (image) => ({
+    // Production WebView can retain getAttribute("style") while exposing an
+    // empty CSSStyleDeclaration for detached template images. Parse the raw
+    // declaration text instead of relying on image.style.width/height.
+    width: imageStyleDimension(image.getAttribute("style"), "width")
+      ?? safeImageDimension(image.getAttribute("width")),
+    height: imageStyleDimension(image.getAttribute("style"), "height")
+      ?? safeImageDimension(image.getAttribute("height")),
+  }));
+}
+
+function restoreImageDimensions(
+  html: string,
+  dimensions: SafeImageDimensions[],
+): string {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  template.content.querySelectorAll<HTMLImageElement>("img").forEach((image, index) => {
+    const original = dimensions[index];
+    if (!original) return;
+    // Standard attributes survive repeated DOMPurify passes and continue to
+    // work when production WebView refuses to parse the detached inline style.
+    if (original.width) image.setAttribute("width", dimensionAttributeValue(original.width));
+    if (original.height) image.setAttribute("height", dimensionAttributeValue(original.height));
+  });
+  return template.innerHTML;
+}
+
 function normalizeLinkAttributes(html: string): string {
   const template = document.createElement("template");
   template.innerHTML = html;
@@ -188,6 +254,7 @@ function extractApprovedCssNodes(html: string): { cssNodes: string; htmlWithoutC
 
 /** Sanitize HTML to prevent XSS while preserving email formatting. */
 export function sanitizeHtml(html: string): string {
+  const imageDimensions = collectImageDimensions(html);
   const { cssNodes, htmlWithoutCssNodes } = extractApprovedCssNodes(html);
   const sanitized = DOMPurify.sanitize(htmlWithoutCssNodes, {
     ALLOWED_TAGS: [
@@ -209,5 +276,6 @@ export function sanitizeHtml(html: string): string {
     ],
     ALLOW_DATA_ATTR: false,
   });
-  return cssNodes + normalizeLinkAttributes(filterStylesheetLinks(filterInlineStyles(sanitized)));
+  const filtered = normalizeLinkAttributes(filterStylesheetLinks(filterInlineStyles(sanitized)));
+  return cssNodes + restoreImageDimensions(filtered, imageDimensions);
 }

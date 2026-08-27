@@ -2,9 +2,13 @@ import { useState, useEffect, useRef, useMemo } from "react";
 import { useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
+import { TextStyle } from "@tiptap/extension-text-style";
+import FontFamily from "@tiptap/extension-font-family";
+import Image from "@tiptap/extension-image";
+import Underline from "@tiptap/extension-underline";
 import { Markdown as MarkdownExtension } from "tiptap-markdown";
 import TurndownService from "turndown";
-import { getSignature } from "@/lib/signatures";
+import { getSignature, listEmailSignatures } from "@/lib/signatures";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
 import type { Message } from "@/lib/ipc-types";
 import type { TFunction } from "i18next";
@@ -23,8 +27,10 @@ interface UseComposeEditorArgs {
     editorMode?: EditorMode;
     rawSource?: string;
     richTextHtml?: string;
+    quotedReplyHtml?: string;
   } | null;
   prefillBody?: string;
+  preferredSignatureId?: string;
 }
 
 interface BuildComposeEditorContentArgs {
@@ -53,10 +59,44 @@ function escapeHtml(s: string) {
 }
 
 function plainTextToParagraphs(text: string) {
-  return text
-    .split(/\r?\n/)
-    .map((line) => line.trim() ? `<p>${escapeHtml(line)}</p>` : "<p><br></p>")
+  // 段落规则：
+  // 1. 显式空行（\n{2,}）一定是段落分隔。
+  // 2. 单换行（无空行）时，若行较短（< 90 字符）也按段落切分——
+  //    开发信/AI 草稿常用单换行分隔短段落，若全并成一段会没有段距。
+  //    长行（>= 90 字符）视为同一段内的折行，用 <br/> 连接。
+  // 3. 列表项（- / 1. 开头）保持为同一段内的换行（<br/>），避免拆散列表。
+  const paragraphs = text
+    .split(/\r?\n{2,}/)
+    .flatMap((para) => {
+      const lines = para.split(/\r?\n/);
+      if (lines.length <= 1) return [para];
+      // 判断是否列表块（大多数行以 -、*、数字. 开头）
+      const listLike = lines.filter((l) => l.trim()).every((l) => /^\s*(?:[-*•]|\d+[.)])\s/.test(l));
+      if (listLike) return [lines.join("\n")];
+      // 单换行短行 → 各自成段；长行合并
+      const out: string[] = [];
+      let buf: string[] = [];
+      for (const line of lines) {
+        if (line.trim().length === 0) continue;
+        if (line.length >= 90) {
+          if (buf.length) { out.push(buf.join("\n")); buf = []; }
+          out.push(line);
+        } else {
+          buf.push(line);
+        }
+      }
+      if (buf.length) out.push(buf.join("\n"));
+      return out;
+    })
+    .map((para) => {
+      const lines = para
+        .split(/\r?\n/)
+        .map((line) => escapeHtml(line))
+        .join("<br/>");
+      return `<p>${lines}</p>`;
+    })
     .join("");
+  return paragraphs || "<p></p>";
 }
 
 function parseBodyHtml(html: string) {
@@ -103,7 +143,10 @@ export function buildComposeEditorContent({
 }: BuildComposeEditorContentArgs) {
   try {
     if (isReply && composeReplyTo) {
-      return `<p><br></p>${signatureHtml}`;
+      const replyBody = prefillBody?.trim()
+        ? plainTextToParagraphs(prefillBody)
+        : "<p><br></p>";
+      return `${replyBody}${signatureHtml}`;
     }
     if (composeMode === "forward" && composeReplyTo) {
       const sender = escapeHtml(composeReplyTo.from_name || composeReplyTo.from_address || "");
@@ -161,6 +204,7 @@ export function useComposeEditor({
   t,
   restoredDraft,
   prefillBody,
+  preferredSignatureId,
 }: UseComposeEditorArgs) {
   const [editorMode, setEditorMode] = useState<EditorMode>(restoredDraft?.editorMode ?? "rich");
   const [rawSource, setRawSource] = useState(restoredDraft?.rawSource ?? prefillBody ?? "");
@@ -168,6 +212,7 @@ export function useComposeEditor({
   const [htmlPreview, setHtmlPreview] = useState(false);
   const [signature, setSignature] = useState("");
   const [signatureReady, setSignatureReady] = useState(Boolean(restoredDraft));
+  const [editorContentReady, setEditorContentReady] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const contentInitializedRef = useRef(false);
 
@@ -178,7 +223,15 @@ export function useComposeEditor({
     }
     let cancelled = false;
     setSignatureReady(false);
-    getSignature(fromAccountId)
+    const loadSignature = async () => {
+      if (preferredSignatureId) {
+        const signatures = await listEmailSignatures(fromAccountId);
+        const preferred = signatures.find((item) => item.id === preferredSignatureId);
+        if (preferred) return preferred.content;
+      }
+      return getSignature(fromAccountId);
+    };
+    loadSignature()
       .then((loaded) => {
         if (!cancelled) setSignature(loaded);
       })
@@ -192,21 +245,37 @@ export function useComposeEditor({
     return () => {
       cancelled = true;
     };
-  }, [fromAccountId, restoredDraft]);
+  }, [fromAccountId, preferredSignatureId, restoredDraft]);
 
-  // Build signature HTML block
+  // Build signature HTML block. New-style signatures are stored as HTML
+  // (rich text editor); legacy plain-text signatures are escaped.
   const signatureHtml = useMemo(() => {
     const sig = signature;
     if (!sig) return "";
-    return `<br/><br/><div style="color:var(--color-text-secondary);font-size:13px">--<br/>${escapeHtml(sig).replace(/\n/g, "<br/>")}</div>`;
+    const isHtml = /<[a-z][\s\S]*>/i.test(sig);
+    const body = isHtml ? sig : escapeHtml(sig).replace(/\n/g, "<br/>");
+    return `<br/><br/><div style="color:var(--color-text-secondary);font-size:13px">--<br/>${body}</div>`;
   }, [signature]);
 
   const editorContent = useMemo(() => {
     return buildComposeEditorContent({ composeMode, composeReplyTo, isReply, signatureHtml, prefillBody, t });
   }, [composeMode, composeReplyTo, isReply, t, signatureHtml, prefillBody]);
-  const quotedReplyHtml = useMemo(() => {
+  const generatedQuotedReplyHtml = useMemo(() => {
     return isReply ? buildReplyQuoteHtml({ composeReplyTo, t }) : "";
   }, [composeReplyTo, isReply, t]);
+  // The reply target is a live store object. It can briefly disappear while
+  // switching compose tabs, applying an AI draft, or restoring a backend
+  // draft. A reply must keep the original quote that was visible when the
+  // compose session started; otherwise later AI rounds and the final send can
+  // silently lose the incoming message.
+  const [stableQuotedReplyHtml, setStableQuotedReplyHtml] = useState(
+    () => restoredDraft?.quotedReplyHtml?.trim() ?? "",
+  );
+  useEffect(() => {
+    if (!isReply || stableQuotedReplyHtml || !generatedQuotedReplyHtml) return;
+    setStableQuotedReplyHtml(generatedQuotedReplyHtml);
+  }, [generatedQuotedReplyHtml, isReply, stableQuotedReplyHtml]);
+  const quotedReplyHtml = stableQuotedReplyHtml || generatedQuotedReplyHtml;
 
   const editor = useEditor({
     immediatelyRender: false,
@@ -214,6 +283,10 @@ export function useComposeEditor({
       StarterKit,
       Placeholder.configure({ placeholder: t("compose.editorPlaceholder", "Write your message...") }),
       MarkdownExtension.configure({ html: true, transformPastedText: true }),
+      TextStyle,
+      FontFamily.configure({ types: ["textStyle"] }),
+      Image.configure({ inline: true, allowBase64: true }),
+      Underline,
     ],
     content: "",
   });
@@ -236,6 +309,7 @@ export function useComposeEditor({
       requestAnimationFrame(() => editor.commands.focus("start"));
     }
     contentInitializedRef.current = true;
+    setEditorContentReady(true);
   }, [editor, editorContent, isReply, restoredDraft, signatureReady]);
 
   useEffect(() => {
@@ -293,6 +367,7 @@ export function useComposeEditor({
     setHtmlPreview,
     switchMode,
     textareaRef,
+    editorContentReady,
     quotedReplyHtml,
   };
 }

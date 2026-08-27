@@ -30,7 +30,7 @@ export function ShadowDomEmail({ html, className }: ShadowDomEmailProps) {
           background: transparent;
           word-break: break-word;
         }
-        img { max-width: 100%; height: auto; }
+        img { max-width: 100% !important; height: auto !important; }
         a { color: var(--color-accent); }
         .pebble-email-content {
           box-sizing: border-box;
@@ -101,6 +101,16 @@ export function ShadowDomEmail({ html, className }: ShadowDomEmailProps) {
       </style>
       <div class="pebble-email-content">${safeHtml}</div>
     `;
+
+    // Keep the sender-authored width for small signature logos while preventing
+    // genuinely oversized images from overflowing the reader. Forcing
+    // `width:auto !important` makes a 110px logo expand to its intrinsic bitmap
+    // width, and a global max-height also distorts legitimate email content.
+    shadow.querySelectorAll<HTMLImageElement>("img").forEach((img) => {
+      img.style.setProperty("max-width", "100%", "important");
+      img.style.setProperty("height", "auto", "important");
+      img.setAttribute("data-yao-capped", "1");
+    });
 
     const handleClick = (event: Event) => {
       const target = event.target;

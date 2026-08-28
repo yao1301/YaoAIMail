@@ -609,7 +609,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn converts_verbatim_paths_for_windows_shell() {
-        assert_eq!(windows_shell_path(Path::new(r"\\?\D:\MailData\attachments\file.pdf")), PathBuf::from(r"D:\MailData\attachments\file.pdf"));
+        assert_eq!(windows_shell_path(Path::new(r"\\?\C:\TestData\attachments\file.pdf")), PathBuf::from(r"C:\TestData\attachments\file.pdf"));
         assert_eq!(windows_shell_path(Path::new(r"\\?\UNC\server\share\file.pdf")), PathBuf::from(r"\\server\share\file.pdf"));
     }
 

@@ -5,7 +5,7 @@
 <h1 align="center">YaoAIMail（老妖 AI 外贸邮）</h1>
 
 <p align="center">
-  一个装着懂外贸 AI 的 Windows 邮件客户端：收发邮件、AI 写信、客户管理、开发客户、资信调研，一个软件干完。
+  一个内置懂外贸 AI 的 Windows 邮件客户端：收发邮件、AI 写信、客户管理、开发客户、资信调研，一个软件干完。
 </p>
 
 <p align="center">

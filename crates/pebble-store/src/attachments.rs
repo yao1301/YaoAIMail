@@ -228,15 +228,15 @@ mod tests {
             filename: "history.pdf".to_string(),
             mime_type: "application/pdf".to_string(),
             size: 12,
-            local_path: Some("D:\\old\\attachments\\message\\history.pdf".to_string()),
+            local_path: Some("C:\\TestData\\old\\attachments\\message\\history.pdf".to_string()),
             content_id: None,
             is_inline: false,
         }).unwrap();
 
-        store.update_attachment_local_path(&att_id, "D:\\MailData\\attachments\\message\\history.pdf").unwrap();
+        store.update_attachment_local_path(&att_id, "C:\\TestData\\attachments\\message\\history.pdf").unwrap();
         assert_eq!(
             store.get_attachment(&att_id).unwrap().unwrap().local_path.as_deref(),
-            Some("D:\\MailData\\attachments\\message\\history.pdf")
+            Some("C:\\TestData\\attachments\\message\\history.pdf")
         );
     }
 

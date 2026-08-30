@@ -4,6 +4,8 @@ All notable changes to Pebble will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses semantic version tags.
 
+Chinese version: [CHANGELOG.zh-CN.md](./CHANGELOG.zh-CN.md).
+
 ## [Unreleased]
 
 ## [1.1.23] - 2026-08-29

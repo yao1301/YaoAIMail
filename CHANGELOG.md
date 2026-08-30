@@ -14,15 +14,48 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Batch mail selection no longer shows duplicate per-row checkboxes; Ctrl can remove the first message from a Shift-selected range.
 - WPS/Excel formatted-table paste keeps the original visual preview instead of falling back to a simplified table.
 
-## [1.1.21] - 2026-08-29
+### Removed
+
+- Dropped the leftover "Snoozed" (稍后提醒) pseudo-folder. It was an early experimental local view, not a real IMAP folder; the sidebar entry and page route are gone, and old navigation state now falls back to the inbox instead of showing a folder with no way in. Existing database rows are kept only for backward compatibility.
+
+## [1.1.22] - 2026-08-29
 
 ### Added
 
-- Added safe undo-send countdowns, scheduled sending, EML/MBOX migration, complete MIME export, WPS/Excel formatted-table previews, and restored Snoozed navigation.
+- Home AI workbench "foreign-trade Skills": seven read-only capabilities — company background research, company email verification, research-based outreach writing, reply strategy, follow-up planning, daily foreign-trade briefing, and thread summary. Routed automatically from the instruction or picked manually; every Skill is analysis-only or draft-only and can never send mail, edit customers, or create calendar entries.
+- Per-address right-click menu on the sender, each To address and each Cc address: write to this address, copy address, add/edit contact, search mail with this address, create a filter from it, or open the customer profile.
+- Create the target folder inline while editing a "move to folder" mail rule — no need to leave the rule dialog and create it on the server first.
+- Safe undo-send countdown before SMTP submission (default 10 seconds; configurable as off / 5 / 10 / 15 / 30 s). Cancelling keeps the draft, recipients, body and attachments intact.
+- Scheduled sending: pick a local date and time, the message is stored in the outbox and only submitted when the time arrives; a restart before then does not lose the schedule.
+- EML/MBOX batch migration (Settings → General): multi-select files or recursively scan a folder, preserving subject, addresses, Cc/Bcc, original date, plain text, HTML, reply relations, inline images and attachments, with live progress, duplicate detection, a failure list and cancellation.
+- Complete MIME EML export: "forward as attachment" and "export EML" now keep plain text + HTML, To/Cc/Bcc, Message-ID, In-Reply-To, References, original date, inline image CIDs and all attachments instead of rebuilding a plain-text-only copy.
+- Customizable reference-currency list in the foreign-trade toolbox: add/remove currencies, edit the conversion quantity, Chinese currency names, and USD-based full exchange rates so newly added currencies get real values.
+- Carrier tracking-number detection for one-key logistics lookup.
+
+### Changed
+
+- "Send new mail to the same recipients" now always uses the original To list, regardless of whether the message sits in Sent, Inbox or a custom folder (previously it used the From address for received mail, which was really "reply to sender").
+- Historical reply/forward quotes render as one unified card (grey header + white body) when reading: Outlook, NetEase, Zoho, Gmail, Yahoo, cite-blockquotes and early in-app quote structures are all recognized. Only the reading view changes — server mail and the local database are never rewritten.
+- Pasted WPS and Excel tables keep the original visual preview (cell colors, borders, merged cells) as a single image instead of being flattened by the editor.
+- Compose distinguishes between dropping a file as an attachment and dropping it as AI context.
 
 ### Fixed
 
-- Restored message-row and select-all batch controls and kept empty-folder accounts visible in the multi-account sidebar.
+- Restored the per-row batch-selection checkbox on message rows and the select-all control in the batch toolbar.
+- Restored the Snoozed navigation entry that existed in the backend and page but had fallen out of the route and sidebar types.
+- Multi-account sidebar now creates a group for every account even when that account has not synced any folders yet.
+- Inline images are rendered at a sane size instead of being blown up.
+- Full Vitest baseline restored: 100 test files / 388 assertions passing, zero unhandled errors.
+
+## [1.1.21] - 2026-08-26
+
+### Added
+
+- Attachment copy and drag-out: drag attachments straight into Windows Explorer (multiple selection supported); right-click "Copy" and the copy button now use the native Windows Shell file clipboard so they paste correctly, including long-path compatibility. Ctrl+C after selecting attachments works too.
+
+### Fixed
+
+- Historical attachments no longer fail to open after the data directory was moved. Open, save-as, batch save, copy and "send to AI" now resolve the current attachment directory and auto-correct the path when it can be confirmed.
 
 ### Added
 
@@ -47,6 +80,75 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Customer profile generation returned empty content when the agent exhausted its turn budget on tool calls (picked the last assistant message with non-empty content and forces a final answer).
 - Agent lead search got stuck in a 24-tool-call loop without emitting the final JSON (tool-call budget enforced in the prompt, turn limit raised, forced final round).
 - Draft attachments could not be opened (`open_external_url` rejected `file://`); now uses `open_local_file`.
+
+## [1.1.20] - 2026-08-26
+
+### Changed
+
+- All manual and automatic outreach emails were rewritten against real outbound data principles: one evidence-backed angle, no invented pain points or social proof, a single low-pressure call to action, and strict separation of fact, inference and suggestion.
+
+### Fixed
+
+- Sidebar unread counts no longer disappear.
+- Automatically developed campaigns no longer collapse the whole message into a single line (plain-text send formatting).
+- Pending-sync operations that used to keep failing are now retried and reported correctly.
+- Customer emails and companies in lead discovery are strictly attributed to the right company, so an address found on one page is never attached to a different candidate.
+
+## [1.1.19] - 2026-08-25
+
+### Added
+
+- Search sessions now store the context used for that search (dropped files, referenced mail, knowledge-base items). Outreach emails — both manually generated and auto-developed — inherit exactly that material, including after switching pages or restarting the app, so a letter is never written without the source it was researched from.
+- The outreach AI instruction box accepts dragged files and can reference knowledge-base items, matching the other AI inputs.
+- Search sessions that carry material show a marker in the session list, and reopening one restores its knowledge-base references.
+
+### Fixed
+
+- Email completion no longer gets stuck showing "searching…" forever. Statuses frozen as running by an interrupted session are reset to pending on startup, a batch "complete emails" button resumes unfinished candidates, and every unfinished row gets its own retry that also works for rows previously marked as not found.
+
+## [1.1.18] - 2026-08-25
+
+### Added
+
+- Lead discovery works without any paid search API: Bing, DuckDuckGo and Mojeek public search run in parallel and are merged and de-duplicated. Brave, Tavily, Hunter and Firecrawl remain optional enhancements.
+- Progressive results: public-search companies appear first while AI candidate batches keep filling in; a slow or timing-out batch no longer blanks results that were already shown.
+- Candidate cards use a consistent Chinese three-part layout (company intro, why it was recommended, evidence it was found on) instead of raw foreign text or code dumps.
+- Broader email discovery: official homepage, contact/team/legal pages, sitemaps, PDF catalogs and public web indexes, including Cloudflare-protected addresses and obfuscated forms such as `[dot]`.
+- An email only counts as "contactable" when it carries a real source page URL; otherwise the row is explicitly marked as needing completion, so no address is ever invented.
+- Website verification status: only an identity-checked site is labelled as a verified official site, preventing addresses from another company's page being attached to the wrong candidate.
+- Initial/incremental sync limits and history backfill were made resilient (smaller batches, skipping failed sub-pages, dedicated backfill ticker) so large folders keep progressing.
+
+### Changed
+
+- Industry associations, chambers of commerce, exhibition sites and media directories no longer pose as candidate companies; they are only used as sources for discovering companies.
+- "Exclude China-based companies" was upgraded from a prompt preference to a hard rule with three layers of filtering: search terms, AI candidates and the final list.
+- The AI model setting became a single dropdown for easier custom models.
+
+### Fixed
+
+- A crash caused by a text-truncation error while parsing Chinese web pages. A crash log was added that records technical information only — never mail or input content.
+- Clicking a candidate website did nothing; protocol-less URLs now open as https.
+- Sent mail now moves into the configured custom folder immediately instead of requiring a manual "get mail" click.
+- Custom IMAP folders now update the sidebar unread count and raise system notifications, not just the inbox.
+
+### Security
+
+- Outbound web reads were hardened: private/internal addresses are blocked and redirects and download sizes are limited, so a malicious site cannot use search to probe the local network.
+
+## [1.1.17] - 2026-08-23
+
+### Security
+
+- Release binaries no longer leak the development machine. Rust path remapping (`--remap-path-prefix`) removes developer usernames and project absolute paths from dependency diagnostics; `strip=true` alone never removed `file!()` style paths.
+- The OAuth fallback that looked for an `.env` in the source tree is now compiled only in debug builds, so `CARGO_MANIFEST_DIR` cannot leak the build directory into a release EXE. Release builds still read `.env` from the run directory and its parents.
+- `打包流程和避坑.txt` was updated: formal packages must use path remapping, scan binaries for absolute paths, and guard compile-time constants such as `CARGO_MANIFEST_DIR`.
+
+## [1.1.16] - 2026-08-22
+
+### Fixed
+
+- Credit-research results added to a customer profile no longer show raw Markdown symbols. AI profile text cleanup was extracted into a shared `formatProfileText` used by both entry points; it handles headings, bold/italic/strikethrough, code markers, quotes, lists, links, images, HTML, dividers and Markdown tables while keeping link addresses and code content readable.
+- The first-run wizard referred to the data-directory environment variable as `PEBBLE_DATA_DIR`; the code actually uses `PEBBLE_PROFILE_DIR`.
 
 ## [1.1.1] - 2026-08-05
 

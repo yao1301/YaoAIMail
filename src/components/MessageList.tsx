@@ -454,9 +454,22 @@ export default function MessageList({
           padding: "6px 10px", borderBottom: "1px solid var(--color-border)",
           backgroundColor: "var(--color-bg)", flexShrink: 0,
         }}>
-          <span style={{ fontSize: 12, color: "var(--color-text-secondary)", padding: "0 4px" }}>
-            {selectedMessageIds.size > 0 ? `已选 ${selectedMessageIds.size} 封` : "可用 Ctrl/Shift 点击多选"}
-          </span>
+          <label className="batch-select-control">
+            <input
+              type="checkbox"
+              className="batch-checkbox batch-select-all-checkbox"
+              aria-label="Select all"
+              checked={visibleMessages.length > 0 && selectedMessageIds.size === visibleMessages.length}
+              onChange={() => {
+                const allSelected = visibleMessages.length > 0 && selectedMessageIds.size === visibleMessages.length;
+                useMailStore.setState({
+                  selectedMessageIds: allSelected ? new Set() : new Set(visibleMessages.map((message) => message.id)),
+                  batchMode: true,
+                });
+              }}
+            />
+            <span>{selectedMessageIds.size > 0 ? `已选 ${selectedMessageIds.size} 封` : "全选"}</span>
+          </label>
           {selectedMessageIds.size > 0 && (
             <>
               <BatchBtn icon={Archive} label={t("messageActions.archive")} onClick={() => handleBatchAction("archive")} disabled={batchLoading} />

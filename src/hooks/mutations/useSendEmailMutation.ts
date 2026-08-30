@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { sendEmail } from "@/lib/api";
 
-interface SendEmailParams {
+export interface SendEmailParams {
   accountId: string;
   to: string[];
   cc: string[];

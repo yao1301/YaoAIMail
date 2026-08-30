@@ -5,6 +5,7 @@ import { useNotificationOpenNavigation } from "../../src/app/useNotificationOpen
 const mocks = vi.hoisted(() => ({
   listeners: new Map<string, (event: { payload: { account_id?: string; message_id?: string } }) => void>(),
   setActiveAccountId: vi.fn(),
+  setActiveFolderId: vi.fn(),
   openMessageInInbox: vi.fn(),
   invalidateQueries: vi.fn(),
 }));
@@ -23,8 +24,12 @@ vi.mock("@tanstack/react-query", () => ({
 }));
 
 vi.mock("../../src/stores/mail.store", () => ({
-  useMailStore: (selector: (state: { setActiveAccountId: (accountId: string) => void }) => unknown) =>
-    selector({ setActiveAccountId: mocks.setActiveAccountId }),
+  useMailStore: (selector: (state: { setActiveAccountId: (accountId: string) => void; setActiveFolderId: (folderId: string) => void }) => unknown) =>
+    selector({ setActiveAccountId: mocks.setActiveAccountId, setActiveFolderId: mocks.setActiveFolderId }),
+}));
+
+vi.mock("../../src/lib/api", () => ({
+  listFolders: vi.fn().mockResolvedValue([{ id: "inbox-2", role: "inbox" }]),
 }));
 
 vi.mock("../../src/stores/ui.store", () => ({
@@ -47,7 +52,8 @@ describe("useNotificationOpenNavigation", () => {
       payload: { account_id: "account-2", message_id: "message-1" },
     });
 
-    expect(mocks.setActiveAccountId).toHaveBeenCalledWith("account-2");
+    await waitFor(() => expect(mocks.setActiveAccountId).toHaveBeenCalledWith("account-2"));
+    expect(mocks.setActiveFolderId).toHaveBeenCalledWith("inbox-2");
     expect(mocks.openMessageInInbox).toHaveBeenCalledWith("message-1");
     expect(mocks.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["messages"] });
     expect(mocks.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["threads"] });

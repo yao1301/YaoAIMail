@@ -12,6 +12,12 @@ const t = ((key: string, options?: Record<string, string>) => {
   if (key === "compose.quoteAttribution") {
     return `On ${options?.date}, ${options?.sender} wrote:`;
   }
+  if (key === "compose.originalMessage") return "Original message";
+  if (key === "compose.sentDate") return "Sent";
+  if (key === "compose.from") return "From";
+  if (key === "compose.to") return "To";
+  if (key === "compose.cc") return "Cc";
+  if (key === "compose.subject") return "Subject";
   if (key === "compose.forwardedHeader") {
     return "Forwarded message";
   }
@@ -80,12 +86,20 @@ describe("buildComposeEditorContent", () => {
       composeReplyTo: makeMessage({
         body_html_raw:
           "&lt;html&gt;&lt;body&gt;&lt;p&gt;&lt;strong&gt;Hello&lt;/strong&gt; team&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;",
+        to_list: [{ name: "Buyer", address: "buyer@example.com" }],
+        cc_list: [{ name: null, address: "copy@example.com" }],
+        subject: "Quarterly order",
       }),
       t,
     });
 
-    expect(quote).toContain("<blockquote");
-    expect(quote).toContain("Sender wrote");
+    expect(quote).toContain("class=\"compose-original-quote\"");
+    expect(quote).toContain("Original message");
+    expect(quote).toContain("sender@example.com");
+    expect(quote).toContain("buyer@example.com");
+    expect(quote).toContain("copy@example.com");
+    expect(quote).toContain("Quarterly order");
+    expect(quote).toContain("background:#f3f4f6");
     expect(quote).toContain("<strong>Hello</strong> team");
     expect(quote).not.toContain("&lt;strong&gt;");
   });

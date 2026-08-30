@@ -12,6 +12,13 @@ import {
 } from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
 import { useUIStore, type RealtimePreference } from "@/stores/ui.store";
+import {
+  readUndoSendDelay,
+  UNDO_SEND_DELAY_OPTIONS,
+  writeUndoSendDelay,
+  type UndoSendDelaySeconds,
+} from "@/features/compose/undoSend";
+import MailImportSection from "./MailImportSection";
 
 const REALTIME_OPTIONS: Array<{
   mode: RealtimePreference;
@@ -56,6 +63,7 @@ export default function GeneralTab() {
   const [testingNotification, setTestingNotification] = useState(false);
   const [profileLocation, setProfileLocation] = useState<ProfileLocationInfo | null>(null);
   const [schedulingMigration, setSchedulingMigration] = useState(false);
+  const [undoSendDelay, setUndoSendDelay] = useState<UndoSendDelaySeconds>(() => readUndoSendDelay());
   const realtimeMode = useUIStore((s) => s.realtimeMode);
   const setRealtimeMode = useUIStore((s) => s.setRealtimeMode);
   const notificationsEnabled = useUIStore((s) => s.notificationsEnabled);
@@ -188,6 +196,8 @@ export default function GeneralTab() {
       <p style={{ fontSize: "11px", color: "var(--color-text-secondary)", margin: "8px 0 28px" }}>
         为防止数据库损坏，实际复制会在下次启动、数据库尚未打开时进行。目标必须是空文件夹；旧数据不会自动删除，可确认新位置正常后自行备份或删除。
       </p>
+
+      <MailImportSection />
 
       <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "8px" }}>
         默认同步频率（未单独设置账号时）
@@ -329,6 +339,40 @@ export default function GeneralTab() {
         />
         <span>{t("settings.quitOnClose", "Quit app when window is closed")}</span>
       </label>
+
+      <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>
+        发送前撤销
+      </h3>
+      <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", margin: "0 0 10px" }}>
+        点击发送后先在本机倒计时，期间可取消并继续编辑。倒计时结束、提交到邮箱服务器后便无法保证撤回。
+      </p>
+      <div role="group" aria-label="发送前撤销时间" style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+        {UNDO_SEND_DELAY_OPTIONS.map((seconds) => {
+          const selected = undoSendDelay === seconds;
+          return (
+            <button
+              key={seconds}
+              type="button"
+              aria-pressed={selected}
+              onClick={() => {
+                setUndoSendDelay(seconds);
+                writeUndoSendDelay(seconds);
+              }}
+              style={{
+                padding: "7px 13px",
+                borderRadius: "6px",
+                border: selected ? "2px solid var(--color-accent)" : "1px solid var(--color-border)",
+                background: selected ? "var(--color-bg-hover)" : "var(--color-bg)",
+                color: "var(--color-text-primary)",
+                cursor: "pointer",
+                fontWeight: selected ? 600 : 400,
+              }}
+            >
+              {seconds === 0 ? "关闭" : `${seconds} 秒`}
+            </button>
+          );
+        })}
+      </div>
 
       <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>
         {t("settings.folderCounts", "Folder Counts")}

@@ -26,7 +26,6 @@ describe("SelectionActionPopover", () => {
         onTranslate={vi.fn()}
         onSearch={vi.fn()}
         onCreateRule={vi.fn()}
-        onAddToKanbanNote={vi.fn()}
         onClose={vi.fn()}
       />,
     );
@@ -43,7 +42,6 @@ describe("SelectionActionPopover", () => {
     const onTranslate = vi.fn();
     const onSearch = vi.fn();
     const onCreateRule = vi.fn();
-    const onAddToKanbanNote = vi.fn();
     render(
       <SelectionActionPopover
         text="selected email text"
@@ -51,7 +49,6 @@ describe("SelectionActionPopover", () => {
         onTranslate={onTranslate}
         onSearch={onSearch}
         onCreateRule={onCreateRule}
-        onAddToKanbanNote={onAddToKanbanNote}
         onClose={vi.fn()}
       />,
     );
@@ -59,33 +56,28 @@ describe("SelectionActionPopover", () => {
     expect(screen.queryByRole("menuitem", { name: "Translate selected text" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Search selected text" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Create rule from selected text" })).toBeNull();
-    expect(screen.queryByRole("menuitem", { name: "Add selected text as kanban note" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "More selected-text actions" }));
 
     expect(screen.getByRole("menuitem", { name: "Search selected text" })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: "Create rule from selected text" })).toBeTruthy();
-    expect(screen.getByRole("menuitem", { name: "Add selected text as kanban note" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("menuitem", { name: "Translate selected text" }));
 
     expect(onTranslate).toHaveBeenCalledWith("selected email text", { x: 100, y: 120 });
     expect(onSearch).not.toHaveBeenCalled();
     expect(onCreateRule).not.toHaveBeenCalled();
-    expect(onAddToKanbanNote).not.toHaveBeenCalled();
   });
 
   it("runs secondary selected-text actions with the selected text", () => {
     const onSearch = vi.fn();
     const onCreateRule = vi.fn();
-    const onAddToKanbanNote = vi.fn();
     const props = {
       text: "selected email text",
       position: { x: 100, y: 120 },
       onTranslate: vi.fn(),
       onSearch,
       onCreateRule,
-      onAddToKanbanNote,
       onClose: vi.fn(),
     };
     let view = render(<SelectionActionPopover {...props} />);
@@ -102,11 +94,5 @@ describe("SelectionActionPopover", () => {
 
     expect(onCreateRule).toHaveBeenCalledWith("selected email text");
 
-    view.unmount();
-    render(<SelectionActionPopover {...props} />);
-    fireEvent.click(screen.getByRole("button", { name: "More selected-text actions" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Add selected text as kanban note" }));
-
-    expect(onAddToKanbanNote).toHaveBeenCalledWith("selected email text");
   });
 });

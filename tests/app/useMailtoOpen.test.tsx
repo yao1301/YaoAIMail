@@ -50,6 +50,9 @@ describe("useMailtoOpen", () => {
     mocks.confirm.mockResolvedValue(true);
     useUIStore.setState({ activeView: "inbox", previousView: "inbox" });
     useComposeStore.setState({
+      tabs: [],
+      tabsById: {},
+      activeTabId: null,
       composeMode: null,
       composeReplyTo: null,
       composePrefill: null,
@@ -75,7 +78,7 @@ describe("useMailtoOpen", () => {
     expect(mocks.invoke).toHaveBeenCalledWith("take_pending_mailto_urls");
   });
 
-  it("asks before replacing a dirty compose opened from mailto", async () => {
+  it("opens a new mailto tab without replacing a dirty compose", async () => {
     mocks.invoke.mockResolvedValue(["mailto:alice@example.com?subject=Hi"]);
     mocks.confirm.mockResolvedValue(false);
     useUIStore.setState({ activeView: "compose", previousView: "inbox" });
@@ -87,11 +90,12 @@ describe("useMailtoOpen", () => {
 
     renderHook(() => useMailtoOpen());
 
-    await waitFor(() => expect(mocks.confirm).toHaveBeenCalled());
-    expect(useComposeStore.getState().composePrefill).toEqual({ to: ["draft@example.com"] });
+    await waitFor(() => expect(useComposeStore.getState().tabs.length).toBe(1));
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(useComposeStore.getState().composePrefill).toMatchObject({ to: ["alice@example.com"] });
   });
 
-  it("opens only the first valid mailto URL and reports skipped links", async () => {
+  it("opens every distinct valid mailto URL in its own tab", async () => {
     mocks.invoke.mockResolvedValue([
       "mailto:first@example.com?subject=First",
       "mailto:second@example.com?subject=Second",
@@ -100,14 +104,10 @@ describe("useMailtoOpen", () => {
     renderHook(() => useMailtoOpen());
 
     await waitFor(() => {
-      expect(useComposeStore.getState().composePrefill).toMatchObject({
-        to: ["first@example.com"],
-        subject: "First",
-      });
+      expect(useComposeStore.getState().tabs).toHaveLength(2);
     });
-    expect(mocks.addToast).toHaveBeenCalledWith(expect.objectContaining({
-      type: "info",
-    }));
+    expect(useComposeStore.getState().tabs.map((tab) => tab.prefill?.subject)).toEqual(["First", "Second"]);
+    expect(mocks.addToast).not.toHaveBeenCalled();
   });
 
   it("opens mailto urls emitted while the app is running", async () => {

@@ -455,6 +455,74 @@ pub async fn send_email(
     }
 }
 
+/// Persist an outgoing message and let the existing reliable pending-op
+/// worker submit it once the requested local timestamp has arrived.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn schedule_email(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+    subject: String,
+    body_text: String,
+    body_html: Option<String>,
+    in_reply_to: Option<String>,
+    attachment_paths: Option<Vec<String>>,
+    send_at: i64,
+) -> std::result::Result<String, PebbleError> {
+    if send_at <= now_timestamp() + 5 {
+        return Err(PebbleError::Validation("定时发送时间必须至少晚于当前 5 秒".to_string()));
+    }
+    let raw_paths = attachment_paths.unwrap_or_default();
+    let attachment_paths = if raw_paths.is_empty() {
+        raw_paths
+    } else {
+        validate_attachment_paths(&raw_paths, &state.attachments_dir)?
+    };
+    let account = state
+        .store
+        .get_account(&account_id)?
+        .ok_or_else(|| PebbleError::Internal(format!("Account not found: {account_id}")))?;
+    let outgoing = OutgoingMessage {
+        to: parse_recipients(to),
+        cc: parse_recipients(cc),
+        bcc: parse_recipients(bcc),
+        subject,
+        body_text,
+        body_html,
+        in_reply_to,
+        attachment_paths,
+        message_id: None,
+    };
+    if outgoing.to.is_empty() {
+        return Err(PebbleError::Validation("至少需要一位收件人".to_string()));
+    }
+    let message = save_outgoing_message_and_refresh_search(
+        &state,
+        &account,
+        &outgoing,
+        LocalOutgoingState::Queued,
+        &state.attachments_dir,
+    )?;
+    let op_id = state.store.insert_pending_mail_op_at(
+        &account_id,
+        &message.id,
+        "send",
+        &serde_json::json!({
+            "provider_account_id": account_id,
+            "remote_id": message.remote_id,
+            "op": "send",
+            "payload": { "scheduled_at": send_at },
+        }).to_string(),
+        send_at,
+    )?;
+    let _ = app.emit(events::MAIL_PENDING_OPS_CHANGED, ());
+    Ok(op_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

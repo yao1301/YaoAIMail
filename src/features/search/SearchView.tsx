@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useTranslation } from "react-i18next";
 import { Search, Loader, ArrowUp, ArrowDown, Paperclip, SlidersHorizontal } from "lucide-react";
-import type { Account, AdvancedSearchQuery, SearchHit } from "@/lib/api";
+import type { Account, AdvancedSearchQuery, Folder, SearchHit } from "@/lib/api";
 import { advancedSearch, deleteMessage, listAccounts, listFolders, searchMessages } from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
@@ -13,6 +13,7 @@ import SearchResultItem from "./SearchResultItem";
 import MessageDetail from "@/components/MessageDetail";
 import { useMailStore } from "@/stores/mail.store";
 import SearchFilterDropdown from "@/components/SearchFilterDropdown";
+import SearchMessageContextMenu from "./SearchMessageContextMenu";
 
 type SearchSortKey = "date" | "subject" | "attachments";
 
@@ -40,10 +41,12 @@ export default function SearchView() {
   const pendingSearchFilters = useUIStore((s) => s.pendingSearchFilters);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [folderNames, setFolderNames] = useState<Record<string, string>>({});
+  const [folderRoles, setFolderRoles] = useState<Record<string, Folder["role"]>>({});
   const [filters, setFilters] = useState<AdvancedSearchQuery>(emptyFilters);
   const [filterOpen, setFilterOpen] = useState(false);
   const [searchFocused, setSearchFocused] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [messageMenu, setMessageMenu] = useState<{ x: number; y: number; hit: SearchHit } | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
   const [sort, setSort] = useState<{ key: SearchSortKey; dir: "asc" | "desc" }>({ key: "date", dir: "desc" });
   const storeSearchQuery = useUIStore((s) => s.searchQuery);
@@ -64,8 +67,10 @@ export default function SearchView() {
     void Promise.all(accounts.map((account) => listFolders(account.id)))
       .then((folderGroups) => {
         const next: Record<string, string> = {};
-        folderGroups.flat().forEach((folder) => { next[folder.id] = folder.name; });
+        const roles: Record<string, Folder["role"]> = {};
+        folderGroups.flat().forEach((folder) => { next[folder.id] = folder.name; roles[folder.id] = folder.role; });
         setFolderNames(next);
+        setFolderRoles(roles);
       })
       .catch(() => {});
   }, [accounts]);
@@ -190,6 +195,13 @@ export default function SearchView() {
 
   function handleClearFilters() {
     setFilters(emptyFilters);
+  }
+
+  function openFullscreen(messageId: string) {
+    useMailStore.getState().setSelectedMessage(messageId);
+    useUIStore.getState().setMessageDetailId(messageId);
+    useUIStore.getState().navigateToView("messageDetail");
+    setSelectedId(null);
   }
 
   useEffect(() => {
@@ -454,10 +466,13 @@ export default function SearchView() {
                       isSelected={hit.message_id === selectedId}
                       onClick={() => setSelectedId((current) => current === hit.message_id ? null : hit.message_id)}
                       onDoubleClick={() => {
-                        useMailStore.getState().setSelectedMessage(hit.message_id);
-                        useUIStore.getState().setMessageDetailId(hit.message_id);
-                        useUIStore.getState().navigateToView("messageDetail");
-                        setSelectedId(null);
+                        openFullscreen(hit.message_id);
+                      }}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setSelectedId(hit.message_id);
+                        setMessageMenu({ x: event.clientX, y: event.clientY, hit });
                       }}
                       folderLabel={(hit.folder_ids || []).map((id) => folderNames[id] || id).join(" / ")}
                       query={query}
@@ -479,6 +494,21 @@ export default function SearchView() {
           </div>
         )}
       </div>
+      {messageMenu && (
+        <SearchMessageContextMenu
+          x={messageMenu.x}
+          y={messageMenu.y}
+          messageId={messageMenu.hit.message_id}
+          folderIds={messageMenu.hit.folder_ids || []}
+          folderRole={(messageMenu.hit.folder_ids || [])
+            .map((id) => folderRoles[id])
+            .find((role): role is NonNullable<Folder["role"]> => Boolean(role))}
+          fallbackLabel={messageMenu.hit.subject || messageMenu.hit.snippet || "邮件"}
+          onOpen={() => openFullscreen(messageMenu.hit.message_id)}
+          onChanged={() => void refetch()}
+          onClose={() => setMessageMenu(null)}
+        />
+      )}
     </div>
   );
 }

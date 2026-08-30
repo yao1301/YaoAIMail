@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, ArrowLeft, Languages } from "lucide-react";
-import { trustSender } from "@/lib/api";
+import { AlertTriangle, ArrowLeft, ContactRound, Copy, Filter, Languages, Mail, Search, Sparkles } from "lucide-react";
+import { listAddressBookContacts, saveAddressBookContact, trustSender } from "@/lib/api";
 import { useTranslation } from "react-i18next";
 import type { PrivacyMode, TranslateResult } from "@/lib/api";
 import { useClickOutside } from "@/hooks/useClickOutside";import { MessageDetailSkeleton } from "./Skeleton";
@@ -15,6 +15,10 @@ import { defaultPrivacyMode } from "@/lib/privacyMode";
 import { useUIStore } from "@/stores/ui.store";
 import SelectionActionPopover from "./SelectionActionPopover";
 import type { EmailAddress } from "@/lib/api";
+import type { AddressBookContact } from "@/lib/api";
+import ContextMenu, { type ContextMenuItem } from "./ContextMenu";
+import { useComposeStore } from "@/stores/compose.store";
+import { useToastStore } from "@/stores/toast.store";
 
 interface Props {
   messageId: string;
@@ -40,15 +44,13 @@ function formatRecipient(address: EmailAddress): string {
   return name ?? "";
 }
 
-function formatRecipients(addresses: EmailAddress[]): string {
-  return addresses.map(formatRecipient).filter(Boolean).join(", ");
-}
-
 export default function MessageDetail({ messageId, onBack, folderRole }: Props) {
   const { t } = useTranslation();
   const [privacyMode, setPrivacyMode] = useState<PrivacyMode>(() => defaultPrivacyMode());
   const [showSelectionActions, setShowSelectionActions] = useState<{ text: string; position: { x: number; y: number } } | null>(null);
   const [showTranslate, setShowTranslate] = useState<{ text: string; position: { x: number; y: number } } | null>(null);
+  const [addressMenu, setAddressMenu] = useState<{ x: number; y: number; address: EmailAddress; field: "from" | "to" } | null>(null);
+  const [contactEditor, setContactEditor] = useState<AddressBookContact | null>(null);
 
   const selectionActionsRef = useRef<HTMLDivElement>(null);
   const translateRef = useRef<HTMLDivElement>(null);
@@ -192,8 +194,61 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
     );
   }
 
-  const recipientLine = formatRecipients(message.to_list);
-  const ccLine = formatRecipients(message.cc_list);
+  function openAddressMenu(event: React.MouseEvent, address: EmailAddress, field: "from" | "to") {
+    if (!address.address.trim()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setAddressMenu({ x: event.clientX, y: event.clientY, address, field });
+  }
+
+  async function openContactEditor(address: EmailAddress) {
+    try {
+      const email = address.address.trim();
+      const items = await listAddressBookContacts();
+      const existing = items.find((item) => item.email.trim().toLowerCase() === email.toLowerCase());
+      setContactEditor(existing ?? {
+        id: "", email, name: address.name?.trim() ?? "", company: "", jobTitle: "",
+        role: "unknown", notes: "", tags: [], createdAt: 0, updatedAt: 0, accountId: message?.account_id ?? null,
+      });
+    } catch (error) {
+      useToastStore.getState().addToast({ message: `无法打开联系人编辑：${String(error)}`, type: "error" });
+    }
+  }
+
+  async function saveContactEditor() {
+    if (!contactEditor) return;
+    try {
+      await saveAddressBookContact({
+        id: contactEditor.id || undefined,
+        email: contactEditor.email,
+        name: contactEditor.name,
+        company: contactEditor.company,
+        jobTitle: contactEditor.jobTitle,
+        role: contactEditor.role,
+        notes: contactEditor.notes,
+        tags: contactEditor.tags,
+        accountId: contactEditor.accountId ?? message?.account_id ?? null,
+      });
+      setContactEditor(null);
+      useToastStore.getState().addToast({ message: "联系人已保存", type: "success" });
+    } catch (error) {
+      useToastStore.getState().addToast({ message: `保存联系人失败：${String(error)}`, type: "error" });
+    }
+  }
+
+  function addressMenuItems(): ContextMenuItem[] {
+    if (!addressMenu) return [];
+    const email = addressMenu.address.address.trim();
+    return [
+      { label: "给此地址发送邮件", icon: <Mail size={14} />, onClick: () => useComposeStore.getState().openCompose("new", null, { to: [email] }) },
+      { label: "复制邮箱地址", icon: <Copy size={14} />, onClick: () => void navigator.clipboard.writeText(email).then(() => useToastStore.getState().addToast({ message: "邮箱地址已复制", type: "success" })) },
+      { label: "添加或修改联系人", icon: <ContactRound size={14} />, onClick: () => void openContactEditor(addressMenu.address) },
+      { separator: true },
+      { label: "搜索与此地址的邮件", icon: <Search size={14} />, onClick: () => { const ui = useUIStore.getState(); ui.setSearchQuery(email); ui.setActiveView("search"); } },
+      { label: "按此地址创建过滤器", icon: <Filter size={14} />, onClick: () => { const ui = useUIStore.getState(); ui.setPendingRuleDraftText(`${addressMenu.field}: ${email}`); ui.setSettingsTab("rules"); ui.setActiveView("settings"); } },
+      { label: "查看或生成客户画像", icon: <Sparkles size={14} />, onClick: () => { const ui = useUIStore.getState(); ui.setCustomerProfileEmail(email); ui.setActiveView("customerProfile"); } },
+    ];
+  }
 
   return (
     <div
@@ -283,22 +338,36 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
           }}
         >
           <div style={{ fontSize: "13px", color: "var(--color-text-primary)", marginBottom: "2px" }}>
-            <span style={{ fontWeight: "500" }}>
+            <span
+              onContextMenu={(event) => openAddressMenu(event, { name: message.from_name, address: message.from_address }, "from")}
+              title="右键可发送邮件、复制地址或修改联系人"
+              style={{ fontWeight: "500", cursor: "context-menu" }}
+            >
               {message.from_name || message.from_address}
             </span>
             {message.from_name && (
-              <span style={{ color: "var(--color-text-secondary)", marginLeft: "6px" }}>
+              <span onContextMenu={(event) => openAddressMenu(event, { name: message.from_name, address: message.from_address }, "from")} style={{ color: "var(--color-text-secondary)", marginLeft: "6px", cursor: "context-menu" }}>
                 &lt;{message.from_address}&gt;
               </span>
             )}
-            {recipientLine && (
+            {message.to_list.length > 0 && (
               <span style={{ color: "var(--color-text-secondary)", marginLeft: "6px", fontSize: "12px" }}>
-                {t("messageDetail.to", "To:")}&nbsp;{recipientLine}
+                {t("messageDetail.to", "To:")}&nbsp;
+                {message.to_list.map((address, index) => (
+                  <span key={`${address.address}-${index}`} onContextMenu={(event) => openAddressMenu(event, address, "to")} title="右键可发送邮件、复制地址或修改联系人" style={{ cursor: "context-menu" }}>
+                    {index > 0 ? ", " : ""}{formatRecipient(address)}
+                  </span>
+                ))}
               </span>
             )}
-            {ccLine && (
+            {message.cc_list.length > 0 && (
               <span style={{ color: "var(--color-text-secondary)", marginLeft: "6px", fontSize: "12px" }}>
-                {t("messageDetail.cc", "Cc:")}&nbsp;{ccLine}
+                {t("messageDetail.cc", "Cc:")}&nbsp;
+                {message.cc_list.map((address, index) => (
+                  <span key={`${address.address}-${index}`} onContextMenu={(event) => openAddressMenu(event, address, "to")} title="右键可发送邮件、复制地址或修改联系人" style={{ cursor: "context-menu" }}>
+                    {index > 0 ? ", " : ""}{formatRecipient(address)}
+                  </span>
+                ))}
               </span>
             )}
           </div>
@@ -413,6 +482,30 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
             onCreateRule={handleCreateRuleFromSelection}
             onClose={() => setShowSelectionActions(null)}
           />
+        </div>
+      )}
+
+      {addressMenu && (
+        <ContextMenu x={addressMenu.x} y={addressMenu.y} items={addressMenuItems()} onClose={() => setAddressMenu(null)} />
+      )}
+
+      {contactEditor && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 2147483100, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.42)" }} onClick={() => setContactEditor(null)}>
+          <div style={{ width: 420, maxWidth: "92vw", padding: 16, borderRadius: 10, border: "1px solid var(--color-border)", background: "var(--color-bg)", boxShadow: "0 12px 32px rgba(0,0,0,0.28)" }} onClick={(event) => event.stopPropagation()}>
+            <h3 style={{ margin: "0 0 12px", fontSize: 15 }}>{contactEditor.id ? "修改联系人" : "添加联系人"}</h3>
+            {([[
+              "邮箱地址", "email"], ["姓名", "name"], ["公司", "company"], ["职位 / 角色", "jobTitle"],
+            ] as const).map(([label, key]) => (
+              <label key={key} style={{ display: "block", marginBottom: 9, fontSize: 12 }}>
+                <span style={{ display: "block", marginBottom: 4, color: "var(--color-text-secondary)" }}>{label}</span>
+                <input value={contactEditor[key]} readOnly={key === "email" && Boolean(contactEditor.id)} onChange={(event) => setContactEditor({ ...contactEditor, [key]: event.target.value })} style={{ width: "100%", boxSizing: "border-box", padding: "7px 9px", borderRadius: 6, border: "1px solid var(--color-border)", background: "var(--color-bg-secondary)", color: "var(--color-text-primary)" }} />
+              </label>
+            ))}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
+              <button type="button" onClick={() => setContactEditor(null)}>取消</button>
+              <button type="button" onClick={() => void saveContactEditor()} style={{ padding: "7px 14px", border: 0, borderRadius: 6, background: "var(--color-accent)", color: "#fff", cursor: "pointer" }}>保存</button>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -184,6 +184,38 @@ impl Store {
         })
     }
 
+    /// Insert an operation that must not be replayed before `not_before`.
+    /// Used by scheduled send; ordinary pending operations keep NULL here.
+    pub fn insert_pending_mail_op_at(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        op_type: &str,
+        payload_json: &str,
+        not_before: i64,
+    ) -> Result<String> {
+        self.with_write(|conn| {
+            let id = pebble_core::new_id();
+            let now = pebble_core::now_timestamp();
+            conn.execute(
+                "INSERT INTO pending_mail_ops
+                    (id, account_id, message_id, op_type, payload_json, status, attempts, last_error, created_at, updated_at, next_retry_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, ?7, ?7, ?8)",
+                params![
+                    id,
+                    account_id,
+                    message_id,
+                    op_type,
+                    payload_json,
+                    PendingMailOpStatus::Pending.as_str(),
+                    now,
+                    not_before,
+                ],
+            )?;
+            Ok(id)
+        })
+    }
+
     /// Queue a rule-generated folder move for remote replay. Rule execution
     /// updates the local view first for responsiveness, but IMAP/Gmail/
     /// Outlook must receive the same move instead of silently diverging.
@@ -348,7 +380,10 @@ impl Store {
                 "SELECT id, account_id, message_id, op_type, payload_json, status,
                         attempts, last_error, created_at, updated_at, next_retry_at
                  FROM pending_mail_ops
-                 WHERE status = 'pending'
+                 WHERE (
+                        status = 'pending'
+                        AND (next_retry_at IS NULL OR next_retry_at <= ?3)
+                    )
                     OR (
                         status = 'failed'
                         AND attempts < ?2

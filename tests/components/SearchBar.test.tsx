@@ -28,15 +28,15 @@ describe("SearchBar", () => {
     vi.clearAllMocks();
   });
 
-  it("opens advanced search from a shared inbox toolbar button", () => {
+  it("opens the inline advanced filter from the shared inbox toolbar", () => {
     render(<SearchBar onSearch={vi.fn()} onClear={vi.fn()} />);
 
-    const advancedButton = screen.getByRole("button", { name: "Advanced search" });
+    const advancedButton = screen.getByRole("button", { name: "筛选" });
 
-    expect(advancedButton.className).toContain("inbox-toolbar-button");
+    expect(advancedButton.className).toContain("search-toolbar-button");
 
     fireEvent.click(advancedButton);
 
-    expect(mocks.setActiveView).toHaveBeenCalledWith("search");
+    expect(advancedButton.getAttribute("aria-expanded")).toBe("true");
   });
 });

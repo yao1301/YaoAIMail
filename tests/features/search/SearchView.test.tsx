@@ -1,10 +1,18 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SearchHit } from "../../../src/lib/api";
 import SearchView from "../../../src/features/search/SearchView";
 import { useUIStore } from "../../../src/stores/ui.store";
 
 let searchResults: SearchHit[] = [];
+
+vi.mock("../../../src/lib/api", () => ({
+  advancedSearch: vi.fn(),
+  deleteMessage: vi.fn(),
+  listAccounts: vi.fn().mockResolvedValue([]),
+  listFolders: vi.fn().mockResolvedValue([]),
+  searchMessages: vi.fn(),
+}));
 
 vi.mock("react-i18next", () => ({
   initReactI18next: {
@@ -52,11 +60,15 @@ vi.mock("../../../src/features/search/SearchFilters", () => ({
 }));
 
 vi.mock("../../../src/features/search/SearchResultItem", () => ({
-  default: ({ hit, isSelected }: { hit: SearchHit; isSelected: boolean }) => (
-    <div role="option" aria-selected={isSelected}>
+  default: ({ hit, isSelected, onContextMenu }: { hit: SearchHit; isSelected: boolean; onContextMenu?: React.MouseEventHandler<HTMLDivElement> }) => (
+    <div role="option" aria-selected={isSelected} onContextMenu={onContextMenu}>
       {hit.subject}
     </div>
   ),
+}));
+
+vi.mock("../../../src/features/search/SearchMessageContextMenu", () => ({
+  default: ({ messageId }: { messageId: string }) => <div role="menu">邮件菜单 {messageId}</div>,
 }));
 
 vi.mock("../../../src/components/MessageDetail", () => ({
@@ -95,5 +107,21 @@ describe("SearchView", () => {
 
     const listbox = screen.getByRole("listbox", { name: "Search results" });
     expect(within(listbox).getByRole("option", { name: "Invoice total" })).toBeTruthy();
+  });
+
+  it("opens the email action menu when a search result is right-clicked", () => {
+    searchResults = [{
+      message_id: "message-1",
+      score: 1,
+      subject: "Invoice total",
+      snippet: "The invoice total is ready",
+      from_address: "sender@example.com",
+      date: 1_700_000_000,
+    }];
+
+    render(<SearchView />);
+    fireEvent.contextMenu(screen.getByRole("option", { name: "Invoice total" }), { clientX: 160, clientY: 90 });
+
+    expect(screen.getByRole("menu").textContent).toContain("邮件菜单 message-1");
   });
 });

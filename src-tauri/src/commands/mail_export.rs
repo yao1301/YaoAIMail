@@ -3,75 +3,95 @@
 //! - export_message_eml：弹保存对话框导出 .eml
 
 use crate::state::AppState;
+use lettre::message::header::ContentType;
+use lettre::message::{Attachment, Body, Mailbox, MultiPart, SinglePart};
 use pebble_core::{PebbleError, Result};
-use std::fmt::Write;
 use tauri::State;
 
-fn address_str(name: &str, address: &str) -> String {
+fn mailbox(name: &str, address: &str) -> Result<Mailbox> {
+    let address = address
+        .trim()
+        .parse()
+        .map_err(|e| PebbleError::Internal(format!("邮件地址无效 '{}': {e}", address.trim())))?;
     let name = name.trim();
-    let address = address.trim();
-    if name.is_empty() {
-        address.to_string()
+    Ok(Mailbox::new((!name.is_empty()).then(|| name.to_string()), address))
+}
+
+fn plain_part(body: &str) -> SinglePart {
+    SinglePart::builder().content_type(ContentType::TEXT_PLAIN).body(body.to_string())
+}
+
+fn message_body(msg: &pebble_core::Message) -> MultiPart {
+    if msg.body_html_raw.trim().is_empty() {
+        MultiPart::alternative().singlepart(plain_part(&msg.body_text))
     } else {
-        format!("{name} <{address}>")
+        MultiPart::alternative()
+            .singlepart(plain_part(&msg.body_text))
+            .singlepart(
+                SinglePart::builder()
+                    .content_type(ContentType::TEXT_HTML)
+                    .body(msg.body_html_raw.clone()),
+            )
     }
 }
 
-/// Rebuild an RFC822 .eml from the stored message. Attachments are omitted
-/// (body text kept) so forwarding stays lightweight; the original can always
-/// be re-exported from the web client.
-fn build_eml(msg: &pebble_core::Message) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "From: {}", address_str(&msg.from_name, &msg.from_address));
-    if !msg.to_list.is_empty() {
-        let tos: Vec<String> = msg
-            .to_list
-            .iter()
-            .map(|a| address_str(a.name.as_deref().unwrap_or(""), &a.address))
-            .collect();
-        let _ = writeln!(out, "To: {}", tos.join(", "));
+/// Rebuild a complete RFC822 message from the local MIME representation.
+/// HTML, inline images and regular attachments are all retained.
+fn build_eml(
+    msg: &pebble_core::Message,
+    attachments: &[pebble_core::Attachment],
+) -> Result<Vec<u8>> {
+    let mut builder = lettre::Message::builder()
+        .from(mailbox(&msg.from_name, &msg.from_address)?)
+        .subject(&msg.subject);
+    if msg.date > 0 {
+        builder = builder.date(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(msg.date as u64),
+        );
     }
-    if !msg.cc_list.is_empty() {
-        let ccs: Vec<String> = msg
-            .cc_list
-            .iter()
-            .map(|a| address_str(a.name.as_deref().unwrap_or(""), &a.address))
-            .collect();
-        let _ = writeln!(out, "Cc: {}", ccs.join(", "));
+    if let Some(message_id) = msg.message_id_header.as_ref().filter(|id| !id.trim().is_empty()) {
+        builder = builder.message_id(Some(message_id.clone()));
     }
-    if !msg.bcc_list.is_empty() {
-        let bccs: Vec<String> = msg
-            .bcc_list
-            .iter()
-            .map(|a| address_str(a.name.as_deref().unwrap_or(""), &a.address))
-            .collect();
-        let _ = writeln!(out, "Bcc: {}", bccs.join(", "));
+    if let Some(in_reply_to) = msg.in_reply_to.as_ref().filter(|id| !id.trim().is_empty()) {
+        builder = builder.in_reply_to(in_reply_to.clone());
     }
-    let _ = writeln!(out, "Subject: {}", msg.subject);
-    let _ = writeln!(out, "Date: {}", rfc2822_date(msg.date));
-    if let Some(mid) = &msg.message_id_header {
-        if !mid.trim().is_empty() {
-            let _ = writeln!(out, "Message-ID: {}", mid.trim());
-        }
+    if let Some(references) = msg.references_header.as_ref().filter(|id| !id.trim().is_empty()) {
+        builder = builder.references(references.clone());
     }
-    if let Some(refs) = &msg.references_header {
-        if !refs.trim().is_empty() {
-            let _ = writeln!(out, "References: {}", refs.trim());
-        }
+    for address in &msg.to_list {
+        builder = builder.to(mailbox(address.name.as_deref().unwrap_or(""), &address.address)?);
     }
-    let _ = writeln!(out, "MIME-Version: 1.0");
-    let _ = writeln!(out, "Content-Type: text/plain; charset=utf-8");
-    let _ = writeln!(out, "Content-Transfer-Encoding: 8bit");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "{}", msg.body_text);
-    out
-}
+    for address in &msg.cc_list {
+        builder = builder.cc(mailbox(address.name.as_deref().unwrap_or(""), &address.address)?);
+    }
+    for address in &msg.bcc_list {
+        builder = builder.bcc(mailbox(address.name.as_deref().unwrap_or(""), &address.address)?);
+    }
 
-fn rfc2822_date(ts: i64) -> String {
-    use chrono::{DateTime, Utc};
-    DateTime::<Utc>::from_timestamp(ts, 0)
-        .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S +0000").to_string())
-        .unwrap_or_default()
+    let mut mixed = MultiPart::mixed().multipart(message_body(msg));
+    for attachment in attachments {
+        let path = attachment.local_path.as_ref().ok_or_else(|| {
+            PebbleError::Internal(format!("附件文件不可用：{}", attachment.filename))
+        })?;
+        let bytes = std::fs::read(path).map_err(|e| {
+            PebbleError::Internal(format!("无法读取附件 {}：{e}", attachment.filename))
+        })?;
+        let content_type = ContentType::parse(&attachment.mime_type)
+            .unwrap_or(ContentType::parse("application/octet-stream").expect("valid MIME"));
+        let part = if attachment.is_inline {
+            Attachment::new_inline(
+                attachment.content_id.clone().unwrap_or_else(|| attachment.filename.clone()),
+            )
+            .body(Body::new(bytes), content_type)
+        } else {
+            Attachment::new(attachment.filename.clone()).body(Body::new(bytes), content_type)
+        };
+        mixed = mixed.singlepart(part);
+    }
+    builder
+        .multipart(mixed)
+        .map(|message| message.formatted())
+        .map_err(|e| PebbleError::Internal(format!("生成 EML 失败：{e}")))
 }
 
 async fn load_message(
@@ -94,7 +114,8 @@ pub async fn build_forward_eml(
     message_id: String,
 ) -> std::result::Result<String, PebbleError> {
     let msg = load_message(&state, &message_id).await?;
-    let eml = build_eml(&msg);
+    let attachments = state.store.list_attachments_by_message(&message_id)?;
+    let eml = build_eml(&msg, &attachments)?;
     let dir = std::env::temp_dir().join("pebble-forward");
     std::fs::create_dir_all(&dir)
         .map_err(|e| PebbleError::Internal(format!("创建临时目录失败: {e}")))?;
@@ -111,7 +132,8 @@ pub async fn export_message_eml(
     message_id: String,
 ) -> std::result::Result<String, PebbleError> {
     let msg = load_message(&state, &message_id).await?;
-    let eml = build_eml(&msg);
+    let attachments = state.store.list_attachments_by_message(&message_id)?;
+    let eml = build_eml(&msg, &attachments)?;
     let suggested = {
         let mut name = msg.subject.trim().replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
         if name.is_empty() {

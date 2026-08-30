@@ -105,6 +105,11 @@ export function useRealtimeSyncTriggers() {
     return () => {
       window.removeEventListener("focus", onFocus);
       window.removeEventListener("blur", onBlur);
+      for (const accountId of accountIds) {
+        lastAutoTriggerAt.delete(accountId);
+        lastAutoTriggerAt.delete(`${accountId}:window_focus`);
+        lastAutoTriggerAt.delete(`${accountId}:window_blur`);
+      }
     };
   }, [accountIds, pollInterval, realtimeMode, accountPreferenceVersion]);
 

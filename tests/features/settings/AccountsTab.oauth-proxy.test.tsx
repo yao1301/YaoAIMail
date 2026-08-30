@@ -42,6 +42,7 @@ vi.mock("../../../src/hooks/queries", () => ({
 
 vi.mock("../../../src/lib/api", () => ({
   deleteAccount: vi.fn(),
+  getAccountDetails: vi.fn().mockResolvedValue({ email: "user@example.com", displayName: "User", color: "#22c55e", provider: "gmail", imapHost: "", imapPort: 0, imapUsername: "", imapSecurity: "tls", imapAcceptInvalidCerts: false, smtpHost: "", smtpPort: 0, smtpUsername: "", smtpSecurity: "tls", smtpAcceptInvalidCerts: false, proxyMode: "custom", proxyHost: "127.0.0.1", proxyPort: 7890 }),
   getOAuthAccountProxy: vi.fn(() => Promise.resolve(null)),
   getOAuthAccountProxySetting: vi.fn(),
   testAccountConnection: vi.fn(),
@@ -53,6 +54,10 @@ vi.mock("../../../src/lib/api", () => ({
 vi.mock("../../../src/lib/signatures", () => ({
   getSignature: vi.fn(() => Promise.resolve("")),
   setSignature: vi.fn(() => Promise.resolve()),
+  listEmailSignatures: vi.fn(() => Promise.resolve([])),
+  saveEmailSignature: vi.fn(() => Promise.resolve([])),
+  deleteEmailSignature: vi.fn(() => Promise.resolve([])),
+  setDefaultEmailSignature: vi.fn(() => Promise.resolve([])),
 }));
 
 vi.mock("../../../src/stores/mail.store", () => ({

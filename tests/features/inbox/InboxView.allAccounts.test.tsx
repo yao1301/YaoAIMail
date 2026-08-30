@@ -65,6 +65,7 @@ vi.mock("../../../src/hooks/queries", () => ({
   useFoldersForAccountsQuery: mocks.useFoldersForAccountsQuery,
   useMessagesQuery: mocks.useMessagesQuery,
   useThreadsQuery: mocks.useThreadsQuery,
+  useMessageQuery: () => ({ data: null }),
   patchMessagesCache: vi.fn(),
 }));
 
@@ -123,6 +124,6 @@ describe("InboxView all accounts", () => {
     render(<InboxView />);
 
     expect(mocks.useFoldersForAccountsQuery).toHaveBeenCalledWith(["account-1", "account-2"]);
-    expect(mocks.useMessagesQuery).toHaveBeenCalledWith("a1-inbox", ["a1-inbox", "a2-inbox"]);
+    expect(mocks.useMessagesQuery).toHaveBeenCalledWith("a1-inbox", ["a1-inbox", "a2-inbox"], true);
   });
 });

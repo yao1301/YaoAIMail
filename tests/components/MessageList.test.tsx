@@ -72,17 +72,19 @@ vi.mock("../../src/stores/confirm.store", () => ({
 }));
 
 vi.mock("../../src/components/MessageItem", () => ({
-  default: ({ message, folderRole, accountColor, accountLabel }: {
+  default: ({ message, folderRole, accountColor, accountLabel, onClick }: {
     message: MessageSummary;
     folderRole?: string | null;
     accountColor?: string;
     accountLabel?: string;
+    onClick?: (event: React.SyntheticEvent) => void;
   }) => (
     <div
       data-testid={`message-${message.id}`}
       data-folder-role={folderRole ?? ""}
       data-account-color={accountColor ?? ""}
       data-account-label={accountLabel ?? ""}
+      onClick={onClick}
     >
       {message.subject}
     </div>
@@ -195,6 +197,24 @@ describe("MessageList", () => {
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
   });
 
+  it("lets Ctrl remove the Shift-range anchor from batch selection", () => {
+    render(
+      <MessageList
+        messages={[makeMessage("m-1"), makeMessage("m-2"), makeMessage("m-3")]}
+        selectedMessageId="m-1"
+        onSelectMessage={vi.fn()}
+        loading={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("message-m-1"));
+    fireEvent.click(screen.getByTestId("message-m-3"), { shiftKey: true });
+    expect([...useMailStore.getState().selectedMessageIds]).toEqual(["m-1", "m-2", "m-3"]);
+
+    fireEvent.click(screen.getByTestId("message-m-1"), { ctrlKey: true });
+    expect([...useMailStore.getState().selectedMessageIds]).toEqual(["m-2", "m-3"]);
+  });
+
   it("offers a manual pagination fallback and loads the next page", () => {
     const onLoadMore = vi.fn();
     render(
@@ -241,7 +261,7 @@ describe("MessageList", () => {
     expect(listbox.className).toContain("message-list-scroll");
   });
 
-  it("passes account color metadata to message items", () => {
+  it("keeps account color markers hidden in the simplified unified inbox", () => {
     const message = { ...makeMessage("m-1"), account_id: "account-2" };
     useMailStore.setState({ activeAccountId: null });
 
@@ -256,8 +276,8 @@ describe("MessageList", () => {
 
     const row = screen.getByTestId("message-m-1");
 
-    expect(row.getAttribute("data-account-color")).toBe("#3b82f6");
-    expect(row.getAttribute("data-account-label")).toBe("Two <two@example.com>");
+    expect(row.getAttribute("data-account-color")).toBe("");
+    expect(row.getAttribute("data-account-label")).toBe("");
   });
 
   it("does not pass account color metadata when a single account is selected", () => {
@@ -301,7 +321,7 @@ describe("MessageList", () => {
     expect(row.getAttribute("data-account-color")).toBe("");
   });
 
-  it("derives a stable account color when the account has no saved color", () => {
+  it("does not show a marker for an unknown account", () => {
     const message = { ...makeMessage("m-1"), account_id: "missing-account" };
     useMailStore.setState({ activeAccountId: null });
 
@@ -316,10 +336,10 @@ describe("MessageList", () => {
 
     const color = screen.getByTestId("message-m-1").getAttribute("data-account-color");
 
-    expect(color).toMatch(/^#[0-9a-f]{6}$/);
+    expect(color).toBe("");
   });
 
-  it("uses different default colors for known accounts without saved colors", () => {
+  it("keeps markers hidden for multiple accounts without saved colors", () => {
     useMailStore.setState({ activeAccountId: null });
 
     render(
@@ -337,9 +357,8 @@ describe("MessageList", () => {
     const firstColor = screen.getByTestId("message-m-1").getAttribute("data-account-color");
     const secondColor = screen.getByTestId("message-m-2").getAttribute("data-account-color");
 
-    expect(firstColor).toMatch(/^#[0-9a-f]{6}$/);
-    expect(secondColor).toMatch(/^#[0-9a-f]{6}$/);
-    expect(firstColor).not.toBe(secondColor);
+    expect(firstColor).toBe("");
+    expect(secondColor).toBe("");
   });
 
   it("refreshes derived queries after a successful batch star action", async () => {

@@ -2,6 +2,7 @@ import { useRef, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openMailtoUrl } from "@/app/useMailtoOpen";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
+import { decorateHistoricalQuoteCards } from "@/lib/historicalQuoteCards";
 
 interface ShadowDomEmailProps {
   html: string;
@@ -98,9 +99,65 @@ export function ShadowDomEmail({ html, className }: ShadowDomEmailProps) {
           max-width: 100%;
           box-sizing: border-box;
         }
+        .pebble-history-quote {
+          display: block !important;
+          box-sizing: border-box !important;
+          max-width: 100% !important;
+          margin: 18px 0 0 !important;
+          padding: 0 !important;
+          overflow: hidden !important;
+          border: 1px solid #d9dde3 !important;
+          border-radius: 10px !important;
+          background: #fff !important;
+          color: #24292f !important;
+          box-shadow: 0 1px 2px rgba(0,0,0,.03);
+        }
+        .pebble-history-quote__title {
+          display: block !important;
+          margin: 0 !important;
+          padding: 9px 14px 0 !important;
+          background: #f3f4f6 !important;
+          color: #6b7280 !important;
+          font-size: 12px !important;
+          font-weight: 700 !important;
+        }
+        .pebble-history-quote__header {
+          display: block !important;
+          box-sizing: border-box !important;
+          width: 100% !important;
+          margin: 0 !important;
+          padding: 11px 14px !important;
+          border: 0 !important;
+          border-bottom: 1px solid #d9dde3 !important;
+          background: #f3f4f6 !important;
+          color: #4b5563 !important;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif !important;
+          font-size: 12px !important;
+          line-height: 1.55 !important;
+        }
+        .pebble-history-quote__header table {
+          width: 100% !important;
+          color: inherit !important;
+          font: inherit !important;
+        }
+        .pebble-history-quote__body {
+          display: block !important;
+          box-sizing: border-box !important;
+          width: 100% !important;
+          margin: 0 !important;
+          padding: 14px 16px !important;
+          border: 0 !important;
+          background: #fff !important;
+          color: #24292f !important;
+        }
+        .pebble-history-quote__separator { display: none !important; }
+        .pebble-history-quote .pebble-history-quote {
+          margin-top: 14px !important;
+        }
       </style>
       <div class="pebble-email-content">${safeHtml}</div>
     `;
+    decorateHistoricalQuoteCards(shadow.querySelector(".pebble-email-content")!);
 
     // Keep the sender-authored width for small signature logos while preventing
     // genuinely oversized images from overflowing the reader. Forcing

@@ -9,7 +9,7 @@ on:
       tag:
         description: Release tag to build, for example v1.1.1
         required: true
-        default: v1.1.1
+        default: v1.1.21
 
 permissions:
   contents: write

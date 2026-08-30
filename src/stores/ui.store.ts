@@ -6,7 +6,16 @@ import { readStartHiddenToTrayPreference, START_HIDDEN_TO_TRAY_KEY } from "@/lib
 import { useMailStore } from "./mail.store";
 import type { AdvancedSearchQuery } from "@/lib/api";
 
-export type ActiveView = "inbox" | "addressBook" | "companyResearch" | "leadFinder" | "kanban" | "settings" | "search" | "starred" | "compose" | "aiWriting" | "aiAssistant" | "foreignTools" | "customerProfile" | "messageDetail";
+export type ActiveView = "inbox" | "addressBook" | "companyResearch" | "leadFinder" | "kanban" | "settings" | "search" | "starred" | "snoozed" | "compose" | "aiWriting" | "aiAssistant" | "foreignTools" | "customerProfile" | "messageDetail";
+
+// Snooze was an experimental virtual mailbox, not a real server folder.  It
+// is intentionally disabled now: old callers or stale in-memory tabs must not
+// be able to bring the removed view back into the navigation UI.
+const REMOVED_VIEWS = new Set<ActiveView>(["snoozed"]);
+
+function normalizeActiveView(view: ActiveView): ActiveView {
+  return REMOVED_VIEWS.has(view) ? "inbox" : view;
+}
 
 /** Chrome 式标签：文件夹标签（单一、动态改名）+ 功能标签（邮件标签沿用 openMessageIds） */
 export interface NavTab {
@@ -364,7 +373,7 @@ export const useUIStore = create<UIState>((set) => ({
   previousView: "inbox",
   toggleSidebar: () =>
     set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
-  navigateToView: (view) => set({ activeView: view }),
+  navigateToView: (view) => set({ activeView: normalizeActiveView(view) }),
   aiContextQueue: [],
   aiContextAttachmentQueue: [],
   enqueueAiContext: (messageId, title) =>
@@ -493,11 +502,14 @@ export const useUIStore = create<UIState>((set) => ({
   navTabs: [],
   upsertNavTab: (tab) =>
     set((state) => {
+      if (REMOVED_VIEWS.has(tab.view)) {
+        return { navTabs: state.navTabs.filter((item) => item.key !== tab.key) };
+      }
       const exists = state.navTabs.some((item) => item.key === tab.key);
       return { navTabs: exists ? state.navTabs.map((item) => (item.key === tab.key ? tab : item)) : [...state.navTabs, tab] };
     }),
   removeNavTab: (key) => set((state) => ({ navTabs: state.navTabs.filter((item) => item.key !== key) })),
-  setNavTabs: (tabs) => set({ navTabs: tabs }),
+  setNavTabs: (tabs) => set({ navTabs: tabs.filter((tab) => !REMOVED_VIEWS.has(tab.view)) }),
   pendingAiDraft: null,
   setPendingAiDraft: (draft) => set({ pendingAiDraft: draft }),
   pendingSearchFilters: null,

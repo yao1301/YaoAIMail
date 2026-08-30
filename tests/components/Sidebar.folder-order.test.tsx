@@ -121,20 +121,15 @@ describe("Sidebar folder order", () => {
     render(<Sidebar />);
 
     const folderNav = screen.getByRole("navigation", { name: "Mail folders" });
-    const labels = within(folderNav).getAllByRole("button").map((button) => button.textContent);
+    const expectedOrder = ["Inbox", "Sent", "Archive", "Drafts", "Trash", "Spam"];
+    const labels = within(folderNav).getAllByRole("button")
+      .map((button) => button.textContent ?? "")
+      .filter((label) => expectedOrder.includes(label));
 
-    expect(labels).toEqual([
-      "Inbox",
-      "Sent",
-      "Archive",
-      "Starred",
-      "Drafts",
-      "Trash",
-      "Spam",
-    ]);
+    expect(labels).toEqual(expectedOrder);
   });
 
-  it("uses a translucent account selector when an app background is active", () => {
+  it("renders each account as a directly selectable group", () => {
     mocks.accounts = [
       {
         id: "account-1",
@@ -168,9 +163,8 @@ describe("Sidebar folder order", () => {
 
     render(<Sidebar />);
 
-    const selector = screen.getByRole("combobox", { name: "Email Accounts" });
-    const style = selector.getAttribute("style") ?? "";
-    expect(style).toContain("color-mix(in srgb, var(--color-accent) 6%, transparent)");
-    expect(style).not.toContain("background-color: var(--color-bg)");
+    expect(screen.getAllByRole("button", { name: "User" }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: "Second" }).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("combobox", { name: "Email Accounts" })).toBeNull();
   });
 });

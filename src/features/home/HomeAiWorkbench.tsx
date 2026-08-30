@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Bot, FileText, Mail, MessageCircle, Paperclip, Plus, Send, Trash2, UserRound, X } from "lucide-react";
+import { Bot, ChevronDown, FileText, Globe2, Mail, MessageCircle, Paperclip, Plus, Send, ShieldCheck, Sparkles, Trash2, UserRound, X } from "lucide-react";
 import {
+  agentRun,
   aiChat,
   aiPrompt,
   getMessagesBatch,
@@ -24,6 +25,8 @@ import { useUIStore } from "@/stores/ui.store";
 import MarkdownView from "@/lib/renderMarkdown";
 import { resizeAutoGrowTextarea } from "@/lib/autoGrowTextarea";
 import KnowledgePicker from "@/components/KnowledgePicker";
+import { buildTradeSkillSystemPrompt, detectTradeSkill, extractOutreachDraft, getTradeSkill, TRADE_SKILLS, type TradeSkill, type TradeSkillId } from "./tradeSkills";
+import { parseOutreachUserConstraints, violatesOutreachUserConstraints } from "@/features/lead-finder/outreach-guard";
 
 type WorkbenchReference =
   | { kind: "mail"; id: string; label: string; subtitle: string; accountId: string; folderId?: string }
@@ -35,6 +38,9 @@ type WorkbenchMessage = {
   role: "user" | "assistant";
   content: string;
   references?: WorkbenchReference[];
+  skillId?: TradeSkillId;
+  externalSources?: string[];
+  toolCalls?: number;
   createdAt: number;
 };
 
@@ -263,6 +269,9 @@ export default function HomeAiWorkbench() {
   const [error, setError] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<HomeAttachedFile[]>([]);
   const [attachedMails, setAttachedMails] = useState<HomeAttachedMail[]>([]);
+  const [selectedSkillId, setSelectedSkillId] = useState<"auto" | TradeSkillId>("auto");
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [runningSkillName, setRunningSkillName] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -399,6 +408,44 @@ export default function HomeAiWorkbench() {
     return "已识别为资信调研指令，已打开资信调研并填入目标信息。";
   }
 
+  function openSkillDraft(message: WorkbenchMessage) {
+    const skill = getTradeSkill(message.skillId);
+    if (!skill?.draftCapable) return;
+    const instruction = `请基于首页外贸 Skill「${skill.name}」的分析继续完善邮件草稿。保留已核实事实，不得补造公司、联系人、价格、交期、认证或合作经历；先让我确认草稿，不要发送。\n\n用户原始任务与 Skill 结果：\n${message.content}`;
+    setPendingAiWritingInstruction(instruction);
+    setAiWritingTurns([{ role: "user", content: instruction }]);
+    openRightPanel("aiWriting");
+  }
+
+  async function runTradeSkill(skill: TradeSkill, prompt: string, conversation: WorkbenchConversation) {
+    setRunningSkillName(skill.name);
+    const context = await collectContext(prompt, activeAccountId, selectedKnowledgeIds);
+    const attachedContext = await buildAttachedContext();
+    const evidence = `${context.text}${attachedContext ? `\n\n用户本次明确附加的内容：\n${attachedContext}` : ""}`;
+    const userTask = `用户任务：\n${prompt}\n\n可用本地证据：\n${evidence}`;
+    if (skill.online) {
+      const result = await agentRun(buildTradeSkillSystemPrompt(skill), userTask);
+      let content = result.content.trim();
+      if (skill.id === "research-first-outreach") {
+        const draft = extractOutreachDraft(content);
+        const constraints = parseOutreachUserConstraints("不要询问邮箱、联系人或采购负责人，不要请求转发或转交。");
+        if (!draft || violatesOutreachUserConstraints(draft, constraints)) {
+          content = (await aiPrompt(
+            `${buildTradeSkillSystemPrompt(skill)}\n这是发送前硬约束复核。重写完整结果，必须使用 Markdown 标题“## 邮件正文”，并保证该段不询问邮箱、联系人、负责人，不要求转发或转交。`,
+            `原始任务：\n${prompt}\n\n需要纠正的结果：\n${content}`,
+          )).trim();
+        }
+      }
+      return { content, references: context.references, externalSources: [...new Set(result.sources)], toolCalls: result.toolCalls };
+    }
+    const content = await aiChat([
+      { role: "system", content: buildTradeSkillSystemPrompt(skill) },
+      ...conversation.messages.slice(-8).map((message) => ({ role: message.role, content: message.content } as ChatTurn)),
+      { role: "user", content: userTask },
+    ]);
+    return { content: content.trim(), references: context.references, externalSources: [], toolCalls: 0 };
+  }
+
   async function send(quickPrompt?: string) {
     const prompt = (quickPrompt ?? input).trim();
     if (!prompt || busy) return;
@@ -414,6 +461,19 @@ export default function HomeAiWorkbench() {
     setError("");
     setBusy(true);
     try {
+      const selectedSkill = selectedSkillId === "auto" ? detectTradeSkill(prompt) : getTradeSkill(selectedSkillId);
+      if (selectedSkill) {
+        const result = await runTradeSkill(selectedSkill, prompt, conversation);
+        const assistantMessage: WorkbenchMessage = {
+          id: `turn-${Date.now()}-skill`, role: "assistant", content: result.content || "模型没有返回内容，请重试。",
+          references: result.references, skillId: selectedSkill.id, externalSources: result.externalSources, toolCalls: result.toolCalls, createdAt: Date.now(),
+        };
+        const finished = { ...optimistic, title: firstTurn ? `${selectedSkill.name}：${shorten(prompt, 18)}` : optimistic.title, messages: [...optimistic.messages, assistantMessage], updatedAt: Date.now() };
+        persist([finished, ...conversations.filter((item) => item.id !== conversation.id)]);
+        setSelectedSkillId("auto");
+        setSkillsOpen(false);
+        return;
+      }
       const intent = await classifyIntent(prompt);
       if (intent) {
         const assistantMessage: WorkbenchMessage = { id: `turn-${Date.now()}-route`, role: "assistant", content: routeIntent(intent, prompt), createdAt: Date.now() };
@@ -442,6 +502,7 @@ export default function HomeAiWorkbench() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
+      setRunningSkillName("");
       setBusy(false);
     }
   }
@@ -460,15 +521,14 @@ export default function HomeAiWorkbench() {
     }
   }
 
-  const suggestions = [
-    "请查看这个邮箱最近的重要往来邮件，包括收件箱、已发送和其他文件夹，按紧急程度排序，并告诉我每个客户下一步该做什么。",
-    "结合客户画像和往来邮件，告诉我这个客户下一步应该做什么",
-    "从产品与资料中心查找相关资料，回答客户可能关心的产品问题",
-  ];
-
-  const extraSuggestions = [
-    "请帮我查一下这个主题的最新信息，并列出来源；如果当前模型不能联网，请直接告诉我。",
-    "请结合当前邮箱、客户和资料回答我的问题；如果需要最新外部信息，再联网查询，并区分本地资料与外部信息。",
+  const selectedSkill = selectedSkillId === "auto" ? null : getTradeSkill(selectedSkillId);
+  const suggestions = selectedSkill ? [
+    selectedSkill.example,
+    `请结合我拖入的邮件、附件和资料执行“${selectedSkill.name}”，资料不足的地方不要猜测。`,
+  ] : [
+    "整理当前邮箱最重要的待办，并告诉我下一步怎么做",
+    "结合客户画像和往来邮件，分析这个客户的下一步",
+    "从产品资料中查找依据，回答客户可能关心的问题",
   ];
 
   return (
@@ -480,11 +540,32 @@ export default function HomeAiWorkbench() {
         {conversations.length > 1 && <details style={{ position: "relative" }}><summary style={{ ...smallButton, listStyle: "none", cursor: "pointer" }}><MessageCircle size={15} /> 历史</summary><div style={historyPopover}>{conversations.map((item) => <div key={item.id} style={{ display: "flex", gap: 4, padding: "3px 0" }}><button type="button" onClick={() => setCurrentId(item.id)} style={{ ...historyButton, background: item.id === current?.id ? "color-mix(in srgb, var(--color-accent) 12%, transparent)" : "transparent" }}>{item.title}</button><button type="button" onClick={() => deleteConversation(item.id)} title="删除对话" style={iconButton}><Trash2 size={13} /></button></div>)}</div></details>}
       </div>
       <div style={{ padding: "12px 18px 0" }}>
-        {current?.messages.length ? <div style={{ display: "flex", flexDirection: "column", gap: 12, maxHeight: 520, overflowY: "auto", paddingBottom: 12 }}>{current.messages.map((message) => <div key={message.id} style={{ display: "flex", justifyContent: message.role === "user" ? "flex-end" : "flex-start" }}><div style={{ maxWidth: "92%", padding: "10px 12px", borderRadius: 10, background: message.role === "user" ? "var(--color-accent)" : "var(--color-bg-secondary)", color: message.role === "user" ? "#fff" : "var(--color-text-primary)", whiteSpace: "pre-wrap", fontSize: 13, lineHeight: 1.65 }}>{message.role === "assistant" ? <MarkdownView text={message.content} /> : message.content}{message.role === "assistant" && message.references && message.references.length > 0 && <div style={referenceList}>{message.references.map((reference) => <button key={`${reference.kind}-${reference.id}`} type="button" onClick={() => openReference(reference)} title={reference.subtitle} style={referenceButton}>{reference.kind === "mail" ? <Mail size={12} /> : reference.kind === "customer" ? <UserRound size={12} /> : <FileText size={12} />}<span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 210 }}>{reference.label}</span></button>)}</div>}</div></div>)}{busy && <div style={{ color: "var(--color-text-secondary)", fontSize: 12 }}>◌ 正在检索邮件、客户和资料并生成回答…</div>}</div> : null}
+        {current?.messages.length ? <div style={{ display: "flex", flexDirection: "column", gap: 12, maxHeight: 520, overflowY: "auto", paddingBottom: 12 }}>{current.messages.map((message) => {
+          const messageSkill = getTradeSkill(message.skillId);
+          return <div key={message.id} style={{ display: "flex", justifyContent: message.role === "user" ? "flex-end" : "flex-start" }}><div style={{ maxWidth: "92%", padding: "10px 12px", borderRadius: 10, background: message.role === "user" ? "var(--color-accent)" : "var(--color-bg-secondary)", color: message.role === "user" ? "#fff" : "var(--color-text-primary)", whiteSpace: "pre-wrap", fontSize: 13, lineHeight: 1.65 }}>
+            {messageSkill && <div style={skillResultHeader}><Sparkles size={13} /><strong>{messageSkill.name}</strong><span>{messageSkill.permission}</span>{messageSkill.online && <span style={{ display: "inline-flex", alignItems: "center", gap: 3 }}><Globe2 size={11} /> 已启用联网核验{typeof message.toolCalls === "number" ? ` · ${message.toolCalls} 个核验步骤` : ""}</span>}</div>}
+            {message.role === "assistant" ? <MarkdownView text={message.content} /> : message.content}
+            {message.role === "assistant" && message.externalSources && message.externalSources.length > 0 && <div style={sourceList}><strong>外部来源</strong>{message.externalSources.map((source, index) => <a key={source} href={source} target="_blank" rel="noreferrer">{index + 1}. {source}</a>)}</div>}
+            {message.role === "assistant" && message.references && message.references.length > 0 && <div style={referenceList}>{message.references.map((reference) => <button key={`${reference.kind}-${reference.id}`} type="button" onClick={() => openReference(reference)} title={reference.subtitle} style={referenceButton}>{reference.kind === "mail" ? <Mail size={12} /> : reference.kind === "customer" ? <UserRound size={12} /> : <FileText size={12} />}<span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 210 }}>{reference.label}</span></button>)}</div>}
+            {messageSkill?.draftCapable && <button type="button" onClick={() => openSkillDraft(message)} style={draftButton}><Mail size={13} /> 送到 AI 写作继续修改</button>}
+          </div></div>;
+        })}{busy && <div style={{ color: "var(--color-text-secondary)", fontSize: 12 }}>◌ {runningSkillName ? `正在执行「${runningSkillName}」，核对依据并生成结果…` : "正在检索邮件、客户和资料并生成回答…"}</div>}</div> : null}
         {error && <div style={{ color: "#c0392b", fontSize: 12, padding: "8px 0" }}>{error}</div>}
       </div>
       <div style={{ padding: "10px 18px 16px" }}>
         <div style={{ fontSize: 15, fontWeight: 700, color: "var(--color-text-primary)", marginBottom: 8 }}>你想处理什么？</div>
+        <div style={skillPanel}>
+          <div style={skillToolbar}>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 5, color: "var(--color-text-secondary)", fontSize: 11 }}><Sparkles size={14} /> 专业能力</span>
+            <button type="button" aria-expanded={skillsOpen} onClick={() => setSkillsOpen((open) => !open)} style={skillPickerButton}><strong>{selectedSkill?.name || "自动选择"}</strong><span>{selectedSkill ? "本次指定" : "按指令自动调用"}</span><ChevronDown size={14} style={{ transform: skillsOpen ? "rotate(180deg)" : "none", transition: "transform .15s" }} /></button>
+            <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 4, color: "var(--color-text-secondary)", fontSize: 11 }}><ShieldCheck size={13} /> 只读；邮件仅生成草稿</span>
+          </div>
+          {skillsOpen && <div style={skillGrid}>
+            <button type="button" onClick={() => { setSelectedSkillId("auto"); setSkillsOpen(false); }} style={{ ...skillButton, ...(selectedSkillId === "auto" ? activeSkillButton : {}) }}><strong>自动选择</strong><span>根据你的自然语言按需调用</span></button>
+            {TRADE_SKILLS.map((skill) => <button key={skill.id} type="button" onClick={() => { setSelectedSkillId(skill.id); setSkillsOpen(false); setInput(skill.example); inputRef.current?.focus(); }} title={skill.description} style={{ ...skillButton, ...(selectedSkillId === skill.id ? activeSkillButton : {}) }}><strong>{skill.name}</strong><span>{skill.online ? "联网核验" : "本地资料"} · {skill.permission}</span></button>)}
+          </div>}
+          {selectedSkill && <div style={selectedSkillHint}>{selectedSkill.description} · 执行完成后自动恢复“自动选择”。</div>}
+        </div>
         <div style={{ marginBottom: 8 }}><KnowledgePicker accountId={activeAccountId} selectedIds={selectedKnowledgeIds} onChange={setSelectedKnowledgeIds} label="引用资料（可选）" /></div>
         <div style={composer} onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); }} onDrop={handleWorkbenchDrop}>
           {(attachedMails.length > 0 || attachedFiles.length > 0) && <div style={attachedRow}>
@@ -496,7 +577,7 @@ export default function HomeAiWorkbench() {
           <button type="button" onClick={() => fileInputRef.current?.click()} disabled={busy} style={fileButton}><Paperclip size={15} /> 添加文件</button>
           <button type="button" onClick={() => void send()} disabled={busy || !input.trim()} style={{ ...sendButton, opacity: busy || !input.trim() ? 0.55 : 1 }}><Send size={15} /> {busy ? "处理中" : "发送"}</button>
         </div>
-        {current?.messages.length === 0 && <div style={{ marginTop: 14 }}><div style={{ color: "var(--color-text-secondary)", fontSize: 12, marginBottom: 8 }}>可以直接开始（点击后会填入输入框，你可以先修改再发送）</div><div style={suggestionGrid}>{[...suggestions, ...extraSuggestions].map((suggestion) => <button key={suggestion} type="button" onClick={() => { setInput(suggestion); inputRef.current?.focus(); }} disabled={busy} style={{ ...suggestionButton, opacity: busy ? 0.55 : 1 }}>{suggestion}</button>)}</div></div>}
+        {current?.messages.length === 0 && <div style={{ marginTop: 12 }}><div style={{ color: "var(--color-text-secondary)", fontSize: 12, marginBottom: 7 }}>{selectedSkill ? `${selectedSkill.name}示例` : "可以这样问"}</div><div style={suggestionGrid}>{suggestions.map((suggestion) => <button key={suggestion} type="button" onClick={() => { setInput(suggestion); inputRef.current?.focus(); }} disabled={busy} style={{ ...suggestionButton, opacity: busy ? 0.55 : 1 }}>{suggestion}</button>)}</div></div>}
         <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 6, color: "var(--color-text-secondary)", fontSize: 11 }}><span>Enter 发送 · Shift + Enter 换行 · 当前范围：{activeAccountId ? "当前邮箱账号的全部邮件" : "全部邮箱账号"}</span>{current && current.messages.length > 0 && <button type="button" onClick={() => persist([{ ...current, messages: [], title: "新对话", updatedAt: Date.now() }, ...conversations.filter((item) => item.id !== current.id)])} style={clearButton}><X size={12} /> 清空当前对话</button>}</div>
       </div>
     </section>
@@ -519,3 +600,13 @@ const textarea: React.CSSProperties = { flex: 1, minWidth: 0, minHeight: 92, max
 const suggestionGrid: React.CSSProperties = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))", gap: 7 };
 const sendButton: React.CSSProperties = { display: "inline-flex", alignItems: "center", gap: 5, border: 0, borderRadius: 7, background: "var(--color-accent)", color: "#fff", padding: "8px 12px", fontSize: 12, cursor: "pointer" };
 const clearButton: React.CSSProperties = { display: "inline-flex", alignItems: "center", gap: 3, border: 0, background: "transparent", color: "var(--color-text-secondary)", fontSize: 11, cursor: "pointer" };
+const skillPanel: React.CSSProperties = { position: "relative", marginBottom: 9, padding: "7px 9px", border: "1px solid var(--color-border)", borderRadius: 9, background: "var(--color-bg-secondary)" };
+const skillToolbar: React.CSSProperties = { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" };
+const skillPickerButton: React.CSSProperties = { display: "inline-flex", alignItems: "center", gap: 6, border: "1px solid var(--color-border)", borderRadius: 7, background: "var(--color-bg-primary)", color: "var(--color-text-primary)", padding: "5px 8px", cursor: "pointer", fontSize: 11 };
+const skillGrid: React.CSSProperties = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 6, marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--color-border)" };
+const skillButton: React.CSSProperties = { display: "flex", flexDirection: "column", gap: 2, minWidth: 0, border: "1px solid var(--color-border)", borderRadius: 8, background: "var(--color-bg-primary)", color: "var(--color-text-primary)", padding: "7px 9px", textAlign: "left", cursor: "pointer", fontSize: 11 };
+const activeSkillButton: React.CSSProperties = { borderColor: "var(--color-accent)", background: "color-mix(in srgb, var(--color-accent) 9%, var(--color-bg-primary))", boxShadow: "inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 30%, transparent)" };
+const selectedSkillHint: React.CSSProperties = { marginTop: 7, color: "var(--color-text-secondary)", fontSize: 11 };
+const skillResultHeader: React.CSSProperties = { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginBottom: 8, paddingBottom: 7, borderBottom: "1px solid var(--color-border)", color: "var(--color-accent)", fontSize: 11 };
+const sourceList: React.CSSProperties = { display: "flex", flexDirection: "column", gap: 3, marginTop: 10, paddingTop: 8, borderTop: "1px solid var(--color-border)", fontSize: 11, wordBreak: "break-all" };
+const draftButton: React.CSSProperties = { display: "inline-flex", alignItems: "center", gap: 5, marginTop: 10, border: 0, borderRadius: 7, background: "var(--color-accent)", color: "#fff", padding: "7px 10px", fontSize: 11, cursor: "pointer" };

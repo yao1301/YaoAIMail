@@ -31,6 +31,9 @@ describe("UIStore", () => {
       startHiddenToTray: false,
     });
     useComposeStore.setState({
+      tabs: [],
+      tabsById: {},
+      activeTabId: null,
       composeMode: null,
       composeReplyTo: null,
       composeDirty: false,
@@ -75,6 +78,25 @@ describe("UIStore", () => {
     expect(useUIStore.getState().activeView).toBe("kanban");
     useUIStore.getState().setActiveView("settings");
     expect(useUIStore.getState().activeView).toBe("settings");
+  });
+
+  it("redirects the removed snoozed view to the inbox and drops stale tabs", () => {
+    useUIStore.getState().setActiveView("snoozed");
+    expect(useUIStore.getState().activeView).toBe("inbox");
+
+    useUIStore.getState().upsertNavTab({
+      key: "feature:snoozed",
+      kind: "feature",
+      label: "稍后提醒",
+      view: "snoozed",
+    });
+    expect(useUIStore.getState().navTabs).toEqual([]);
+
+    useUIStore.getState().setNavTabs([
+      { key: "feature:snoozed", kind: "feature", label: "稍后提醒", view: "snoozed" },
+      { key: "feature:starred", kind: "feature", label: "已加星标", view: "starred" },
+    ]);
+    expect(useUIStore.getState().navTabs.map((tab) => tab.view)).toEqual(["starred"]);
   });
 
   it("opens a message in inbox by clearing stale thread selection", () => {
@@ -134,10 +156,8 @@ describe("UIStore", () => {
       activeView: "compose",
       previousView: "kanban",
     });
-    useComposeStore.setState({
-      composeMode: "reply",
-      composeDirty: true,
-    });
+    useComposeStore.getState().openCompose("reply", { id: "message-1" } as never);
+    useComposeStore.getState().setComposeDirty(true);
 
     useComposeStore.getState().closeCompose();
 
@@ -155,13 +175,9 @@ describe("UIStore", () => {
       activeView: "compose",
       previousView: "kanban",
     });
-    useComposeStore.setState({
-      composeMode: "forward",
-      composeReplyTo: { id: "message-1" } as never,
-      composeDirty: true,
-      showComposeLeaveConfirm: true,
-      pendingView: null,
-    });
+    useComposeStore.getState().openCompose("forward", { id: "message-1" } as never);
+    useComposeStore.getState().setComposeDirty(true);
+    useComposeStore.getState().closeCompose();
 
     useComposeStore.getState().confirmCloseCompose();
 
@@ -174,19 +190,14 @@ describe("UIStore", () => {
     expect(composeState.showComposeLeaveConfirm).toBe(false);
   });
 
-  it("confirmCloseCompose navigates to pendingView when set", () => {
+  it("discardComposeAndSetActiveView closes the active tab and navigates", () => {
     useUIStore.setState({
       activeView: "compose",
       previousView: "inbox",
     });
-    useComposeStore.setState({
-      composeMode: "new",
-      composeDirty: true,
-      showComposeLeaveConfirm: true,
-      pendingView: "search",
-    });
-
-    useComposeStore.getState().confirmCloseCompose();
+    useComposeStore.getState().openCompose("new");
+    useComposeStore.getState().setComposeDirty(true);
+    useComposeStore.getState().discardComposeAndSetActiveView("search");
 
     const state = useUIStore.getState();
     const composeState = useComposeStore.getState();

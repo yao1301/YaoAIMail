@@ -9,6 +9,13 @@ vi.mock("../../../src/lib/api", () => ({
   openDefaultMailSettings: vi.fn().mockResolvedValue(undefined),
   getAutostartEnabled: vi.fn().mockResolvedValue(false),
   setAutostartEnabled: vi.fn().mockResolvedValue(undefined),
+  getProfileLocation: vi.fn().mockResolvedValue({ currentPath: "D:\\MailData", defaultPath: "D:\\MailData", isCustom: false }),
+  chooseProfileFolder: vi.fn(),
+  scheduleProfileMigration: vi.fn(),
+}));
+
+vi.mock("../../../src/features/settings/MailImportSection", () => ({
+  default: () => <div>Mail import</div>,
 }));
 
 vi.mock("react-i18next", () => ({

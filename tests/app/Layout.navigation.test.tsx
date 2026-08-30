@@ -1,7 +1,8 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import Layout from "../../src/app/Layout";
 import { useUIStore } from "../../src/stores/ui.store";
+import { useComposeStore } from "../../src/stores/compose.store";
 
 const mocks = vi.hoisted(() => {
   const settingsViewPromise = new Promise<{ default: () => JSX.Element }>(() => {});
@@ -162,12 +163,30 @@ vi.mock("../../src/stores/kanban.store", () => ({
 
 describe("Layout navigation", () => {
   beforeEach(() => {
+    useComposeStore.setState({
+      tabs: [],
+      tabsById: {},
+      activeTabId: null,
+      composeMode: null,
+      composeDirty: false,
+    });
     useUIStore.setState({
       activeView: "inbox",
       theme: "light",
       notificationsEnabled: true,
       networkStatus: "online",
     });
+  });
+
+  it("keeps compose tabs mounted when another workspace tab becomes active", async () => {
+    useComposeStore.getState().openCompose("new");
+    render(<Layout />);
+
+    expect(await screen.findByText("Compose panel")).toBeTruthy();
+    act(() => useUIStore.getState().setActiveView("inbox"));
+
+    expect(screen.getByText("Inbox panel")).toBeTruthy();
+    expect(screen.getByText("Compose panel")).toBeTruthy();
   });
 
   it("shows the loading fallback instead of leaving stale inbox content when a lazy view is pending", async () => {

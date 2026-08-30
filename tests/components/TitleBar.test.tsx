@@ -40,7 +40,7 @@ describe("TitleBar", () => {
   it("renders the app logo as a transparent custom titlebar image", () => {
     const { container } = render(<TitleBar />);
 
-    expect(screen.getByText("Pebble")).toBeTruthy();
+    expect(screen.getByText("YaoAIMail")).toBeTruthy();
 
     const logo = container.querySelector("img[aria-hidden='true']");
     expect(logo).not.toBeNull();

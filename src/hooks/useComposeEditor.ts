@@ -5,12 +5,13 @@ import Placeholder from "@tiptap/extension-placeholder";
 import { TextStyle } from "@tiptap/extension-text-style";
 import FontFamily from "@tiptap/extension-font-family";
 import Image from "@tiptap/extension-image";
+import { TableKit } from "@tiptap/extension-table";
 import Underline from "@tiptap/extension-underline";
 import { Markdown as MarkdownExtension } from "tiptap-markdown";
 import TurndownService from "turndown";
 import { getSignature, listEmailSignatures } from "@/lib/signatures";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
-import type { Message } from "@/lib/ipc-types";
+import type { EmailAddress, Message } from "@/lib/ipc-types";
 import type { TFunction } from "i18next";
 
 export type EditorMode = "rich" | "markdown" | "html";
@@ -52,6 +53,21 @@ interface ShouldApplyInitialEditorContentArgs {
   initialized: boolean;
   signatureReady: boolean;
   hasRestoredDraft: boolean;
+}
+
+function formatQuoteAddress(item: EmailAddress) {
+  const address = escapeHtml(item.address || "");
+  const linkedAddress = `<a href="mailto:${address}" style="color:#2563eb;text-decoration:none">${address}</a>`;
+  return item.name?.trim() ? `${escapeHtml(item.name.trim())} &lt;${linkedAddress}&gt;` : linkedAddress;
+}
+
+function formatQuoteAddressList(items: EmailAddress[]) {
+  return items.map(formatQuoteAddress).join(", ");
+}
+
+function quoteHeaderRow(label: string, value: string) {
+  if (!value) return "";
+  return `<tr><td style="width:68px;padding:3px 12px 3px 0;color:#6b7280;vertical-align:top;white-space:nowrap">${escapeHtml(label)}</td><td style="padding:3px 0;color:#24292f;vertical-align:top;word-break:break-word">${value}</td></tr>`;
 }
 
 function escapeHtml(s: string) {
@@ -169,14 +185,18 @@ export function buildComposeEditorContent({
 export function buildReplyQuoteHtml({ composeReplyTo, t }: BuildReplyQuoteHtmlArgs) {
   if (!composeReplyTo) return "";
 
-  const sender = escapeHtml(composeReplyTo.from_name || composeReplyTo.from_address || "");
+  const sender = formatQuoteAddress({
+    name: composeReplyTo.from_name || null,
+    address: composeReplyTo.from_address || "",
+  });
   const dateStr = escapeHtml(new Date((composeReplyTo.date || 0) * 1000).toLocaleString());
+  const to = formatQuoteAddressList(composeReplyTo.to_list || []);
+  const cc = formatQuoteAddressList(composeReplyTo.cc_list || []);
+  const subject = escapeHtml(composeReplyTo.subject || "");
   const body = composeReplyTo.body_html_raw
     ? extractComposeBodyHtml(composeReplyTo.body_html_raw)
     : `<p>${escapeHtml(composeReplyTo.body_text || "")}</p>`;
-  const attribution = t("compose.quoteAttribution", { date: dateStr, sender });
-
-  return `<blockquote class="compose-original-quote"><p>${escapeHtml(attribution)}</p>${body}</blockquote>`;
+  return `<div class="compose-original-quote" style="margin:18px 0 0;border:1px solid #d9dde3;border-radius:10px;overflow:hidden;background:#ffffff;color:#24292f;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.55"><div style="padding:12px 14px;background:#f3f4f6;border-bottom:1px solid #d9dde3"><div style="margin:0 0 7px;color:#4b5563;font-size:12px;font-weight:700">${escapeHtml(t("compose.originalMessage"))}</div><table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;font:inherit"><tbody>${quoteHeaderRow(t("compose.from"), sender)}${quoteHeaderRow(t("compose.sentDate"), dateStr)}${quoteHeaderRow(t("compose.to"), to)}${quoteHeaderRow(t("compose.cc"), cc)}${quoteHeaderRow(t("compose.subject"), subject)}</tbody></table></div><div style="padding:14px 16px;background:#ffffff">${body}</div></div>`;
 }
 
 export function appendReplyQuoteHtml(bodyHtml: string, quotedReplyHtml: string) {
@@ -283,6 +303,18 @@ export function useComposeEditor({
       StarterKit,
       Placeholder.configure({ placeholder: t("compose.editorPlaceholder", "Write your message...") }),
       MarkdownExtension.configure({ html: true, transformPastedText: true }),
+      TableKit.configure({
+        table: {
+          resizable: false,
+          HTMLAttributes: { style: "border-collapse:collapse;width:100%;max-width:100%;margin:12px 0" },
+        },
+        tableCell: {
+          HTMLAttributes: { style: "border:1px solid #d1d5db;padding:6px 8px;vertical-align:top" },
+        },
+        tableHeader: {
+          HTMLAttributes: { style: "border:1px solid #cbd5e1;padding:6px 8px;background-color:#f3f4f6;font-weight:600;text-align:left" },
+        },
+      }),
       TextStyle,
       FontFamily.configure({ types: ["textStyle"] }),
       Image.configure({ inline: true, allowBase64: true }),

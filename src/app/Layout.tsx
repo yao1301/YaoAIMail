@@ -135,6 +135,16 @@ export default function Layout() {
           <OfflineBanner />
           <WorkspaceTabs />
           <div className="app-main-scroll" style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden", position: "relative" }}>
+            {/* Keep every compose tab mounted while another workspace tab is
+                active. Undo-send timers and editor state must continue in the
+                background instead of being destroyed by view navigation. */}
+            {composeTabs.length > 0 && (
+              <div style={{ display: displayedView === "compose" ? "block" : "none", height: "100%" }}>
+                <Suspense fallback={<ViewLoadingFallback />}>
+                  <ComposeTabsView tabs={composeTabs} activeTabId={activeComposeTabId} />
+                </Suspense>
+              </div>
+            )}
             <ViewErrorBoundary key={displayedView}>
               <Suspense fallback={<ViewLoadingFallback />}>
                 {displayedView === "inbox" && <InboxView />}
@@ -146,9 +156,6 @@ export default function Layout() {
                 {displayedView === "search" && <SearchView />}
                 {displayedView === "starred" && <StarredView />}
                 {displayedView === "customerProfile" && <CustomerProfileView />}
-                {displayedView === "compose" && composeTabs.length > 0 && (
-                  <ComposeTabsView tabs={composeTabs} activeTabId={activeComposeTabId} />
-                )}
                 {displayedView === "aiWriting" && <StandaloneToolView><AiWritingView /></StandaloneToolView>}
                 {displayedView === "foreignTools" && <StandaloneToolView><ForeignToolsView /></StandaloneToolView>}
                 {displayedView === "messageDetail" && <MessageDetailPane />}

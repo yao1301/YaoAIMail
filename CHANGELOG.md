@@ -6,6 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [1.1.23] - 2026-08-29
+
+### Fixed
+
+- Default send-cancellation countdown is now 5 seconds and continues while switching workspace tabs.
+- Batch mail selection no longer shows duplicate per-row checkboxes; Ctrl can remove the first message from a Shift-selected range.
+- WPS/Excel formatted-table paste keeps the original visual preview instead of falling back to a simplified table.
+
+## [1.1.21] - 2026-08-29
+
+### Added
+
+- Added safe undo-send countdowns, scheduled sending, EML/MBOX migration, complete MIME export, WPS/Excel formatted-table previews, and restored Snoozed navigation.
+
+### Fixed
+
+- Restored message-row and select-all batch controls and kept empty-folder accounts visible in the multi-account sidebar.
+
 ### Added
 
 - Tool-calling agent infrastructure: `complete_chat_with_tools` with OpenAI-compatible tools, an agent loop (`run_agent`) with `web_search` / `fetch_url` / `gleif_company` tools, automatic fallback to plain chat when the model does not support function calling, and a forced final-answer round when the model gets stuck in a tool loop.
@@ -337,7 +355,8 @@ This release includes:
 - Windows installers are not code-signed yet, so Windows SmartScreen may show a warning.
 - Outlook support is still experimental and depends on Microsoft Graph permissions configured by the user.
 
-[Unreleased]: https://github.com/QingJ01/Pebble/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/QingJ01/Pebble/compare/v1.1.21...HEAD
+[1.1.21]: https://github.com/QingJ01/Pebble/compare/v1.1.1...v1.1.21
 [1.1.1]: https://github.com/QingJ01/Pebble/compare/v0.1.3...v1.1.1
 [0.1.3]: https://github.com/QingJ01/Pebble/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/QingJ01/Pebble/compare/v0.1.1...v0.1.2

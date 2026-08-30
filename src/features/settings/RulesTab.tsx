@@ -4,6 +4,7 @@ import {
 } from "lucide-react";
 import {
   applyRulesToFolder,
+  createFolder,
   createRule,
   deleteRule,
   listRules,
@@ -342,6 +343,27 @@ export default function RulesTab() {
     }
   }
 
+  async function createMoveTargetFolder(actionIndex: number) {
+    if (!editing) return;
+    const accountId = editing.form.account_id || selectedAccountId;
+    if (!accountId) {
+      useToastStore.getState().addToast({ message: "请先选择规则所属邮箱账号", type: "error" });
+      return;
+    }
+    const name = window.prompt("请输入新邮件文件夹名称");
+    if (!name?.trim()) return;
+    try {
+      const folder = await createFolder(accountId, name.trim());
+      const actions = [...editing.form.actions];
+      actions[actionIndex] = { ...actions[actionIndex], value: folder.id };
+      setEditing({ ...editing, form: { ...editing.form, account_id: accountId, actions } });
+      await queryClient.invalidateQueries({ queryKey: ["folders"] });
+      useToastStore.getState().addToast({ message: `已新建文件夹「${folder.name}」并选中`, type: "success" });
+    } catch (error) {
+      useToastStore.getState().addToast({ message: `新建文件夹失败：${String(error)}`, type: "error" });
+    }
+  }
+
   async function removeRule(rule: Rule) {
     try {
       await deleteRule(rule.id);
@@ -625,20 +647,25 @@ export default function RulesTab() {
                       ))}
                     </select>
                     {action.type === "MoveToFolder" && (
-                      <select
-                        value={action.value ?? ""}
-                        onChange={(event) => {
-                          const actions = [...editing.form.actions];
-                          actions[index] = { ...actions[index], value: event.target.value };
-                          setEditing({ ...editing, form: { ...editing.form, actions } });
-                        }}
-                        style={{ ...fieldSelect, flex: 1, minWidth: 160 }}
-                      >
-                        <option value="">选择文件夹…</option>
-                        {accountFolders.map((folder) => (
-                          <option key={folder.id} value={folder.id}>{folder.name}</option>
-                        ))}
-                      </select>
+                      <div style={{ display: "flex", gap: 6, flex: 1, minWidth: 230 }}>
+                        <select
+                          value={action.value ?? ""}
+                          onChange={(event) => {
+                            const actions = [...editing.form.actions];
+                            actions[index] = { ...actions[index], value: event.target.value };
+                            setEditing({ ...editing, form: { ...editing.form, actions } });
+                          }}
+                          style={{ ...fieldSelect, flex: 1, minWidth: 150 }}
+                        >
+                          <option value="">选择文件夹…</option>
+                          {accountFolders.map((folder) => (
+                            <option key={folder.id} value={folder.id}>{folder.name}</option>
+                          ))}
+                        </select>
+                        <button type="button" onClick={() => void createMoveTargetFolder(index)} style={smallBtn} title="直接在邮箱服务器中新建文件夹并选中">
+                          <Plus size={12} />新建文件夹
+                        </button>
+                      </div>
                     )}
                     {action.type === "AddLabel" && (
                       <input

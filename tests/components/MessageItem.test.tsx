@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("react-i18next", () => ({
+  initReactI18next: { type: "3rdParty", init: vi.fn() },
   useTranslation: () => ({
     t: (key: string, fallback?: string) => {
       const labels: Record<string, string> = {
@@ -210,28 +211,31 @@ describe("MessageItem", () => {
     expect(mocks.queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["message", "message-1"] });
   });
 
-  it("uses the custom batch checkbox control for row selection", () => {
-    const onToggleBatchSelect = vi.fn();
-
+  it("uses row highlighting without a duplicate checkbox in batch mode", () => {
     render(
       <MessageItem
         message={makeMessage()}
         isSelected={false}
         onClick={vi.fn()}
         batchMode
-        batchSelected={false}
-        onToggleBatchSelect={onToggleBatchSelect}
+        batchSelected
       />,
     );
+    expect(screen.queryByRole("checkbox", { name: "Select message" })).toBeNull();
+    expect(screen.getByRole("option").getAttribute("aria-selected")).toBe("true");
+  });
 
-    const checkbox = screen.getByRole("checkbox", { name: "Select message" });
-
-    expect(checkbox.className).toContain("batch-checkbox");
-    expect(checkbox.className).toContain("message-row-checkbox");
-
-    fireEvent.click(checkbox);
-
-    expect(onToggleBatchSelect).toHaveBeenCalledWith("message-1");
+  it("does not keep the reading-pane selection highlighted after batch deselection", () => {
+    render(
+      <MessageItem
+        message={makeMessage()}
+        isSelected
+        onClick={vi.fn()}
+        batchMode
+        batchSelected={false}
+      />,
+    );
+    expect(screen.getByRole("option").getAttribute("aria-selected")).toBe("false");
   });
 
   it("shows the source account color marker when an account color is provided", () => {

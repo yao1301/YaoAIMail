@@ -75,6 +75,7 @@ vi.mock("../../../src/hooks/queries", () => ({
     data: threads,
     isLoading: false,
   }),
+  useMessageQuery: () => ({ data: null }),
   patchMessagesCache: vi.fn(),
 }));
 

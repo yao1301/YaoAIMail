@@ -6,7 +6,7 @@ import {
   Type, FileCode2, Hash, Eye, EyeOff,
   Paperclip, FileText, Trash2, BookTemplate, Library,
   ChevronDown, ChevronRight, Sparkles, Undo2, Redo2,
-  FolderOpen, Copy,
+  FolderOpen, Copy, Scaling,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import ContextMenu, { type ContextMenuItem } from "@/components/ContextMenu";
@@ -15,13 +15,14 @@ import { useUIStore } from "@/stores/ui.store";
 import { useComposeStore } from "@/stores/compose.store";
 import { useAccountsQuery } from "@/hooks/queries";
 import { useSendEmailMutation } from "@/hooks/mutations";
+import type { SendEmailParams } from "@/hooks/mutations/useSendEmailMutation";
 import ContactAutocomplete from "@/components/ContactAutocomplete";
 import { listTemplates, saveTemplate, deleteTemplate } from "@/lib/templates";
 import type { EmailTemplate } from "@/lib/templates";
 import { listKnowledgeItems, listStyleProfiles, searchKnowledgeBase, getMessagesBatch, readAttachmentFile, type KnowledgeItem, type StyleProfile, aiChat, type ChatTurn } from "@/lib/api";
 import { useComposeRecipients } from "@/hooks/useComposeRecipients";
 import { useComposeDraft, loadDraftFromStorage, clearDraftStorage } from "@/hooks/useComposeDraft";
-import { deleteDraft, stageComposeAttachment, getSendGuardConfig, checkSendGuard } from "@/lib/api";
+import { deleteDraft, stageComposeAttachment, getSendGuardConfig, checkSendGuard, scheduleEmail } from "@/lib/api";
 import { listEmailSignatures, type EmailSignature } from "@/lib/signatures";
 import { appendReplyQuoteHtml, useComposeEditor } from "@/hooks/useComposeEditor";
 import { useConfirmStore } from "@/stores/confirm.store";
@@ -35,6 +36,17 @@ import { extractDocumentText } from "@/lib/documentText";
 import { getActiveWorkRole } from "@/features/settings/WorkRoleTab";
 import { resizeAutoGrowTextarea } from "@/lib/autoGrowTextarea";
 import { getWritingPreferences } from "@/lib/writingPreferences";
+import {
+  clipboardContainsHtmlTable,
+  clipboardImageFiles,
+  renderSpreadsheetHtmlToPng,
+  normalizeImageWidthPercent,
+  scaledImageWidthPx,
+} from "./composeClipboard";
+import {
+  getUndoSendRemainingSeconds,
+  readUndoSendDelay,
+} from "./undoSend";
 
 export default function ComposeView({ tabId }: { tabId?: string }) {
   const composeMode = useComposeStore((s) => s.composeMode);
@@ -106,6 +118,15 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
   });
   const [sendError, setSendError] = useState<string | null>(null);
   const sendMutation = useSendEmailMutation();
+  const [queuedSend, setQueuedSend] = useState<{
+    payload: SendEmailParams;
+    deadlineMs: number;
+    durationSeconds: number;
+  } | null>(null);
+  const [undoSendRemaining, setUndoSendRemaining] = useState(0);
+  const [schedulePickerOpen, setSchedulePickerOpen] = useState(false);
+  const [scheduleLocalValue, setScheduleLocalValue] = useState("");
+  const [isScheduling, setIsScheduling] = useState(false);
   const writingAccountId = fromAccountId ?? activeAccountId;
   const writingDefaults = getWritingPreferences(writingAccountId);
 
@@ -134,7 +155,8 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
   const [attachments, setAttachments] = useState<ComposeAttachment[]>(() =>
     composePrefill?.attachments ?? restoredDraft.current?.attachments ?? [],
   );
-  const [isDragging, setIsDragging] = useState(false);
+  const [isAttachmentDragging, setIsAttachmentDragging] = useState(false);
+  const [isAiContextDragging, setIsAiContextDragging] = useState(false);
 
   const [editorReady, setEditorReady] = useState(false);
   useEffect(() => {
@@ -312,6 +334,8 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
   function handleComposeAiDrop(event: React.DragEvent<HTMLDivElement>) {
     event.preventDefault();
     event.stopPropagation();
+    setIsAiContextDragging(false);
+    setIsAttachmentDragging(false);
     const messageId = event.dataTransfer.getData("application/x-pebble-message-id").trim();
     const attachmentId = event.dataTransfer.getData("application/x-pebble-attachment-id").trim();
     const files = Array.from(event.dataTransfer.files ?? []);
@@ -630,7 +654,73 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
     return () => clearTimeout(timer);
   }, [sendError]);
 
-  async function handleSend() {
+  function finishAcceptedSend(accountId: string) {
+    const draftIdsToDelete = { ...draftIdsByAccountRef.current };
+    if (draftIdRef.current) {
+      draftIdsToDelete[accountId] = draftIdRef.current;
+    }
+    for (const [draftAccountId, draftId] of Object.entries(draftIdsToDelete)) {
+      deleteDraft(draftAccountId, draftId).catch((err) => {
+        console.warn("Failed to delete draft after send:", err);
+        useToastStore.getState().addToast({
+          type: "error",
+          message: t(
+            "compose.draftCleanupFailed",
+            "Sent, but failed to remove the saved draft. You can delete it from Drafts.",
+          ),
+        });
+      });
+    }
+    draftIdsByAccountRef.current = {};
+    draftIdRef.current = null;
+    clearDraftStorage();
+    useComposeStore.getState().setComposeDirty(false, tabId);
+    closeCompose(tabId);
+  }
+
+  function sendNow(payload: SendEmailParams) {
+    sendMutation.mutate(payload, {
+      onSuccess: () => finishAcceptedSend(payload.accountId),
+      onError: (e) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        setSendError(msg || t("compose.sendError", "Failed to send"));
+      },
+    });
+  }
+
+  useEffect(() => {
+    if (!queuedSend) return;
+
+    const updateRemaining = () => {
+      setUndoSendRemaining(getUndoSendRemainingSeconds(queuedSend.deadlineMs));
+    };
+    updateRemaining();
+    const intervalId = window.setInterval(updateRemaining, 100);
+    const timeoutId = window.setTimeout(() => {
+      const payload = queuedSend.payload;
+      setQueuedSend(null);
+      setUndoSendRemaining(0);
+      sendNow(payload);
+    }, Math.max(0, queuedSend.deadlineMs - Date.now()));
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.clearTimeout(timeoutId);
+    };
+  }, [queuedSend]);
+
+  function cancelQueuedSend() {
+    if (!queuedSend) return;
+    setQueuedSend(null);
+    setUndoSendRemaining(0);
+    useToastStore.getState().addToast({
+      type: "success",
+      message: t("compose.sendCancelled", "已取消发送，邮件仍保留在草稿中"),
+    });
+  }
+
+  async function handleSend(sendAt?: number) {
+    if (queuedSend || sendMutation.isPending || isScheduling) return;
     const finalTo = mergePendingRecipient(to, toInputValue).filter(Boolean);
     const finalCc = mergePendingRecipient(cc, ccInputValue).filter(Boolean);
     const finalBcc = mergePendingRecipient(bcc, bccInputValue).filter(Boolean);
@@ -723,48 +813,57 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
       }
     }
 
-    sendMutation.mutate(
-      {
-        accountId: fromAccountId,
-        to: finalTo,
-        cc: finalCc,
-        bcc: finalBcc,
-        subject,
-        bodyText,
-        bodyHtml: outgoingBodyHtml || undefined,
-        inReplyTo: inReplyTo || undefined,
-        attachmentPaths: attachments.length > 0 ? attachments.map((a) => a.path) : undefined,
-      },
-      {
-        onSuccess: () => {
-          const draftIdsToDelete = { ...draftIdsByAccountRef.current };
-          if (draftIdRef.current && fromAccountId) {
-            draftIdsToDelete[fromAccountId] = draftIdRef.current;
-          }
-          for (const [draftAccountId, draftId] of Object.entries(draftIdsToDelete)) {
-            deleteDraft(draftAccountId, draftId).catch((err) => {
-              console.warn("Failed to delete draft after send:", err);
-              useToastStore.getState().addToast({
-                type: "error",
-                message: t(
-                  "compose.draftCleanupFailed",
-                  "Sent, but failed to remove the saved draft. You can delete it from Drafts.",
-                ),
-              });
-            });
-          }
-          draftIdsByAccountRef.current = {};
-          draftIdRef.current = null;
-          clearDraftStorage();
-          useComposeStore.getState().setComposeDirty(false, tabId);
-          closeCompose(tabId);
-        },
-        onError: (e) => {
-          const msg = e instanceof Error ? e.message : String(e);
-          setSendError(msg || t("compose.sendError", "Failed to send"));
-        },
-      },
-    );
+    const payload: SendEmailParams = {
+      accountId: fromAccountId,
+      to: finalTo,
+      cc: finalCc,
+      bcc: finalBcc,
+      subject,
+      bodyText,
+      bodyHtml: outgoingBodyHtml || undefined,
+      inReplyTo: inReplyTo || undefined,
+      attachmentPaths: attachments.length > 0 ? attachments.map((a) => a.path) : undefined,
+    };
+    if (typeof sendAt === "number") {
+      setIsScheduling(true);
+      setSchedulePickerOpen(false);
+      try {
+        await scheduleEmail(
+          payload.accountId,
+          payload.to,
+          payload.cc,
+          payload.bcc,
+          payload.subject,
+          payload.bodyText,
+          payload.bodyHtml,
+          payload.inReplyTo,
+          payload.attachmentPaths,
+          sendAt,
+        );
+        useToastStore.getState().addToast({
+          type: "success",
+          duration: 8000,
+          message: t("compose.scheduledSuccess", "邮件已加入发件箱，将在设定时间自动发送"),
+        });
+        finishAcceptedSend(payload.accountId);
+      } catch (error) {
+        setSendError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setIsScheduling(false);
+      }
+      return;
+    }
+    const delaySeconds = readUndoSendDelay();
+    if (delaySeconds === 0) {
+      sendNow(payload);
+      return;
+    }
+    setUndoSendRemaining(delaySeconds);
+    setQueuedSend({
+      payload,
+      durationSeconds: delaySeconds,
+      deadlineMs: Date.now() + delaySeconds * 1000,
+    });
   }
 
   const title =
@@ -776,7 +875,7 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
           ? t("compose.forward", "Forward")
           : t("compose.newMessage", "New Message");
   const hasToRecipient = to.some(Boolean) || isValidEmailAddress(toInputValue);
-  const sendDisabled = sendMutation.isPending || !fromAccountId || !hasToRecipient;
+  const sendDisabled = sendMutation.isPending || isScheduling || Boolean(queuedSend) || !fromAccountId || !hasToRecipient;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
@@ -803,23 +902,101 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
             {title}
           </span>
         </div>
-        <button
-          onClick={handleSend}
-          disabled={sendDisabled}
+        <div style={{ position: "relative", display: "flex" }}>
+          <button
+            onClick={() => void handleSend()}
+            disabled={sendDisabled}
+            style={{
+              display: "flex", alignItems: "center", gap: "6px",
+              padding: "7px 16px",
+              backgroundColor: sendMutation.isPending || queuedSend || isScheduling ? "var(--color-text-secondary)" : "var(--color-accent, #2563eb)",
+              color: "#fff", border: "none", borderRadius: "6px 0 0 6px",
+              cursor: sendDisabled ? "default" : "pointer",
+              opacity: hasToRecipient ? 1 : 0.5,
+              fontSize: "13px", fontWeight: 500,
+            }}
+          >
+            <Send size={14} />
+            {sendMutation.isPending
+              ? t("compose.sending", "正在连接邮箱服务器…")
+              : isScheduling
+                ? t("compose.scheduling", "正在安排…")
+                : queuedSend
+                  ? t("compose.waitingToSend", "等待发送…")
+                  : t("compose.send", "Send")}
+          </button>
+          <button
+            type="button"
+            aria-label={t("compose.scheduleSend", "定时发送")}
+            disabled={sendDisabled}
+            onClick={() => {
+              if (!scheduleLocalValue) {
+                const next = new Date(Date.now() + 60 * 60 * 1000);
+                next.setMinutes(0, 0, 0);
+                const local = new Date(next.getTime() - next.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+                setScheduleLocalValue(local);
+              }
+              setSchedulePickerOpen((open) => !open);
+            }}
+            style={{ padding: "7px 8px", border: "none", borderLeft: "1px solid rgba(255,255,255,.35)", borderRadius: "0 6px 6px 0", background: "var(--color-accent, #2563eb)", color: "#fff", cursor: sendDisabled ? "default" : "pointer", opacity: hasToRecipient ? 1 : 0.5 }}
+          ><ChevronDown size={14} /></button>
+          {schedulePickerOpen && (
+            <div style={{ position: "absolute", zIndex: 50, right: 0, top: "calc(100% + 7px)", width: "285px", padding: "12px", border: "1px solid var(--color-border)", borderRadius: "8px", background: "var(--color-bg)", boxShadow: "0 8px 24px rgba(0,0,0,.16)" }}>
+              <div style={{ fontSize: "13px", fontWeight: 600, marginBottom: "8px" }}>{t("compose.scheduleSend", "定时发送")}</div>
+              <input type="datetime-local" value={scheduleLocalValue} min={new Date(Date.now() - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 16)} onChange={(event) => setScheduleLocalValue(event.target.value)} style={{ width: "100%", boxSizing: "border-box", padding: "8px", border: "1px solid var(--color-border)", borderRadius: "6px", background: "var(--color-bg)", color: "var(--color-text-primary)" }} />
+              <p style={{ margin: "7px 0 10px", color: "var(--color-text-secondary)", fontSize: "11px", lineHeight: 1.45 }}>{t("compose.scheduleHint", "软件关闭后计划仍会保留；到达时间后，下次软件运行并联网时会自动发送。")}</p>
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: "7px" }}>
+                <button type="button" onClick={() => setSchedulePickerOpen(false)} style={{ padding: "6px 10px", border: "1px solid var(--color-border)", borderRadius: "6px", background: "transparent", color: "var(--color-text-primary)" }}>{t("common.cancel", "取消")}</button>
+                <button type="button" onClick={() => { const value = new Date(scheduleLocalValue).getTime(); if (Number.isFinite(value)) void handleSend(Math.floor(value / 1000)); }} disabled={!scheduleLocalValue || new Date(scheduleLocalValue).getTime() <= Date.now() + 5000} style={{ padding: "6px 12px", border: "none", borderRadius: "6px", background: "var(--color-accent)", color: "#fff", opacity: !scheduleLocalValue || new Date(scheduleLocalValue).getTime() <= Date.now() + 5000 ? .5 : 1 }}>{t("compose.confirmSchedule", "确认定时发送")}</button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {queuedSend && (
+        <div
+          role="status"
+          aria-live="polite"
           style={{
-            display: "flex", alignItems: "center", gap: "6px",
-            padding: "7px 20px",
-            backgroundColor: sendMutation.isPending ? "var(--color-text-secondary)" : "var(--color-accent, #2563eb)",
-            color: "#fff", border: "none", borderRadius: "6px",
-            cursor: sendDisabled ? "default" : "pointer",
-            opacity: hasToRecipient ? 1 : 0.5,
-            fontSize: "13px", fontWeight: 500,
+            padding: "10px 20px 12px",
+            borderBottom: "1px solid var(--color-border)",
+            background: "var(--color-bg-secondary)",
           }}
         >
-          <Send size={14} />
-          {sendMutation.isPending ? t("compose.sending", "Sending...") : t("compose.send", "Send")}
-        </button>
-      </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: "13px", fontWeight: 600, color: "var(--color-text-primary)" }}>
+                {t("compose.undoSendCountdown", "将在 {{seconds}} 秒后发送", { seconds: undoSendRemaining })}
+              </div>
+              <div style={{ height: "5px", marginTop: "7px", borderRadius: "999px", overflow: "hidden", background: "var(--color-border)" }}>
+                <div style={{
+                  width: `${Math.max(0, Math.min(100, (undoSendRemaining / queuedSend.durationSeconds) * 100))}%`,
+                  height: "100%",
+                  borderRadius: "inherit",
+                  background: "var(--color-accent)",
+                  transition: "width 100ms linear",
+                }} />
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={cancelQueuedSend}
+              style={{
+                padding: "7px 16px",
+                borderRadius: "6px",
+                border: "1px solid var(--color-accent)",
+                background: "var(--color-bg)",
+                color: "var(--color-accent)",
+                cursor: "pointer",
+                fontWeight: 600,
+              }}
+            >
+              {t("compose.cancelSend", "取消发送")}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Error banner */}
       {sendError && (
@@ -1262,23 +1439,48 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
           {/* Editor area */}
           <div
             className={`compose-editor-area${isReply ? " compose-editor-area--reply" : ""}`}
-            onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
-            onDragLeave={() => setIsDragging(false)}
-            onDrop={async (e) => {
-              e.preventDefault();
-              setIsDragging(false);
-              const files = e.dataTransfer.files;
-              if (!files.length) return;
-              try {
-                await stageAttachmentFiles(files);
-              } catch (err) {
-                console.warn("Failed to stage dropped attachment:", err);
-                setSendError(t("compose.attachmentStageError", "Failed to attach file"));
-              }
-            }}
-            onPaste={async (e) => {
+            onPasteCapture={async (e) => {
               const items = e.clipboardData?.items;
               if (!items) return;
+              const previewImages = clipboardImageFiles(items);
+              // Excel exposes editable HTML and a rendered image at the same
+              // time. The user expects the rendered Excel appearance, so stop
+              // Tiptap before it inserts the simplified HTML table and keep
+              // exactly one preview image.
+              if (clipboardContainsHtmlTable(e.clipboardData)) {
+                const pastedHtml = e.clipboardData.getData("text/html");
+                e.preventDefault();
+                e.stopPropagation();
+                try {
+                  let dataUrl = "";
+                  if (previewImages.length > 0) {
+                    dataUrl = await fileToDataUrl(previewImages[0]);
+                  } else {
+                    const nativePng = await invoke<string | null>("get_clipboard_image_png_base64");
+                    if (nativePng) dataUrl = `data:image/png;base64,${nativePng}`;
+                    if (!dataUrl && pastedHtml) dataUrl = await renderSpreadsheetHtmlToPng(pastedHtml) ?? "";
+                  }
+                  if (dataUrl) {
+                    editor?.chain().focus().setImage({ src: dataUrl }).run();
+                  } else if (pastedHtml) {
+                    editor?.chain().focus().insertContent(pastedHtml).run();
+                    useToastStore.getState().addToast({
+                      message: t("compose.excelPreviewUnavailable", "无法生成原格式预览，已保留为可编辑表格"),
+                      type: "error",
+                    });
+                  }
+                } catch (err) {
+                  console.warn("Failed to paste Excel preview into body:", err);
+                  if (pastedHtml) {
+                    editor?.chain().focus().insertContent(pastedHtml).run();
+                    useToastStore.getState().addToast({
+                      message: t("compose.excelPreviewUnavailable", "无法生成原格式预览，已保留为可编辑表格"),
+                      type: "error",
+                    });
+                  }
+                }
+                return;
+              }
               const pastedFiles: File[] = [];
               for (const item of Array.from(items)) {
                 if (item.kind === "file") {
@@ -1310,7 +1512,34 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
             }}
           >
             <div
-              className={`compose-editor-surface${isReply ? " compose-editor-surface--reply" : ""}`}
+              className={`compose-editor-surface${isReply ? " compose-editor-surface--reply" : ""}${isAttachmentDragging ? " is-attachment-drop-target" : ""}`}
+              onDragOver={(event) => {
+                if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+                event.preventDefault();
+                event.stopPropagation();
+                event.dataTransfer.dropEffect = "copy";
+                setIsAiContextDragging(false);
+                setIsAttachmentDragging(true);
+              }}
+              onDragLeave={(event) => {
+                const nextTarget = event.relatedTarget;
+                if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+                  setIsAttachmentDragging(false);
+                }
+              }}
+              onDrop={async (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setIsAttachmentDragging(false);
+                const files = event.dataTransfer.files;
+                if (!files.length) return;
+                try {
+                  await stageAttachmentFiles(files);
+                } catch (err) {
+                  console.warn("Failed to stage dropped attachment:", err);
+                  setSendError(t("compose.attachmentStageError", "Failed to attach file"));
+                }
+              }}
               onContextMenu={(event) => {
                 const target = event.target as HTMLElement | null;
                 const img = target?.closest("img");
@@ -1318,7 +1547,53 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
                 event.preventDefault();
                 const src = img.getAttribute("src") ?? "";
                 const isInlineData = src.startsWith("data:image/");
+                let imagePos: number | null = null;
+                try {
+                  const domPos = editor.view.posAtDOM(img, 0);
+                  imagePos = editor.state.doc.nodeAt(domPos)?.type.name === "image"
+                    ? domPos
+                    : domPos > 0 && editor.state.doc.nodeAt(domPos - 1)?.type.name === "image"
+                      ? domPos - 1
+                      : null;
+                } catch {
+                  imagePos = null;
+                }
+                const originalWidth = img.naturalWidth;
+                const resizeImage = (percent: number | null) => {
+                  if (imagePos === null) return;
+                  const width = percent === null ? null : scaledImageWidthPx(originalWidth, percent);
+                  if (percent !== null && width === null) {
+                    useToastStore.getState().addToast({ message: t("compose.imageOriginalSizeUnavailable", "暂时无法读取图片原始尺寸，请等待图片加载后重试"), type: "error" });
+                    return;
+                  }
+                  editor.chain().focus().setNodeSelection(imagePos).updateAttributes("image", {
+                    width,
+                    height: null,
+                  }).run();
+                };
                 const items: ContextMenuItem[] = [
+                  { label: t("compose.imageSize", "图片大小"), icon: <Scaling size={14} />, disabled: true, onClick: () => undefined },
+                  ...[20, 50, 80].map((percent) => ({
+                    label: t("compose.imageScalePercent", "缩小到原图 {{percent}}%", { percent }),
+                    icon: <Scaling size={14} />,
+                    disabled: imagePos === null || originalWidth <= 0,
+                    onClick: () => resizeImage(percent),
+                  })),
+                  { label: t("compose.imageOriginalSize", "恢复原始大小"), icon: <Scaling size={14} />, disabled: imagePos === null, onClick: () => resizeImage(null) },
+                  {
+                    label: t("compose.imageCustomSize", "自定义大小…"), icon: <Scaling size={14} />, disabled: imagePos === null,
+                    onClick: () => {
+                      const input = window.prompt(t("compose.imageCustomSizePrompt", "请输入相对原图的缩放比例（1–99）"), "50");
+                      if (input === null) return;
+                      const percent = normalizeImageWidthPercent(input);
+                      if (percent === null || percent >= 100) {
+                        useToastStore.getState().addToast({ message: t("compose.imageCustomSizeInvalid", "请输入 1 到 99 之间的百分比；原始大小请使用“恢复原始大小”"), type: "error" });
+                        return;
+                      }
+                      resizeImage(percent);
+                    },
+                  },
+                  { separator: true },
                   { label: t("compose.imgToAttachment", "转为附件"), icon: <Paperclip size={14} />, disabled: !isInlineData, onClick: () => {
                     if (!isInlineData) return;
                     try {
@@ -1331,11 +1606,7 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
                       const file = new File([bytes], `pasted-${Date.now()}.${ext}`, { type: mime });
                       void stageAttachmentFiles([file]);
                       // 从正文移除该图片（改为附件）
-                      const { state } = editor;
-                      const { from } = state.selection;
-                      const node = state.doc.nodeAt(from);
-                      const imgPos = node?.type.name === "image" ? from : from - 1;
-                      editor.chain().focus().deleteRange({ from: Math.max(0, imgPos), to: imgPos + 1 }).run();
+                      if (imagePos !== null) editor.chain().focus().deleteRange({ from: imagePos, to: imagePos + 1 }).run();
                     } catch (err) {
                       console.warn("Failed to convert image to attachment:", err);
                       useToastStore.getState().addToast({ message: t("compose.imgToAttachmentFailed", "转换失败，请重试"), type: "error" });
@@ -1348,11 +1619,7 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
                   } },
                   { separator: true },
                   { label: t("compose.deleteImage", "删除图片"), icon: <Trash2 size={14} />, danger: true, onClick: () => {
-                    const { state } = editor;
-                    const { from } = state.selection;
-                    const node = state.doc.nodeAt(from);
-                    const imgPos = node?.type.name === "image" ? from : from - 1;
-                    editor.chain().focus().deleteRange({ from: Math.max(0, imgPos), to: imgPos + 1 }).run();
+                    if (imagePos !== null) editor.chain().focus().deleteRange({ from: imagePos, to: imagePos + 1 }).run();
                   } },
                 ];
                 setInlineImageMenu({ x: event.clientX, y: event.clientY, items });
@@ -1400,6 +1667,15 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
                   className={`compose-source-input${editorMode === "html" ? " is-code" : ""}`}
                 />
               )}
+              {isAttachmentDragging && (
+                <div className="compose-drop-overlay compose-drop-overlay--attachment" role="status">
+                  <Paperclip size={22} />
+                  <span>
+                    <strong>{t("compose.dropAsAttachment", "松开，添加为邮件附件")}</strong>
+                    <small>{t("compose.dropAsAttachmentHint", "文件将随邮件一起发送")}</small>
+                  </span>
+                </div>
+              )}
             </div>
             {/* AI 写作助手 —— 草稿栏下方：生成结果直接写入草稿栏 */}
             <div style={{
@@ -1424,7 +1700,23 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
                   </button>
                 )}
               </div>
-              <div onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); }} onDrop={handleComposeAiDrop}>
+              <div
+                className={`compose-ai-dropzone${isAiContextDragging ? " is-ai-context-drop-target" : ""}`}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  event.dataTransfer.dropEffect = "copy";
+                  setIsAttachmentDragging(false);
+                  setIsAiContextDragging(true);
+                }}
+                onDragLeave={(event) => {
+                  const nextTarget = event.relatedTarget;
+                  if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+                    setIsAiContextDragging(false);
+                  }
+                }}
+                onDrop={handleComposeAiDrop}
+              >
                 <textarea
                   value={aiInstruction}
                   onChange={(e) => setAiInstruction(e.target.value)}
@@ -1458,6 +1750,15 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "7px 8px", border: "1px dashed var(--color-accent)", borderTop: 0, borderRadius: "0 0 6px 6px" }}>
                     {aiContextMessages.map((item) => <span key={item.id} style={{ fontSize: 11, padding: "3px 7px", borderRadius: 10, background: "var(--color-bg-hover)" }}>邮件：{item.title} <button type="button" onClick={() => setAiContextMessages((current) => current.filter((x) => x.id !== item.id))} style={{ border: 0, background: "transparent", cursor: "pointer" }}>×</button></span>)}
                     {aiContextFiles.map((file) => <span key={`${file.name}-${file.size}-${file.lastModified}`} style={{ fontSize: 11, padding: "3px 7px", borderRadius: 10, background: "var(--color-bg-hover)" }}>文件：{file.name} <button type="button" onClick={() => setAiContextFiles((current) => current.filter((x) => x !== file))} style={{ border: 0, background: "transparent", cursor: "pointer" }}>×</button></span>)}
+                  </div>
+                )}
+                {isAiContextDragging && (
+                  <div className="compose-ai-drop-overlay" role="status">
+                    <Sparkles size={22} />
+                    <span>
+                      <strong>{t("compose.dropAsAiContext", "松开，作为 AI 输入上下文")}</strong>
+                      <small>{t("compose.dropAsAiContextHint", "只用于生成草稿，不会作为邮件附件发送")}</small>
+                    </span>
                   </div>
                 )}
                 {(aiContextFiles.length > 0 || aiContextMessages.length > 0) && <div style={{ marginTop: 7, fontSize: 11, color: "var(--color-text-secondary)" }}>已添加 {aiContextMessages.length + aiContextFiles.length} 项上下文；点击生成后会使用这些内容发送给当前配置的 AI 服务商。</div>}
@@ -1640,12 +1941,6 @@ function ComposeViewInner({ accounts, tabId }: { accounts: Account[]; tabId?: st
                     dangerouslySetInnerHTML={{ __html: quotedReplyHtml }}
                   />
                 )}
-              </div>
-            )}
-            {isDragging && (
-              <div className="compose-drop-overlay">
-                <Paperclip size={20} />
-                {t("compose.dropFiles", "Drop files to attach")}
               </div>
             )}
           </div>

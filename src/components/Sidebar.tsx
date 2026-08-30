@@ -698,6 +698,7 @@ export default function Sidebar() {
   // 始终分组（不随 allAccountsMode 切换）：每个账号一组、各自可折叠。
   const foldersByAccount = useMemo(() => {
     const map = new Map<string, FolderType[]>();
+    for (const account of accounts) map.set(account.id, []);
     for (const folder of folders) {
       const list = map.get(folder.account_id) ?? [];
       list.push(folder);
@@ -722,7 +723,7 @@ export default function Sidebar() {
       });
     }
     return map;
-  }, [folders, allAccountsMode]);
+  }, [folders, accounts]);
 
   const showAccountGroups = !!foldersByAccount && accounts.length >= 1;
 
@@ -1022,7 +1023,7 @@ export default function Sidebar() {
           gap: "1px",
         }}
       >
-        {false && runningTasks.length > 0 && !sidebarCollapsed && (
+        {runningTasks.length > 0 && !sidebarCollapsed && (
           <div title={runningTasks.map((task) => task.label).join("；")} style={{ display: "flex", alignItems: "center", gap: 7, margin: "0 4px 5px", padding: "6px 8px", borderRadius: 6, background: "color-mix(in srgb, var(--color-accent) 10%, transparent)", color: "var(--color-accent)", fontSize: 11 }}>
             <RefreshCw size={13} style={{ animation: "pebble-sidebar-spin 1s linear infinite" }} />
             <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{runningTasks.length === 1 ? runningTasks[0].label : `${runningTasks.length} 项后台任务处理中`}</span>
@@ -1083,12 +1084,15 @@ export default function Sidebar() {
                         gap: 4,
                         padding: "6px 10px",
                         marginTop: 0,
-                        borderBottom: isExpanded ? "1px solid var(--color-border)" : "none",
                         borderRadius: 6,
                         background: isAccountActive
                           ? "color-mix(in srgb, var(--color-accent) 22%, var(--color-bg-primary))"
                           : "transparent",
-                        border: isAccountActive ? "1px solid var(--color-accent)" : "1px solid transparent",
+                        borderTop: isAccountActive ? "1px solid var(--color-accent)" : "1px solid transparent",
+                        borderRight: isAccountActive ? "1px solid var(--color-accent)" : "1px solid transparent",
+                        borderBottom: isAccountActive
+                          ? "1px solid var(--color-accent)"
+                          : isExpanded ? "1px solid var(--color-border)" : "1px solid transparent",
                         borderLeft: isAccountActive ? "3px solid var(--color-accent)" : "3px solid transparent",
                         boxShadow: isAccountActive ? "0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent)" : "none",
                         cursor: "pointer",

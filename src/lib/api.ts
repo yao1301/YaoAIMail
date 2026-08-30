@@ -863,6 +863,23 @@ export async function sendEmail(
   });
 }
 
+export async function scheduleEmail(
+  accountId: string,
+  to: string[],
+  cc: string[],
+  bcc: string[],
+  subject: string,
+  bodyText: string,
+  bodyHtml: string | undefined,
+  inReplyTo: string | undefined,
+  attachmentPaths: string[] | undefined,
+  sendAt: number,
+): Promise<string> {
+  return invoke<string>("schedule_email", {
+    accountId, to, cc, bcc, subject, bodyText, bodyHtml, inReplyTo, attachmentPaths, sendAt,
+  });
+}
+
 export async function stageComposeAttachment(filename: string, bytes: number[]): Promise<string> {
   return invoke<string>("stage_compose_attachment", { filename, bytes });
 }

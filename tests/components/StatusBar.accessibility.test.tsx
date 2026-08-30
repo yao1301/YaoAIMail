@@ -85,10 +85,16 @@ vi.mock("../../src/hooks/mutations/useSyncMutation", () => ({
 }));
 
 vi.mock("../../src/hooks/queries", () => ({
+  useAccountsQuery: () => ({ data: [{ id: "account-1" }] }),
+  useFoldersForAccountsQuery: () => ({ data: [] }),
   pendingMailOpsSummaryQueryKey: (accountId: string | null) => ["pending-mail-ops-summary", accountId],
   usePendingMailOpsSummary: () => ({
     data: mocks.pendingOpsSummary,
   }),
+}));
+
+vi.mock("../../src/hooks/queries/useFolderUnreadCounts", () => ({
+  useFolderUnreadCountsForAccounts: () => ({ data: {} }),
 }));
 
 vi.mock("../../src/lib/api", () => ({

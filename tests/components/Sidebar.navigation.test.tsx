@@ -27,7 +27,6 @@ vi.mock("react-i18next", () => ({
         "sidebar.archive": "Archive",
         "sidebar.spam": "Spam",
         "sidebar.starred": "Starred",
-        "sidebar.snoozed": "Snoozed",
         "sidebar.kanban": "Kanban",
         "sidebar.settings": "Settings",
       };
@@ -97,8 +96,7 @@ describe("Sidebar navigation", () => {
   });
 
   it.each([
-    ["Snoozed", "snoozed"],
-    ["Kanban", "kanban"],
+    ["首页", "kanban"],
     ["Settings", "settings"],
   ] as const)("switches to the %s view from the bottom navigation", async (label, view) => {
     useUIStore.setState({ activeView: "inbox" });
@@ -124,8 +122,7 @@ describe("Sidebar navigation", () => {
   it("uses non-submit buttons for bottom navigation actions", () => {
     render(<Sidebar />);
 
-    expect(screen.getByRole("button", { name: "Snoozed" }).getAttribute("type")).toBe("button");
-    expect(screen.getByRole("button", { name: "Kanban" }).getAttribute("type")).toBe("button");
+    expect(screen.getByRole("button", { name: "首页" }).getAttribute("type")).toBe("button");
     expect(screen.getByRole("button", { name: "Settings" }).getAttribute("type")).toBe("button");
   });
 
@@ -137,7 +134,7 @@ describe("Sidebar navigation", () => {
     await waitFor(() => {
       expect(useUIStore.getState().activeView).toBe("settings");
     });
-    expect(useComposeStore.getState().composeDirty).toBe(false);
+    expect(useComposeStore.getState().composeDirty).toBe(true);
     expect(useComposeStore.getState().showComposeLeaveConfirm).toBe(false);
     expect(useComposeStore.getState().pendingView).toBe(null);
   });

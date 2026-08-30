@@ -49,7 +49,7 @@ pub async fn get_dashboard_data(year: i32) -> Result<DashboardData, PebbleError>
         .build()
         .map_err(|error| PebbleError::Network(error.to_string()))?;
     let exchange_request = client
-        .get("https://api.frankfurter.app/latest?from=USD&to=CNY,EUR,GBP,HKD,JPY")
+        .get("https://api.frankfurter.app/latest?from=USD")
         .send();
     let (exchange, cn, gb, us) = tokio::join!(
         exchange_request,

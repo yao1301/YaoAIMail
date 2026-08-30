@@ -6,6 +6,17 @@ import { useMailStore } from "@/stores/mail.store";
 import { useUIStore } from "@/stores/ui.store";
 import type { ActiveView } from "@/stores/ui.store";
 import ContextMenu, { type ContextMenuItem } from "./ContextMenu";
+import { isComposeWorkspaceTabActive, isMessageWorkspaceTabActive } from "./workspaceTabActivity";
+
+function activeTabStyle(active: boolean) {
+  return {
+    borderBottom: active ? "3px solid var(--color-accent)" : "3px solid transparent",
+    background: active ? "color-mix(in srgb, var(--color-accent) 9%, var(--color-bg))" : "var(--color-bg-secondary)",
+    color: active ? "var(--color-accent)" : "var(--color-text-primary)",
+    fontWeight: active ? 650 : 400,
+    boxShadow: active ? "inset 0 -1px 0 var(--color-accent)" : "none",
+  } as const;
+}
 
 /** 写信标签标题：回复/转发带原主题，新建显示固定文案。 */
 function composeTabTitle(tab: ComposeTab): string {
@@ -101,16 +112,17 @@ function buildTabMenu(anchorKey: string, canCloseSelf: boolean, onCloseSelf: () 
 
 function MessageTab({ messageId }: { messageId: string }) {
   const { data: message } = useMessageQuery(messageId);
-  const selectedMessageId = useMailStore((state) => state.selectedMessageId);
   const closeMessageTab = useMailStore((state) => state.closeMessageTab);
   const activeView = useUIStore((state) => state.activeView);
-  const active = (activeView === "inbox" || activeView === "messageDetail") && selectedMessageId === messageId;
+  const messageDetailId = useUIStore((state) => state.messageDetailId);
+  const active = isMessageWorkspaceTabActive(activeView, messageDetailId, messageId);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
   return (
     <>
     <button
       type="button"
+      aria-current={active ? "page" : undefined}
       onClick={() => {
         useMailStore.getState().setSelectedMessage(messageId);
         // 全屏标签（双击/右键打开）点击后回到详情视图；普通标签回列表视图。
@@ -128,9 +140,7 @@ function MessageTab({ messageId }: { messageId: string }) {
       style={{
         display: "flex", alignItems: "center", gap: "6px", minWidth: "120px", maxWidth: "220px",
         padding: "7px 8px", border: "none", borderRight: "1px solid var(--color-border)",
-        borderBottom: active ? "2px solid var(--color-accent)" : "2px solid transparent",
-        background: active ? "var(--color-bg)" : "var(--color-bg-secondary)",
-        color: "var(--color-text-primary)", cursor: "pointer",
+        ...activeTabStyle(active), cursor: "pointer",
       }}
     >
       <Mail size={13} />
@@ -189,6 +199,7 @@ export default function WorkspaceTabs() {
           <button
             key={tab.key}
             type="button"
+            aria-current={active ? "page" : undefined}
             onClick={() => {
               activateTab(tab);
             }}
@@ -200,9 +211,7 @@ export default function WorkspaceTabs() {
             style={{
               display: "flex", alignItems: "center", gap: "6px", minWidth: "90px", maxWidth: "200px",
               padding: "7px 8px", border: "none", borderRight: "1px solid var(--color-border)",
-              borderBottom: active ? "2px solid var(--color-accent)" : "2px solid transparent",
-              background: active ? "var(--color-bg)" : "var(--color-bg-secondary)",
-              color: "var(--color-text-primary)", cursor: "pointer",
+              ...activeTabStyle(active), cursor: "pointer",
             }}
           >
             {tab.kind === "folder" ? <Folder size={13} /> : <LayoutGrid size={13} />}
@@ -231,11 +240,12 @@ export default function WorkspaceTabs() {
       })}
       {openMessageIds.map((messageId) => <MessageTab key={messageId} messageId={messageId} />)}
       {composeTabs.map((tab) => {
-        const active = activeComposeTabId === tab.id;
+        const active = isComposeWorkspaceTabActive(activeView, activeComposeTabId, tab.id);
         return (
           <button
             key={tab.id}
             type="button"
+            aria-current={active ? "page" : undefined}
             onClick={() => {
               useComposeStore.getState().activateComposeTab(tab.id);
               useUIStore.getState().setActiveView("compose");
@@ -254,9 +264,7 @@ export default function WorkspaceTabs() {
             style={{
               display: "flex", alignItems: "center", gap: "6px", minWidth: "130px", maxWidth: "220px",
               padding: "7px 8px", border: "none", borderRight: "1px solid var(--color-border)",
-              borderBottom: active ? "2px solid var(--color-accent)" : "2px solid transparent",
-              background: active ? "var(--color-bg)" : "var(--color-bg-secondary)",
-              color: "var(--color-text-primary)", cursor: "pointer",
+              ...activeTabStyle(active), cursor: "pointer",
             }}
           >
             <FilePenLine size={13} />

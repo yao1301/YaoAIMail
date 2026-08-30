@@ -5,6 +5,7 @@ import { aiPrompt, getDashboardData, type DashboardData } from "@/lib/api";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { useToastStore } from "@/stores/toast.store";
 import MarkdownView from "@/lib/renderMarkdown";
+import { identifyTrackingLookup, type TrackingLookup } from "./trackingLookup";
 
 const HS_SYSTEM = `你是外贸商品归类辅助员。请基于当前有效的 HS 2022 或目的国最新税则判断，不要沿用已经失效的编码。先判断商品本质、材料、功能、工作方式、是否成套、功率和用途，再给出最可能的编码、需要排除的候选、仍需确认的参数，并提醒用户最终在 WCO 或目的国官方税则复核。不确定时保留 6 位，不要编造十位税号。用中文回答。`;
 
@@ -16,6 +17,7 @@ const CONTAINERS = {
 } as const;
 
 const ZONES_KEY = "yaoaimail-foreign-tool-zones-v2";
+const CURRENCIES_KEY = "yaoaimail-foreign-tool-currencies-v1";
 
 /** 世界主要城市（按大洲分组）。同一时区可对应多个城市（如北京/上海、悉尼/墨尔本）。 */
 const REGION_CITIES: Array<{ region: string; cities: Array<[string, string]> }> = [
@@ -78,11 +80,35 @@ const DEFAULT_CITIES: Array<{ city: string; zone: string }> = [
   { city: "迪拜", zone: "Asia/Dubai" },
 ];
 
+const DEFAULT_CURRENCIES: Array<{ code: string; amount: number }> = [
+  { code: "USD", amount: 1 }, { code: "EUR", amount: 1 }, { code: "GBP", amount: 1 },
+  { code: "HKD", amount: 1 }, { code: "JPY", amount: 100 },
+];
+const CURRENCY_NAMES: Record<string, string> = {
+  AED: "阿联酋迪拉姆", AUD: "澳元", BGN: "保加利亚列弗", BRL: "巴西雷亚尔", CAD: "加元", CHF: "瑞士法郎",
+  CNY: "人民币", CZK: "捷克克朗", DKK: "丹麦克朗", EUR: "欧元", GBP: "英镑", HKD: "港币",
+  HUF: "匈牙利福林", IDR: "印尼盾", ILS: "以色列新谢克尔", INR: "印度卢比", ISK: "冰岛克朗",
+  JPY: "日元", KRW: "韩元", MXN: "墨西哥比索", MYR: "马来西亚林吉特", NOK: "挪威克朗",
+  NZD: "新西兰元", PHP: "菲律宾比索", PLN: "波兰兹罗提", RON: "罗马尼亚列伊", SAR: "沙特里亚尔",
+  SEK: "瑞典克朗", SGD: "新加坡元", THB: "泰铢", TRY: "土耳其里拉", USD: "美元", ZAR: "南非兰特",
+};
+
+const COUNTRY_NAMES: Record<string, string> = {
+  CN: "中国",
+  GB: "英国",
+  US: "美国",
+};
+
+function currencyLabel(code: string) {
+  return CURRENCY_NAMES[code] ? `${CURRENCY_NAMES[code]}（${code}）` : code;
+}
+
 export default function ForeignToolsTab() {
   const [hsInput, setHsInput] = useState("");
   const [hsOutput, setHsOutput] = useState("");
   const [hsBusy, setHsBusy] = useState(false);
   const [trackNo, setTrackNo] = useState("");
+  const [trackingResult, setTrackingResult] = useState<TrackingLookup | null>(null);
   const [container, setContainer] = useState<keyof typeof CONTAINERS>("40HQ");
   const [length, setLength] = useState(50);
   const [width, setWidth] = useState(40);
@@ -92,6 +118,15 @@ export default function ForeignToolsTab() {
   const [dashboardBusy, setDashboardBusy] = useState(false);
   const [now, setNow] = useState(() => new Date());
   const [newCity, setNewCity] = useState("北京");
+  const [newCurrency, setNewCurrency] = useState("AUD");
+  const [currencies, setCurrencies] = useState<Array<{ code: string; amount: number }>>(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(CURRENCIES_KEY) || "null");
+      if (!Array.isArray(parsed)) return DEFAULT_CURRENCIES;
+      const valid = parsed.filter((item) => typeof item?.code === "string" && /^[A-Z]{3}$/.test(item.code) && Number(item.amount) > 0);
+      return valid;
+    } catch { return DEFAULT_CURRENCIES; }
+  });
   const [zones, setZones] = useState<Array<{ city: string; zone: string }>>(() => {
     try {
       const parsed = JSON.parse(localStorage.getItem(ZONES_KEY) || "null");
@@ -100,6 +135,7 @@ export default function ForeignToolsTab() {
   });
 
   useEffect(() => { localStorage.setItem(ZONES_KEY, JSON.stringify(zones)); }, [zones]);
+  useEffect(() => { localStorage.setItem(CURRENCIES_KEY, JSON.stringify(currencies)); }, [currencies]);
   useEffect(() => {
     void refreshDashboard();
     const timer = window.setInterval(() => setNow(new Date()), 30_000);
@@ -131,6 +167,20 @@ export default function ForeignToolsTab() {
   }, [container, length, width, height, weight]);
 
   const open = (url: string) => invoke("open_external_url", { url });
+  async function runSmartTracking() {
+    const result = identifyTrackingLookup(trackNo);
+    if (!result) {
+      useToastStore.getState().addToast({ message: "请先输入单号", type: "info" });
+      return;
+    }
+    setTrackingResult(result);
+    try {
+      await open(result.url);
+      useToastStore.getState().addToast({ message: `已识别为${result.label}，正在打开 ${result.provider}`, type: "success" });
+    } catch (error) {
+      useToastStore.getState().addToast({ message: `无法打开查询网站：${extractErrorMessage(error)}`, type: "error" });
+    }
+  }
   const trackingLinks = [
     ["集装箱 / 提单综合追踪", `https://www.searates.com/container/tracking/?number=${encodeURIComponent(trackNo)}`],
     ["船舶 AIS 查询", "https://www.vesselfinder.com/"],
@@ -139,13 +189,7 @@ export default function ForeignToolsTab() {
   ];
   const holidays = (dashboard?.holidays ?? []).filter((item) => new Date(`${item.date}T23:59:59`) >= now).slice(0, 8);
   const cnyPerUsd = dashboard?.usdRates?.CNY;
-  const exchangeItems = [
-    ["USD", "1 美元", cnyPerUsd ?? null],
-    ["EUR", "1 欧元", cnyPerUsd && dashboard?.usdRates?.EUR ? cnyPerUsd / dashboard.usdRates.EUR : null],
-    ["GBP", "1 英镑", cnyPerUsd && dashboard?.usdRates?.GBP ? cnyPerUsd / dashboard.usdRates.GBP : null],
-    ["HKD", "1 港币", cnyPerUsd && dashboard?.usdRates?.HKD ? cnyPerUsd / dashboard.usdRates.HKD : null],
-    ["JPY", "100 日元", cnyPerUsd && dashboard?.usdRates?.JPY ? (cnyPerUsd / dashboard.usdRates.JPY) * 100 : null],
-  ] as const;
+  const availableCurrencies = [...new Set(["USD", "EUR", "GBP", "HKD", "JPY", "AUD", "CAD", "CHF", "CNY", "NZD", "SGD", "KRW", "INR", "THB", "MYR", "IDR", "PHP", "AED", "SAR", "TRY", "MXN", "BRL", "ZAR", "SEK", "NOK", "DKK", "PLN", "CZK", "HUF", ...Object.keys(dashboard?.usdRates ?? {})])].sort();
 
   return (
     <div>
@@ -155,17 +199,45 @@ export default function ForeignToolsTab() {
       <ToolSection icon={<CalendarDays size={16} />} title="世界节假日">
         <div style={toolbar}><button type="button" onClick={() => void refreshDashboard()} style={iconButton} title="刷新节假日数据"><RefreshCw size={14} className={dashboardBusy ? "spinner" : ""} /></button></div>
         <div style={gridCards}>
-          {holidays.length ? holidays.map((item) => <div key={`${item.countryCode}-${item.date}-${item.name}`} style={miniCard}><strong>{item.date}</strong> · {item.countryCode}<br /><span style={hint}>{item.localName || item.name}</span></div>) : <span style={hint}>暂未获取近期节假日数据。</span>}
+          {holidays.length ? holidays.map((item) => <div key={`${item.countryCode}-${item.date}-${item.name}`} style={miniCard}><strong>{item.date}</strong> · {COUNTRY_NAMES[item.countryCode] || item.countryCode}<br /><span style={hint}>{item.localName || item.name}</span></div>) : <span style={hint}>暂未获取近期节假日数据。</span>}
         </div>
         <small style={hint}>数据用于工作提醒，具体工作日请以当地官方日历为准。</small>
       </ToolSection>
 
       <ToolSection icon={<TrendingUp size={16} />} title="参考汇率">
         <div style={toolbar}><button type="button" onClick={() => void refreshDashboard()} style={iconButton} title="刷新汇率数据"><RefreshCw size={14} className={dashboardBusy ? "spinner" : ""} /></button></div>
-        <div style={gridCards}>
-          {exchangeItems.map(([code, label, rate]) => <div key={code} style={miniCard}><span>{label}</span><strong style={{ display: "block", marginTop: 4, color: "var(--color-accent)" }}>{rate === null ? "—" : `${rate.toFixed(code === "JPY" ? 3 : 4)} 元`}</strong></div>)}
+        <div style={{ display: "grid", gap: 6 }}>
+          {currencies.map((item, index) => {
+            const usdRate = item.code === "USD" ? 1 : dashboard?.usdRates?.[item.code];
+            const rate = cnyPerUsd && usdRate ? (cnyPerUsd / usdRate) * item.amount : null;
+            return <div key={`${item.code}-${index}`} style={{ ...row, alignItems: "center" }}>
+              <span style={{ display: "flex", alignItems: "center", gap: 6, flex: 1 }}>
+                <input type="number" min="0.0001" step="any" value={item.amount} onChange={(event) => setCurrencies((items) => items.map((entry, i) => i === index ? { ...entry, amount: Math.max(0.0001, Number(event.target.value) || 1) } : entry))} style={{ ...input, width: 90 }} aria-label={`${item.code} 换算数量`} />
+                <select value={item.code} onChange={(event) => setCurrencies((items) => items.map((entry, i) => i === index ? { ...entry, code: event.target.value } : entry))} style={{ ...input, minWidth: 156, flex: 1 }} aria-label="修改币种">
+                  {availableCurrencies.map((code) => <option key={code} value={code}>{currencyLabel(code)}</option>)}
+                </select>
+              </span>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                <strong style={{ color: "var(--color-accent)" }}>{rate === null ? "—" : `${rate.toFixed(rate >= 100 ? 2 : 4)} 元`}</strong>
+                <button type="button" onClick={() => setCurrencies((items) => items.filter((_, i) => i !== index))} style={removeButton} title="删除这个币种"><X size={12} /></button>
+              </span>
+            </div>;
+          })}
+          {currencies.length === 0 && <span style={hint}>还没有常用币种，可从下方添加。</span>}
         </div>
-        <small style={hint}>汇率日期：{dashboard?.exchangeDate ?? "暂未获取"}；成交请以银行牌价为准。</small>
+        <div style={{ display: "flex", gap: 7, marginTop: 10 }}>
+          <select value={newCurrency} onChange={(event) => setNewCurrency(event.target.value)} style={{ ...input, flex: 1 }}>
+            {availableCurrencies.map((code) => <option key={code} value={code}>{currencyLabel(code)}</option>)}
+          </select>
+          <button type="button" onClick={() => {
+            if (currencies.some((item) => item.code === newCurrency)) {
+              useToastStore.getState().addToast({ message: `${newCurrency} 已在常用汇率中`, type: "info" });
+              return;
+            }
+            setCurrencies((items) => [...items, { code: newCurrency, amount: newCurrency === "JPY" || newCurrency === "KRW" ? 100 : 1 }]);
+          }} style={secondary}><Plus size={13} />添加</button>
+        </div>
+        <small style={hint}>可直接修改币种和换算数量，也可新增或删除；设置会保存在当前用户配置中。汇率日期：{dashboard?.exchangeDate ?? "暂未获取"}；成交请以银行牌价为准。</small>
       </ToolSection>
 
       <ToolSection icon={<Clock3 size={16} />} title="多时区">
@@ -224,7 +296,13 @@ export default function ForeignToolsTab() {
       </ToolSection>
 
       <ToolSection icon={<PackageSearch size={16} />} title="物流、集装箱与空运追踪">
-        <input style={input} value={trackNo} onChange={(event) => setTrackNo(event.target.value)} placeholder="输入集装箱号、提单号、快递单号或空运单号" />
+        <form onSubmit={(event) => { event.preventDefault(); void runSmartTracking(); }} style={{ display: "flex", gap: 8 }}>
+          <input style={input} value={trackNo} onChange={(event) => { setTrackNo(event.target.value); setTrackingResult(null); }} placeholder="输入物流单号、集装箱号、IMO 或 MMSI，按回车直接查询" aria-label="物流智能查询单号" />
+          <button type="submit" style={{ ...primary, marginTop: 0, whiteSpace: "nowrap" }}><Search size={14} />智能查询</button>
+        </form>
+        {trackingResult && <div role="status" style={{ marginTop: 8, padding: "7px 9px", borderRadius: 7, background: "color-mix(in srgb, var(--color-accent) 9%, var(--color-bg-secondary))", color: "var(--color-text-secondary)", fontSize: 12 }}>已识别：<strong style={{ color: "var(--color-accent)" }}>{trackingResult.label}</strong> · {trackingResult.provider}</div>}
+        <p style={{ ...hint, margin: "7px 0 0" }}>会优先识别 ISO 集装箱号、IMO/MMSI 船舶号；其余单号按普通国际物流查询。无法确定时不会冒充船舶或集装箱结果。</p>
+        <div style={{ ...hint, marginTop: 9 }}>手动选择其他查询渠道：</div>
         <div style={links}>{trackingLinks.map(([label, url]) => <LinkButton key={label} label={label} url={url} open={open} />)}</div>
         <p style={hint}>不同船公司和航空公司的数据授权不同，综合站查不到时请进入承运人官网复核。</p>
       </ToolSection>

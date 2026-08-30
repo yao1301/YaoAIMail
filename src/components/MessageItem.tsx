@@ -44,6 +44,7 @@ import { useConfirmStore } from "@/stores/confirm.store";
 import { useUIStore } from "@/stores/ui.store";
 import { patchMessagesCache, restoreMessagesCache, snapshotMessagesCache } from "@/hooks/queries";
 import ContextMenu, { type ContextMenuItem } from "./ContextMenu";
+import { originalRecipientAddresses } from "@/lib/messageRecipients";
 
 interface Props {
   message: MessageSummary;
@@ -57,7 +58,6 @@ interface Props {
   onToggleStar?: (messageId: string, newStarred: boolean) => void;
   batchMode?: boolean;
   batchSelected?: boolean;
-  onToggleBatchSelect?: (messageId: string) => void;
   spamFolderId?: string;
   folderRole?: Folder["role"];
   activeFolderId?: string | null;
@@ -92,7 +92,7 @@ function recipientLabel(addresses: EmailAddress[]): string {
   return addresses.map(addressLabel).filter(Boolean).join(", ");
 }
 
-function MessageItem({ message, labels = [], isSelected, onClick, onDoubleClick, onOpenFullscreen, onToggleStar, batchSelected, spamFolderId, folderRole, activeFolderId, accountColor, accountLabel }: Props) {
+function MessageItem({ message, labels = [], isSelected, onClick, onDoubleClick, onOpenFullscreen, onToggleStar, batchMode, batchSelected, spamFolderId, folderRole, activeFolderId, accountColor, accountLabel }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [showActions, setShowActions] = useState(false);
@@ -117,6 +117,9 @@ function MessageItem({ message, labels = [], isSelected, onClick, onDoubleClick,
   const primaryContact = folderRole === "sent" && message.to_list.length > 0
     ? recipientLabel(message.to_list)
     : message.from_name || message.from_address;
+  // In batch mode the row highlight is the selection control. The ordinary
+  // reading-pane selection must not keep a Ctrl-deselected row looking selected.
+  const rowSelected = batchMode ? Boolean(batchSelected) : isSelected;
 
   function invalidateMessageViews(includeUnreadCounts = false) {
     queryClient.invalidateQueries({ queryKey: ["messages"] });
@@ -297,12 +300,14 @@ hr{border:none;border-top:1px solid #ddd;margin:16px 0}</style></head><body>
   }
 
   function handleNewToSender() {
-    // 已发送文件夹：发给"原收件人"；收件箱/其他：发给"原发件人"。
-    const target =
-      folderRole === "sent" && message.to_list.length > 0
-        ? message.to_list[0].address
-        : message.from_address;
-    useComposeStore.getState().openCompose("new", null, { to: [target] });
+    // 这个命令的语义是“相同接收人”，无论邮件位于哪个文件夹，都应
+    // 读取原邮件 To，而不是把收到的邮件错误地改发给原发件人。
+    const targets = originalRecipientAddresses(message.to_list);
+    if (targets.length === 0) {
+      useToastStore.getState().addToast({ message: "原邮件没有可用的收件人地址", type: "error" });
+      return;
+    }
+    useComposeStore.getState().openCompose("new", null, { to: targets });
   }
 
   const moveItems: ContextMenuItem[] = showMoveFolders
@@ -358,6 +363,7 @@ hr{border:none;border-top:1px solid #ddd;margin:16px 0}</style></head><body>
         {
           label: "发送新邮件给相同接收人",
           icon: <Mail size={14} />,
+          disabled: message.to_list.length === 0,
           onClick: () => handleNewToSender(),
         },
         { separator: true },
@@ -481,7 +487,7 @@ hr{border:none;border-top:1px solid #ddd;margin:16px 0}</style></head><body>
       }}
       tabIndex={0}
       role="option"
-      aria-selected={isSelected || batchSelected}
+      aria-selected={rowSelected}
       style={{
         position: "relative",
         color: "var(--color-text-primary)",
@@ -492,7 +498,7 @@ hr{border:none;border-top:1px solid #ddd;margin:16px 0}</style></head><body>
         height: "76px",
         boxSizing: "border-box",
         overflow: "hidden",
-        background: isSelected || batchSelected ? "var(--color-sidebar-active)" : "transparent",
+        background: rowSelected ? "var(--color-sidebar-active)" : "transparent",
         transition: "background-color 0.12s ease",
       }}
       onMouseEnter={() => {

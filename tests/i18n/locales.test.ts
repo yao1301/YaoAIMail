@@ -14,10 +14,10 @@ describe("locale files", () => {
 
     expect(en.tray.show).toBe("Show Window");
     expect(en.tray.hide).toBe("Hide Window");
-    expect(en.tray.quit).toBe("Quit Pebble");
+    expect(en.tray.quit).toBe("Quit YaoAIMail");
     expect(zh.tray.show).toBe("显示窗口");
     expect(zh.tray.hide).toBe("隐藏窗口");
-    expect(zh.tray.quit).toBe("退出 Pebble");
+    expect(zh.tray.quit).toBe("退出 YaoAIMail");
   });
 
   it("translates folder count settings in English and Chinese", () => {

@@ -7,6 +7,12 @@ import { getMessageWithHtml, getRenderedHtml } from "../../src/lib/api";
 vi.mock("../../src/lib/api", () => ({
   getMessageWithHtml: vi.fn(),
   getRenderedHtml: vi.fn(),
+  listAttachments: vi.fn().mockResolvedValue([]),
+  readAttachmentFile: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(vi.fn()),
 }));
 
 vi.mock("../../src/hooks/mutations/useUpdateFlagsMutation", () => ({

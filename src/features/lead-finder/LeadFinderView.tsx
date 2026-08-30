@@ -22,6 +22,16 @@ import {
   type OutreachUserConstraints,
 } from "./outreach-guard";
 import { emailStrictlyMatchesCompany } from "./company-email-affinity";
+import TaskProgressSteps from "@/components/TaskProgressSteps";
+
+const LEAD_SEARCH_STEPS = ["理解产品与目标客户", "搜索公开公司来源", "整理公开依据", "AI 补充候选公司"];
+
+function leadSearchStageIndex(stage: string): number {
+  if (stage.includes("AI 正在补充")) return 3;
+  if (stage.includes("整理")) return 2;
+  if (stage.includes("搜索公开")) return 1;
+  return 0;
+}
 
 interface LeadCandidate {
   companyName?: string;
@@ -1576,13 +1586,20 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
             />
             <input ref={leadFileInputRef} type="file" multiple hidden onChange={(event) => { if (event.target.files) addLeadContextFiles(event.target.files); event.currentTarget.value = ""; }} />
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexBasis: "100%" }}>
-              <button type="button" onClick={() => leadFileInputRef.current?.click()} disabled={busy} style={leadFileButton}><Paperclip size={14} />{leadContextBusy ? "正在读取…" : "添加文件"}</button>
+              <button type="button" onClick={() => leadFileInputRef.current?.click()} disabled={busy} style={leadFileButton}>{leadContextBusy ? <RefreshCw size={14} className="spinner" /> : <Paperclip size={14} />}{leadContextBusy ? "正在读取…" : "添加文件"}</button>
               <span style={{ flex: 1, color: "var(--color-text-secondary)", fontSize: 11 }}>拖入或粘贴的内容仅用于本次搜索</span>
               <button type="button" disabled={busy} onClick={() => startNewSearch()} style={{ ...primary, marginTop: 0 }}>
                 {busy ? <RefreshCw size={15} className="spinner" /> : <Search size={15} />}{busy ? (searchStage || (searchPage > 1 ? `正在搜索第 ${searchPage} 页…` : "正在开发客户…")) : "开始搜索"}
               </button>
             </div>
           </div>
+          {busy && (
+            <TaskProgressSteps
+              steps={LEAD_SEARCH_STEPS}
+              activeIndex={leadSearchStageIndex(searchStage)}
+              detail={searchStage || (searchPage > 1 ? `正在搜索第 ${searchPage} 页…` : "正在开发客户…")}
+            />
+          )}
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 10, flexWrap: "wrap" }}>
             <label style={{ ...hint, display: "inline-flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
               <input type="checkbox" checked={batchMode} onChange={(e) => setBatchMode(e.target.checked)} /> 批量搜客

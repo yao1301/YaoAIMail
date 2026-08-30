@@ -386,6 +386,68 @@ option {
   color: var(--color-text-secondary);
 }
 
+.task-progress-steps {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 28%, var(--color-border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-accent) 5%, var(--color-bg-secondary));
+}
+
+.task-progress-steps__items {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 7px;
+}
+
+.task-progress-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
+.task-progress-step__icon {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--color-border);
+  border-radius: 50%;
+  font-size: 9px;
+}
+
+.task-progress-step.is-active {
+  color: var(--color-accent);
+  font-weight: 650;
+}
+
+.task-progress-step.is-active .task-progress-step__icon {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+}
+
+.task-progress-step.is-complete {
+  color: #2f855a;
+}
+
+.task-progress-step.is-complete .task-progress-step__icon {
+  border-color: #2f855a;
+  background: color-mix(in srgb, #2f855a 10%, transparent);
+}
+
+.task-progress-steps__detail {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
 .message-detail-container {
   background-color: var(--color-bg);
 }
@@ -635,6 +697,7 @@ textarea:focus-visible {
 }
 
 .compose-editor-surface {
+  position: relative;
   min-height: 90px;
   flex: 0 0 auto;
   display: flex;
@@ -644,6 +707,11 @@ textarea:focus-visible {
   border-radius: 8px;
   background: var(--color-bg);
   transition: border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.compose-editor-surface.is-attachment-drop-target {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 16%, transparent);
 }
 
 .compose-editor-surface:focus-within {
@@ -713,6 +781,33 @@ textarea:focus-visible {
   margin-bottom: 0;
 }
 
+.compose-editor-content .ProseMirror img {
+  max-width: 100%;
+  height: auto;
+}
+
+.compose-editor-content .ProseMirror table {
+  width: 100%;
+  max-width: 100%;
+  margin: 12px 0;
+  border-collapse: collapse;
+  table-layout: auto;
+}
+
+.compose-editor-content .ProseMirror th,
+.compose-editor-content .ProseMirror td {
+  min-width: 48px;
+  padding: 6px 8px;
+  border: 1px solid #d1d5db;
+  vertical-align: top;
+}
+
+.compose-editor-content .ProseMirror th {
+  background: #f3f4f6;
+  font-weight: 600;
+  text-align: left;
+}
+
 .compose-source-input {
   flex: 1 1 auto;
   min-height: 0;
@@ -757,7 +852,7 @@ textarea:focus-visible {
 
 .compose-drop-overlay {
   position: absolute;
-  inset: 16px 20px 20px;
+  inset: 6px;
   z-index: 10;
   display: flex;
   align-items: center;
@@ -769,6 +864,55 @@ textarea:focus-visible {
   color: var(--color-accent);
   font-size: 14px;
   font-weight: 500;
+  pointer-events: none;
+}
+
+.compose-drop-overlay--attachment {
+  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-bg));
+}
+
+.compose-drop-overlay span,
+.compose-ai-drop-overlay span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.compose-drop-overlay strong,
+.compose-ai-drop-overlay strong {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.compose-drop-overlay small,
+.compose-ai-drop-overlay small {
+  font-size: 11px;
+  font-weight: 400;
+  opacity: 0.82;
+}
+
+.compose-ai-dropzone {
+  position: relative;
+  border-radius: 6px;
+}
+
+.compose-ai-dropzone.is-ai-context-drop-target {
+  box-shadow: 0 0 0 3px color-mix(in srgb, #7357d8 20%, transparent);
+}
+
+.compose-ai-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 72px;
+  border: 2px dashed #7357d8;
+  border-radius: 6px;
+  background: color-mix(in srgb, #7357d8 13%, var(--color-bg));
+  color: #7357d8;
   pointer-events: none;
 }
 
@@ -824,10 +968,8 @@ textarea:focus-visible {
   overflow: visible;
 }
 
-.compose-quoted-reply-content blockquote {
-  margin: 0;
-  padding-left: 12px;
-  border-left: 3px solid color-mix(in srgb, var(--color-text-secondary) 24%, transparent);
+.compose-quoted-reply-content .compose-original-quote {
+  margin: 0 !important;
 }
 
 .compose-quoted-reply-content p {
@@ -864,7 +1006,7 @@ textarea:focus-visible {
   }
 
   .compose-drop-overlay {
-    inset: 12px;
+    inset: 5px;
   }
 }
 

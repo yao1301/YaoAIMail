@@ -23,11 +23,12 @@ interface Props {
   isSelected: boolean;
   onClick: () => void;
   onDoubleClick: () => void;
+  onContextMenu?: (event: React.MouseEvent<HTMLDivElement>) => void;
   folderLabel?: string;
   query?: string;
 }
 
-export default function SearchResultItem({ hit, message, isSelected, onClick, onDoubleClick, folderLabel, query = "" }: Props) {
+export default function SearchResultItem({ hit, message, isSelected, onClick, onDoubleClick, onContextMenu, folderLabel, query = "" }: Props) {
   const { t } = useTranslation();
   const subject = hit.subject || message?.subject || hit.snippet || t("common.noSubject");
   const from = hit.from_address || message?.from_address || "";
@@ -40,6 +41,7 @@ export default function SearchResultItem({ hit, message, isSelected, onClick, on
       tabIndex={0}
       onClick={onClick}
       onDoubleClick={onDoubleClick}
+      onContextMenu={onContextMenu}
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); } }}
       style={{
         padding: "10px 14px",

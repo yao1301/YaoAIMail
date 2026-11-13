@@ -9,6 +9,7 @@ describe("ComposeStore", () => {
       previousView: "inbox",
     });
     useComposeStore.setState({
+      tabs: [], tabsById: {}, activeTabId: null,
       composeMode: null,
       composeReplyTo: null,
       composeDirty: false,
@@ -17,6 +18,19 @@ describe("ComposeStore", () => {
       composePrefill: null,
       composeKey: 0,
     });
+  });
+
+  it('protects legacy standalone drafts and closes only after confirmation', () => {
+    useComposeStore.setState({ composeMode: 'new' });
+    useComposeStore.getState().setComposeDirty(true);
+    useComposeStore.getState().closeCompose();
+    expect(useComposeStore.getState().showComposeLeaveConfirm).toBe(true);
+    expect(useComposeStore.getState().composeMode).toBe('new');
+    useComposeStore.getState().cancelCloseCompose();
+    expect(useComposeStore.getState().composeDirty).toBe(true);
+    useComposeStore.getState().closeCompose();
+    useComposeStore.getState().confirmCloseCompose();
+    expect(useComposeStore.getState().composeMode).toBeNull();
   });
 
   it("opens a new compose with mailto prefill data", () => {

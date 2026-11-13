@@ -18,6 +18,12 @@ fn emit_env_from_dotenv(path: &str, key: &str) {
         return;
     }
 
+    // Local dotenv is a development convenience, never a source of secrets
+    // for a distributable build. CI may still supply publisher OAuth settings
+    // explicitly through the environment above.
+    if std::env::var("PROFILE").as_deref() != Ok("debug") {
+        return;
+    }
     let Ok(contents) = std::fs::read_to_string(path) else {
         return;
     };

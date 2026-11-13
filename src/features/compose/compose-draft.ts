@@ -8,6 +8,10 @@ export interface ComposeAttachment {
 export interface ComposeDraftSnapshot {
   /** Existing backend draft being edited. Reused on auto-save instead of creating a duplicate. */
   sourceDraftId?: string;
+  /** An in-memory navigation snapshot may be newer than the persisted draft. */
+  unsavedChanges?: boolean;
+  /** Persist reply linkage even after reopening a saved local draft. */
+  inReplyTo?: string;
   accountId: string;
   to: string[];
   cc: string[];

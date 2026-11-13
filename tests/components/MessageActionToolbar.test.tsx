@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { MessageDeletionNavigationContext } from "../../src/hooks/useMessageDeletionNavigation";
 import type { Message } from "../../src/lib/api";
 
 const mocks = vi.hoisted(() => ({
@@ -16,7 +17,9 @@ const mocks = vi.hoisted(() => ({
   openCompose: vi.fn(),
   addCard: vi.fn(),
   mutate: vi.fn(),
+  sendDrafts: vi.fn(),
 }));
+vi.mock('../../src/hooks/useSendDrafts',()=>({useSendDrafts:()=>({sendDrafts:mocks.sendDrafts,sending:false})}));
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -141,6 +144,14 @@ describe("MessageActionToolbar", () => {
     await waitFor(() => expect(mocks.archiveMessage).toHaveBeenCalledWith("message-1"));
     expect(mocks.queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["folder-unread-counts"] });
   });
+  it('keeps icon-only Send without duplicating the list draft status in the detail toolbar',()=>{
+    render(<MessageActionToolbar message={{...makeMessage(),is_draft:true}} onBack={vi.fn()} onMessageUpdate={vi.fn()}/>);
+    expect(screen.queryByRole('img',{name:'草稿，未发送'})).toBeNull();
+    expect(screen.queryByText('草稿 · 未发送')).toBeNull();expect(screen.queryByRole('button',{name:/按文件.*指令生成草稿/})).toBeNull();
+    const send=screen.getByRole('button',{name:'发送草稿'});expect(send.textContent).toBe('');expect(send.getAttribute('title')).toBe('发送草稿');
+    expect(send.style.padding).toBe(screen.getByRole('button',{name:'Reply'}).style.padding);
+    fireEvent.click(send);expect(mocks.sendDrafts).toHaveBeenCalledWith(['message-1']);
+  });
 
   it("refreshes folder unread counts after restore from the detail toolbar", async () => {
     render(
@@ -172,5 +183,17 @@ describe("MessageActionToolbar", () => {
 
     await waitFor(() => expect(mocks.deleteMessage).toHaveBeenCalledWith("message-1"));
     expect(mocks.queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["folder-unread-counts"] });
+  });
+
+  it("keeps the next list preview open after successful deletion", async () => {
+    const onBack = vi.fn();
+    const complete = vi.fn().mockReturnValue(true);
+    render(<MessageDeletionNavigationContext.Provider value={() => complete}>
+      <MessageActionToolbar message={makeMessage()} onBack={onBack} onMessageUpdate={vi.fn()} />
+    </MessageDeletionNavigationContext.Provider>);
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
+    await waitFor(() => expect(complete).toHaveBeenCalledWith(["message-1"]));
+    expect(onBack).not.toHaveBeenCalled();
   });
 });

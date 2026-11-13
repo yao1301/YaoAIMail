@@ -1,16 +1,20 @@
-import { useEffect, useRef, useState } from "react";
+import { useWorkspaceState } from '@/lib/workspaceState';
+import { useEffect, useRef } from "react";
 import i18n from "@/lib/i18n";
 import { useConfirmStore } from "@/stores/confirm.store";
 import { X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { addAccount, startSync, testImapConnection, testPop3Connection, completeOAuthFlow } from "@/lib/api";
-import type { AddAccountRequest } from "@/lib/api";
+import { addAccount, startSync, testImapConnection, testPop3Connection, testSmtpConnection, completeOAuthFlow } from "@/lib/api";
+import { explainMailConnectionReport, testBothMailDirections } from "@/lib/mailConnectionTest";
+import { detectMailAccountPreset, findMailServerPreset, MAIL_ACCOUNT_PRESETS } from "@/lib/mailAccountPresets";
+import type { AddAccountRequest, ConnectionSecurity } from "@/lib/api";
 import { accountsQueryKey } from "@/hooks/queries";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { realtimePreferenceToPollInterval, useUIStore } from "@/stores/ui.store";
 import { useToastStore } from "@/stores/toast.store";
 import { inputStyle, labelStyle } from "../styles/form";
+import { defaultIncomingPort, defaultSmtpPort } from "@/lib/mailPorts";
 
 const FOLDER_REFRESH_ATTEMPTS = 5;
 const FOLDER_REFRESH_INTERVAL_MS = 2000;
@@ -29,47 +33,6 @@ function refreshFoldersAfterSyncStart(queryClient: QueryClient, accountId: strin
   };
   pollFolders(FOLDER_REFRESH_ATTEMPTS);
 }
-
-const PRESETS: Record<
-  string,
-  Pick<
-    AddAccountRequest,
-    "imap_host" | "imap_port" | "smtp_host" | "smtp_port" | "imap_security" | "smtp_security"
-  >
-> = {
-  gmail: {
-    imap_host: "imap.gmail.com",
-    imap_port: 993,
-    imap_security: "tls",
-    smtp_host: "smtp.gmail.com",
-    smtp_port: 587,
-    smtp_security: "starttls",
-  },
-  outlook: {
-    imap_host: "outlook.office365.com",
-    imap_port: 993,
-    imap_security: "tls",
-    smtp_host: "smtp.office365.com",
-    smtp_port: 587,
-    smtp_security: "starttls",
-  },
-  qq: {
-    imap_host: "imap.qq.com",
-    imap_port: 993,
-    imap_security: "tls",
-    smtp_host: "smtp.qq.com",
-    smtp_port: 465,
-    smtp_security: "tls",
-  },
-  "163": {
-    imap_host: "imap.163.com",
-    imap_port: 993,
-    imap_security: "tls",
-    smtp_host: "smtp.163.com",
-    smtp_port: 465,
-    smtp_security: "tls",
-  },
-};
 
 interface Props {
   onClose: () => void;
@@ -92,18 +55,22 @@ export default function AccountSetup({ onClose }: Props) {
     smtp_host: "",
     smtp_port: 587,
     smtp_security: "starttls",
-    accept_invalid_certs: false,
+    imap_accept_invalid_certs: false,
+    smtp_accept_invalid_certs: false,
     allow_plaintext: false,
     username: "",
     password: "",
   };
-  const [form, setForm] = useState<AddAccountRequest>(initialForm);
+  const [form, setForm] = useWorkspaceState<AddAccountRequest>("src/components/AccountSetup.tsx:AccountSetup:form", initialForm);
   const initialFormRef = useRef(initialForm);
+  const [advancedOpen, setAdvancedOpen] = useWorkspaceState("accountSetup:advancedOpen", false);
+  const [serverSource, setServerSource] = useWorkspaceState<"auto" | "provider" | "manual">("accountSetup:serverSource", "auto");
+  const testedForm = useRef<AddAccountRequest | null>(null);
 
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [testLoading, setTestLoading] = useState(false);
-  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [loading, setLoading] = useWorkspaceState("src/components/AccountSetup.tsx:AccountSetup:loading", false);
+  const [error, setError] = useWorkspaceState<string | null>("src/components/AccountSetup.tsx:AccountSetup:error", null);
+  const [testLoading, setTestLoading] = useWorkspaceState("src/components/AccountSetup.tsx:AccountSetup:testLoading", false);
+  const [testResult, setTestResult] = useWorkspaceState<{ ok: boolean; message: string } | null>("src/components/AccountSetup.tsx:AccountSetup:testResult", null);
 
   const dialogRef = useRef<HTMLDivElement>(null);
   const formRef = useRef(form);
@@ -143,9 +110,9 @@ export default function AccountSetup({ onClose }: Props) {
       }
       // Focus trap: keep Tab within the dialog
       if (event.key === "Tab" && dialogRef.current) {
-        const focusable = dialogRef.current.querySelectorAll<HTMLElement>(
-          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-        );
+        const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])',
+        )).filter(element => !element.matches(":disabled") && (!element.closest("details:not([open])") || element.matches("summary")));
         if (focusable.length === 0) return;
         const first = focusable[0];
         const last = focusable[focusable.length - 1];
@@ -167,45 +134,53 @@ export default function AccountSetup({ onClose }: Props) {
     };
   }, [onClose]);
 
-  async function handleTestConnection() {
+  async function verifyConnection(): Promise<boolean> {
     setTestResult(null);
     setTestLoading(true);
     try {
-      const report =
+      const report = await testBothMailDirections(() =>
         form.provider === "pop3"
-          ? await testPop3Connection(
+          ? testPop3Connection(
               form.imap_host,
               form.imap_port,
               form.imap_security,
-              form.accept_invalid_certs,
+              form.imap_accept_invalid_certs,
               form.proxy_host,
               form.proxy_port,
-              form.username || undefined,
+              form.username.trim() || form.email.trim(),
               form.password || undefined,
               form.allow_plaintext,
             )
-          : await testImapConnection(
+          : testImapConnection(
               form.imap_host,
               form.imap_port,
               form.imap_security,
-              form.accept_invalid_certs,
+              form.imap_accept_invalid_certs,
               form.proxy_host,
               form.proxy_port,
-              form.username || undefined,
+              form.username.trim() || form.email.trim(),
               form.password || undefined,
               form.email || undefined,
               form.allow_plaintext,
-            );
+            ), () => testSmtpConnection({ smtp_host: form.smtp_host, smtp_port: form.smtp_port,
+              smtp_security: form.smtp_security, username: form.username.trim() || form.email.trim(), password: form.password, email: form.email.trim(),
+              proxy_host: form.proxy_host, proxy_port: form.proxy_port,
+              accept_invalid_certs: form.smtp_accept_invalid_certs, allow_plaintext: form.allow_plaintext }));
+      testedForm.current = form;
       setTestResult({ ok: true, message: report });
+      return true;
     } catch (err) {
-      const msg = extractErrorMessage(err);
+      testedForm.current = null;
+      const preset = form.provider === "imap" ? findMailServerPreset(form.email, form.imap_host, form.smtp_host) : undefined;
+      const msg = explainMailConnectionReport(extractErrorMessage(err), preset);
       setTestResult({ ok: false, message: msg });
+      return false;
     } finally {
       setTestLoading(false);
     }
   }
 
-  const [oauthLoading, setOauthLoading] = useState(false);
+  const [oauthLoading, setOauthLoading] = useWorkspaceState("src/components/AccountSetup.tsx:AccountSetup:oauthLoading", false);
 
   async function handleOAuth(provider: "gmail" | "outlook") {
     setOauthLoading(true);
@@ -231,23 +206,52 @@ export default function AccountSetup({ onClose }: Props) {
   }
 
   function applyPreset(key: string) {
-    const preset = PRESETS[key];
-    if (!preset) return;
-    setForm((prev) => ({ ...prev, provider: "imap", ...preset }));
+    const preset = MAIL_ACCOUNT_PRESETS.find(item => item.id === key);
+    if (!preset) { setAdvancedOpen(true); return; }
+    setServerSource("provider");
+    setTestResult(null);
+    setForm((prev) => ({ ...prev, provider: "imap", ...preset.servers, allow_plaintext: false, imap_accept_invalid_certs: false, smtp_accept_invalid_certs: false }));
   }
 
   function handleChange(field: keyof AddAccountRequest, value: string | number | boolean) {
+    setTestResult(null);
+    const domain = (email: string) => email.trim().split("@")[1]?.toLowerCase();
+    const changedProviderDomain = field === "email" && serverSource === "provider" && domain(form.email) !== domain(String(value));
+    if (changedProviderDomain) setServerSource("auto");
+    if (/^(imap|smtp)_(host|port|security)$/.test(field)) setServerSource("manual");
     setForm((prev) => {
       const updated = { ...prev, [field]: value };
       // Keep username in sync with email when username hasn't been manually changed
       if (field === "email" && prev.username === prev.email) {
-        updated.username = value as string;
+        updated.username = "";
+      }
+      if (field === "email" && (serverSource === "auto" || changedProviderDomain)) {
+        const preset = detectMailAccountPreset(String(value));
+        Object.assign(updated, {
+          imap_host: "", smtp_host: "", imap_port: 993, smtp_port: 587,
+          imap_security: "tls", smtp_security: "starttls",
+          ...preset?.servers,
+        });
+        if (updated.imap_host !== prev.imap_host) updated.imap_accept_invalid_certs = false;
+        if (updated.smtp_host !== prev.smtp_host) updated.smtp_accept_invalid_certs = false;
+      }
+      if (field === "imap_host" || field === "imap_port" || field === "imap_security") {
+        updated.imap_accept_invalid_certs = false;
+      }
+      if (field === "smtp_host" || field === "smtp_port" || field === "smtp_security") {
+        updated.smtp_accept_invalid_certs = false;
       }
       // The plaintext opt-in checkbox only shows while a connection is
       // unencrypted. If the user switches both sides back to an encrypted
       // mode, clear the flag so a transiently-checked box can't persist
       // allow_plaintext=true onto an encrypted account (issue #70).
       if (field === "imap_security" || field === "smtp_security") {
+        const security = value as ConnectionSecurity;
+        if (field === "imap_security") {
+          updated.imap_port = defaultIncomingPort(prev.provider === "pop3" ? "pop3" : "imap", security);
+        } else {
+          updated.smtp_port = defaultSmtpPort(security);
+        }
         const anyPlain =
           updated.imap_security === "plain" || updated.smtp_security === "plain";
         if (!anyPlain) {
@@ -259,20 +263,33 @@ export default function AccountSetup({ onClose }: Props) {
   }
 
   function handleIncomingProtocolChange(provider: "imap" | "pop3") {
+    setServerSource("manual");
+    setTestResult(null);
     setForm((prev) => ({
       ...prev,
       provider,
-      imap_port: provider === "pop3" ? 995 : 993,
+      imap_port: defaultIncomingPort(provider, "tls"),
       imap_security: "tls",
+      imap_accept_invalid_certs: false,
     }));
   }
 
   async function handleSubmit(e: React.SyntheticEvent<HTMLFormElement>) {
     e.preventDefault();
     setError(null);
+    if (loading || testLoading || oauthLoading) return;
+    if (!canTestConnection) {
+      setError(t("accountSetup.serverSettingsRequired", "Choose your email provider or fill in the incoming and outgoing servers in Advanced connection settings."));
+      setAdvancedOpen(true);
+      return;
+    }
     setLoading(true);
     try {
-      const account = await addAccount(form);
+      if (testedForm.current !== form && !await verifyConnection()) return;
+      const address = form.email.trim();
+      const account = await addAccount({
+        ...form, email: address, display_name: form.display_name.trim() || address.split("@")[0],
+      });
       // Invalidate accounts immediately so UI reflects the new account
       await queryClient.invalidateQueries({ queryKey: accountsQueryKey });
       onClose();
@@ -307,7 +324,9 @@ export default function AccountSetup({ onClose }: Props) {
     : t("accountSetup.imapPort", "IMAP port");
   const incomingHostPlaceholder = isPop3 ? "pop.example.com" : "imap.example.com";
   const canTestConnection =
-    !!form.imap_host && (!isPop3 || (!!form.username && !!form.password));
+    !!form.imap_host.trim() && !!form.smtp_host.trim() && !!form.password && !!form.email.trim()
+    && [form.imap_port, form.smtp_port].every(port => Number.isInteger(port) && port > 0 && port <= 65535);
+  const suggestedProvider = findMailServerPreset(form.email, form.imap_host, form.smtp_host);
 
   const proxyFields = (
     <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "12px", marginBottom: "16px" }}>
@@ -414,7 +433,7 @@ export default function AccountSetup({ onClose }: Props) {
           <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
             <button
               type="button"
-              disabled={oauthLoading}
+              disabled={oauthLoading || loading || testLoading}
               onClick={() => handleOAuth("gmail")}
               style={{
                 flex: 1,
@@ -438,7 +457,7 @@ export default function AccountSetup({ onClose }: Props) {
             </button>
             <button
               type="button"
-              disabled={oauthLoading}
+              disabled={oauthLoading || loading || testLoading}
               onClick={() => handleOAuth("outlook")}
               style={{
                 flex: 1,
@@ -462,39 +481,12 @@ export default function AccountSetup({ onClose }: Props) {
             </button>
           </div>
 
-          {proxyFields}
-
           <div style={{ textAlign: "center", color: "var(--color-text-secondary)", fontSize: "12px", marginBottom: "16px" }}>
             {t("accountSetup.orManual", "or add account manually")}
           </div>
 
-          {/* Preset buttons */}
-          <div style={{ marginBottom: "20px" }}>
-            <span style={{ ...labelStyle, marginBottom: "8px" }}>{t("accountSetup.quickSetup", "Quick setup")}</span>
-            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-              {Object.keys(PRESETS).map((key) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => applyPreset(key)}
-                  style={{
-                    padding: "5px 14px",
-                    borderRadius: "20px",
-                    border: "1px solid var(--color-border)",
-                    backgroundColor: "transparent",
-                    color: "var(--color-text-primary)",
-                    fontSize: "12px",
-                    cursor: "pointer",
-                    textTransform: "capitalize",
-                  }}
-                >
-                  {key === "163" ? "163" : key.charAt(0).toUpperCase() + key.slice(1)}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+          <form onSubmit={handleSubmit}>
+            <fieldset disabled={loading || testLoading || oauthLoading} style={{ margin: 0, padding: 0, border: 0, minWidth: 0, display: "flex", flexDirection: "column", gap: 14 }}>
             {/* Email */}
             <div style={fieldStyle}>
               <label htmlFor="setup-email" style={labelStyle}>{t("accountSetup.emailAddress", "Email address")}</label>
@@ -512,6 +504,33 @@ export default function AccountSetup({ onClose }: Props) {
               />
             </div>
 
+            <div style={fieldStyle}>
+              <label htmlFor="setup-password" style={labelStyle}>{t("accountSetup.password", "Password / App password")}</label>
+              <input id="setup-password" name="password" autoComplete="current-password" style={inputStyle} type="password"
+                required value={form.password} onChange={(event) => handleChange("password", event.target.value)} />
+              {(suggestedProvider?.id === "qq" || suggestedProvider?.id === "163") && (
+                <p style={{ margin: "5px 0 0", fontSize: 12, color: "var(--color-text-secondary)" }}>
+                  {t("accountSetup.appPasswordHint", "Enter the app password generated in your webmail settings.")}
+                </p>
+              )}
+            </div>
+
+            {form.email.includes("@") && ((!form.imap_host && !form.smtp_host) || serverSource === "provider") && (
+              <label style={fieldStyle}>
+                <span style={labelStyle}>{t("accountSetup.chooseProvider", "Email provider")}</span>
+                <select value={serverSource === "provider" ? suggestedProvider?.id ?? "" : ""} style={inputStyle}
+                  onChange={event => applyPreset(event.target.value)}>
+                  <option value="" disabled>{t("accountSetup.chooseProviderPlaceholder", "Choose your email provider")}</option>
+                  {MAIL_ACCOUNT_PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.label}</option>)}
+                  <option value="manual">{t("accountSetup.otherProvider", "Other provider / Enter server settings")}</option>
+                </select>
+              </label>
+            )}
+            <button type="button" aria-expanded={advancedOpen} onClick={() => setAdvancedOpen(!advancedOpen)}
+              style={{ alignSelf: "flex-start", border: 0, padding: 0, background: "transparent", color: "var(--color-accent)", cursor: "pointer", fontSize: 13 }}>
+              {t("accountSetup.advancedConnection", "Advanced connection settings")}
+            </button>
+            {advancedOpen && <>
             {/* Display name */}
             <div style={fieldStyle}>
               <label htmlFor="setup-display-name" style={labelStyle}>{t("accountSetup.displayName", "Display name")}</label>
@@ -521,7 +540,6 @@ export default function AccountSetup({ onClose }: Props) {
                 autoComplete="name"
                 style={inputStyle}
                 type="text"
-                required
                 value={form.display_name}
                 onChange={(e) => handleChange("display_name", e.target.value)}
                 placeholder={t("accountSetup.namePlaceholder", "Your Name")}
@@ -627,25 +645,20 @@ export default function AccountSetup({ onClose }: Props) {
               </div>
             </div>
 
-            {/* TLS certificate policy */}
-            <label
-              htmlFor="setup-accept-invalid-certs"
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "8px",
-                fontSize: "12px",
-                color: "var(--color-text-primary)",
-              }}
-            >
-              <input
-                id="setup-accept-invalid-certs"
-                type="checkbox"
-                checked={!!form.accept_invalid_certs}
-                onChange={(e) => handleChange("accept_invalid_certs", e.target.checked)}
-              />
-              {t("accountSetup.acceptInvalidCerts", "Allow invalid TLS certificates")}
-            </label>
+            <details>
+              <summary style={{ cursor: "pointer", fontSize: 13 }}>{t("accountSetup.certificateExceptions", "Certificate exceptions")}</summary>
+              <p style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{t("accountSetup.certificateExceptionHelp", "Only enable an exception after your mail administrator verifies the server. The app will skip its identity check for that connection.")}</p>
+              <label style={{ display: "block", fontSize: 13, marginBottom: 6 }}>
+                <input type="checkbox" checked={!!form.imap_accept_invalid_certs} disabled={form.imap_security === "plain"}
+                  onChange={event => handleChange("imap_accept_invalid_certs", event.target.checked)} />
+                {" "}{t("accountSetup.allowIncomingCertificate", "Skip certificate verification for incoming mail")}
+              </label>
+              <label style={{ display: "block", fontSize: 13 }}>
+                <input type="checkbox" checked={!!form.smtp_accept_invalid_certs} disabled={form.smtp_security === "plain"}
+                  onChange={event => handleChange("smtp_accept_invalid_certs", event.target.checked)} />
+                {" "}{t("accountSetup.allowOutgoingCertificate", "Skip certificate verification for outgoing mail")}
+              </label>
+            </details>
 
             {(form.imap_security === "plain" || form.smtp_security === "plain") && (
               <label
@@ -689,20 +702,8 @@ export default function AccountSetup({ onClose }: Props) {
               />
             </div>
 
-            {/* Password */}
-            <div style={fieldStyle}>
-              <label htmlFor="setup-password" style={labelStyle}>{t("accountSetup.password", "Password / App password")}</label>
-              <input
-                id="setup-password"
-                name="password"
-                autoComplete="current-password"
-                style={inputStyle}
-                type="password"
-                required
-                value={form.password}
-                onChange={(e) => handleChange("password", e.target.value)}
-              />
-            </div>
+            {proxyFields}
+            </>}
 
             {/* Test Connection */}
             {testResult && (
@@ -745,10 +746,10 @@ export default function AccountSetup({ onClose }: Props) {
 
             {/* Buttons */}
             <div style={{ display: "flex", gap: "10px", marginTop: "4px" }}>
-              <button
+              {advancedOpen && <button
                 type="button"
                 disabled={testLoading || !canTestConnection}
-                onClick={handleTestConnection}
+                onClick={() => void verifyConnection()}
                 style={{
                   padding: "9px 16px",
                   borderRadius: "6px",
@@ -762,10 +763,10 @@ export default function AccountSetup({ onClose }: Props) {
                 }}
               >
                 {testLoading ? t("accountSetup.testing", "Testing...") : t("accountSetup.testConnection", "Test Connection")}
-              </button>
+              </button>}
               <button
                 type="submit"
-                disabled={loading}
+                disabled={loading || testLoading || oauthLoading}
                 style={{
                   flex: 1,
                   padding: "9px 16px",
@@ -782,6 +783,7 @@ export default function AccountSetup({ onClose }: Props) {
                 {loading ? t("accountSetup.adding", "Adding account…") : t("accountSetup.submit", "Add Account & Sync")}
               </button>
             </div>
+            </fieldset>
           </form>
         </div>
       </div>

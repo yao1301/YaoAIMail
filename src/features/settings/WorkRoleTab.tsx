@@ -1,9 +1,12 @@
-import { useEffect, useState } from "react";
-import { Plus, Save, Sparkles, Trash2 } from "lucide-react";
+import { useWorkspaceState } from '@/lib/workspaceState';
+import { useEffect } from "react";
+import { Check, Save, Sparkles, X } from "lucide-react";
 import { aiPrompt, getSentSamples, type StyleSample } from "@/lib/api";
 import { useAccountsQuery } from "@/hooks/queries";
 import { useMailStore } from "@/stores/mail.store";
 import type { Account } from "@/lib/ipc-types";
+import { extractErrorMessage } from "@/lib/extractErrorMessage";
+import { SettingsFeedback, type SettingsNotice } from "./SettingsFeedback";
 
 export interface WorkRoleProfile {
   id: string;
@@ -20,20 +23,23 @@ export interface WorkRoleProfile {
   isActive: boolean;
   useInAi: boolean;
   updatedAt: number;
+  /** 固定预设的 ID；同一邮箱的每个预设只保存一份。 */
+  presetId?: string | null;
 }
 
 const KEY = "yaoaimail-work-roles-v1";
+const ADD_CUSTOM_ROLE = "__add_custom_role";
 const ROLE_PRESETS = [
-  { name: "综合外贸业务", jobTitle: "外贸业务员", responsibilities: "开发客户、回复询盘、报价、跟进订单和协调工厂。", preferences: "先给结论，再说明依据；结尾明确下一步。" },
-  { name: "客户开发", jobTitle: "外贸销售 / 客户开发", responsibilities: "寻找匹配客户、判断采购机会、撰写开发信和持续跟进。", preferences: "专业、具体、简洁，不写群发套话。" },
-  { name: "订单跟进", jobTitle: "外贸跟单员", responsibilities: "确认订单、交期、生产进度、装运文件、付款和异常处理。", preferences: "事实优先，把时间节点和责任人写清楚。" },
-  { name: "外贸管理", jobTitle: "外贸主管 / 负责人", responsibilities: "管理客户、产品、报价策略、团队协作和关键商务决策。", preferences: "表达稳健，明确风险、选择和需要确认的事项。" },
+  { id: "general", name: "综合外贸业务", jobTitle: "外贸业务员", responsibilities: "开发客户、回复询盘、报价、跟进订单和协调工厂。", preferences: "先给结论，再说明依据；结尾明确下一步。" },
+  { id: "customer-development", name: "客户开发", jobTitle: "外贸销售 / 客户开发", responsibilities: "寻找匹配客户、判断采购机会、撰写开发信和持续跟进。", preferences: "专业、具体、简洁，不写群发套话。" },
+  { id: "order-follow-up", name: "订单跟进", jobTitle: "外贸跟单员", responsibilities: "确认订单、交期、生产进度、装运文件、付款和异常处理。", preferences: "事实优先，把时间节点和责任人写清楚。" },
+  { id: "management", name: "外贸管理", jobTitle: "外贸主管 / 负责人", responsibilities: "管理客户、产品、报价策略、团队协作和关键商务决策。", preferences: "表达稳健，明确风险、选择和需要确认的事项。" },
 ];
 
-const emptyRole = (accountId: string): WorkRoleProfile => ({
-  id: crypto.randomUUID(),
+const emptyRole = (accountId: string, id: string): WorkRoleProfile => ({
+  id,
   accountId,
-  name: "我的工作角色",
+  name: "自定义工作角色",
   jobTitle: "",
   company: "",
   responsibilities: "",
@@ -44,6 +50,7 @@ const emptyRole = (accountId: string): WorkRoleProfile => ({
   isActive: false,
   useInAi: false,
   updatedAt: Date.now(),
+  presetId: null,
 });
 
 function redactRoleEvidence(text: string): string {
@@ -60,30 +67,80 @@ function loadRoles(): WorkRoleProfile[] {
   try { return JSON.parse(localStorage.getItem(KEY) || "[]") as WorkRoleProfile[]; } catch { return []; }
 }
 
+function migrateRoles(roles: WorkRoleProfile[]): WorkRoleProfile[] {
+  const presetByName = new Map(ROLE_PRESETS.map((preset) => [preset.name, preset]));
+  const groups = new Map<string, WorkRoleProfile[]>();
+  const custom: WorkRoleProfile[] = [];
+
+  for (const role of roles) {
+    const preset = role.presetId === undefined
+      ? presetByName.get(role.name)
+      : ROLE_PRESETS.find((item) => item.id === role.presetId);
+    if (!preset) {
+      custom.push({ ...role, name: role.name || "自定义工作角色" });
+      continue;
+    }
+    const key = `${role.accountId || ""}:${preset.id}`;
+    groups.set(key, [...(groups.get(key) || []), { ...role, presetId: preset.id }]);
+  }
+
+  for (const group of groups.values()) {
+    const ordered = [...group].sort((a, b) => Number(b.isActive || b.useInAi) - Number(a.isActive || a.useInAi) || (b.updatedAt || 0) - (a.updatedAt || 0));
+    const [primary, ...duplicates] = ordered;
+    custom.push(primary);
+    // Preserve genuinely customized duplicate legacy roles as custom roles.
+    for (const duplicate of duplicates) {
+      const sameContent = ["jobTitle", "company", "responsibilities", "productsMarkets", "permissions", "preferences", "rules"]
+        .every((field) => duplicate[field as keyof WorkRoleProfile] === primary[field as keyof WorkRoleProfile]);
+      if (!sameContent) custom.push({ ...duplicate, presetId: null, name: `${duplicate.name}（自定义）` });
+    }
+  }
+  return custom;
+}
+
 function normalizeRoles(roles: WorkRoleProfile[], accountId: string): WorkRoleProfile[] {
   return roles.map((role) => ({ ...role, accountId: role.accountId || accountId }));
 }
 
+function findActiveRole(roles: WorkRoleProfile[]): WorkRoleProfile | null {
+  const role = roles.find((item) => item.isActive) || roles[0];
+  return role?.useInAi ? role : null;
+}
+
 export function getActiveWorkRole(accountId?: string | null): WorkRoleProfile | null {
   const roles = loadRoles();
-  const scoped = accountId ? roles.filter((role) => role.accountId === accountId || !role.accountId) : roles;
-  const role = scoped.find((item) => item.isActive) || scoped[0];
-  return role?.useInAi ? role : null;
+  return findActiveRole(accountId ? roles.filter((role) => role.accountId === accountId || !role.accountId) : roles);
 }
 
 export default function WorkRoleTab() {
   const { data: accounts = [] } = useAccountsQuery();
   const activeAccountId = useMailStore((state) => state.activeAccountId);
-  const [selectedAccountId, setSelectedAccountId] = useState("");
-  const [roles, setRoles] = useState<WorkRoleProfile[]>(() => loadRoles());
-  const [selectedId, setSelectedId] = useState("");
-  const [generating, setGenerating] = useState(false);
-  const [historyConsent, setHistoryConsent] = useState(false);
+  const [selectedAccountId, setSelectedAccountId] = useWorkspaceState("src/features/settings/WorkRoleTab.tsx:WorkRoleTab:selectedAccountId", "");
+  const [roles, setRoles] = useWorkspaceState<WorkRoleProfile[]>("src/features/settings/WorkRoleTab.tsx:WorkRoleTab:roles", () => migrateRoles(loadRoles()));
+  const [drafts, setDrafts] = useWorkspaceState<Record<string, WorkRoleProfile>>("src/features/settings/WorkRoleTab.tsx:WorkRoleTab:drafts", {});
+  const [selectedId, setSelectedId] = useWorkspaceState("src/features/settings/WorkRoleTab.tsx:WorkRoleTab:selectedId", "");
+  const [generating, setGenerating] = useWorkspaceState("src/features/settings/WorkRoleTab.tsx:WorkRoleTab:generating", false);
+  const [historyConsent, setHistoryConsent] = useWorkspaceState("src/features/settings/WorkRoleTab.tsx:WorkRoleTab:historyConsent", false);
+  const [feedback, setFeedback] = useWorkspaceState<(SettingsNotice & { action: string; target: string }) | null>("src/features/settings/WorkRoleTab.tsx:WorkRoleTab:feedback", null);
 
-  const scopedRoles = roles.filter((role) => !selectedAccountId || role.accountId === selectedAccountId);
-  const selected = scopedRoles.find((role) => role.id === selectedId) || scopedRoles[0] || null;
+  const scopedRoles = roles.filter((role) => role.accountId === selectedAccountId);
+  const activeRole = findActiveRole(scopedRoles);
+  const presetRoles = ROLE_PRESETS.map((preset) => {
+    const saved = scopedRoles.find((role) => role.presetId === preset.id);
+    if (saved) return saved;
+    const { id: presetId, ...content } = preset;
+    return { ...emptyRole(selectedAccountId, `preset:${selectedAccountId}:${presetId}`), ...content, presetId };
+  });
+  const pendingCustomRole = Object.values(drafts).find((role) =>
+    role.accountId === selectedAccountId && !role.presetId && !scopedRoles.some((saved) => saved.id === role.id));
+  const customRoles = scopedRoles.filter((role) => !role.presetId);
+  if (pendingCustomRole) customRoles.push(pendingCustomRole);
+  const selectedRole = [...presetRoles, ...customRoles].find((role) => role.id === selectedId)
+    ?? activeRole ?? scopedRoles[0] ?? presetRoles[0];
+  const draft = drafts[selectedRole.id];
+  const selected = draft ?? selectedRole;
+  const editingActiveRole = selected.id === activeRole?.id;
 
-  useEffect(() => { localStorage.setItem(KEY, JSON.stringify(roles)); }, [roles]);
   useEffect(() => {
     if (!selectedAccountId) setSelectedAccountId(activeAccountId || accounts[0]?.id || "");
   }, [accounts, activeAccountId, selectedAccountId]);
@@ -91,46 +148,125 @@ export default function WorkRoleTab() {
     if (selectedAccountId && roles.some((role) => !role.accountId)) setRoles((old) => normalizeRoles(old, selectedAccountId));
   }, [selectedAccountId, roles]);
   useEffect(() => {
-    if (scopedRoles.length && !scopedRoles.some((role) => role.id === selectedId)) setSelectedId(scopedRoles[0].id);
-    if (!scopedRoles.length) setSelectedId("");
-  }, [scopedRoles, selectedId]);
+    setHistoryConsent(false);
+  }, [selected.id, setHistoryConsent]);
 
   function update(patch: Partial<WorkRoleProfile>) {
-    if (!selected) return;
-    setRoles((old) => old.map((role) => role.id === selected.id ? { ...role, ...patch, updatedAt: Date.now() } : role));
+    setDrafts((old) => ({ ...old, [selected.id]: { ...(old[selected.id] ?? selected), ...patch } }));
   }
 
-  function addRole(preset = ROLE_PRESETS[0]) {
-    if (!selectedAccountId) return;
-    const role = { ...emptyRole(selectedAccountId), name: preset.name, jobTitle: preset.jobTitle, responsibilities: preset.responsibilities, preferences: preset.preferences };
-    setRoles((old) => [...old, role]);
+  function forgetDraft(id: string) {
+    setDrafts((old) => {
+      const next = { ...old };
+      delete next[id];
+      return next;
+    });
+  }
+
+  function writeRoles(action: "save" | "delete" | "disable", change: (latest: WorkRoleProfile[]) => WorkRoleProfile[]) {
+    setFeedback(null);
+    try {
+      const latest = migrateRoles(loadRoles()).map((role) => role.accountId ? role : {
+        ...role,
+        accountId: roles.find((known) => known.id === role.id)?.accountId || selectedAccountId,
+      });
+      const next = change(latest);
+      localStorage.setItem(KEY, JSON.stringify(next));
+      setRoles(next);
+      return next;
+    } catch (error) {
+      const title = { save: "保存", delete: "删除", disable: "停用" }[action];
+      setFeedback({ action, target: action === "disable" ? selectedAccountId : selected.id, message: `${title}工作角色失败：${extractErrorMessage(error)}`, kind: "error" });
+      return null;
+    }
+  }
+
+  function removeSelectedCustomRole() {
+    if (selected.presetId) return;
+    if (selected.id !== pendingCustomRole?.id) {
+      if (!window.confirm("确定删除这个自定义工作角色吗？")) return;
+      if (!writeRoles("delete", (latest) => latest.filter((role) => role.id !== selected.id))) return;
+    }
+    forgetDraft(selected.id);
+    setSelectedId("");
+  }
+
+  function chooseRole(value: string) {
+    if (value !== ADD_CUSTOM_ROLE) {
+      setSelectedId(value);
+      return;
+    }
+    const role = pendingCustomRole ?? emptyRole(selectedAccountId, crypto.randomUUID());
+    setDrafts((old) => ({ ...old, [role.id]: role }));
     setSelectedId(role.id);
   }
 
-  function activate(id: string) {
-    setRoles((old) => old.map((role) => role.accountId === selectedAccountId ? { ...role, isActive: role.id === id, useInAi: role.id === id, updatedAt: Date.now() } : role));
-    setSelectedId(id);
+  function saveRole(enable: boolean) {
+    const saved = writeRoles("save", (latest) => {
+      const previous = latest.find((role) => role.accountId === selectedAccountId &&
+        (role.id === selected.id || (selected.presetId && role.presetId === selected.presetId)));
+      const role = {
+        ...(draft ?? previous ?? selected),
+        id: previous?.id ?? selected.id,
+        isActive: enable || !!previous?.isActive,
+        useInAi: enable || !!previous?.useInAi,
+        updatedAt: Date.now(),
+      };
+      const next = latest.map((item) => {
+        if (item.id === role.id) return role;
+        return enable && item.accountId === selectedAccountId ? { ...item, isActive: false, useInAi: false } : item;
+      });
+      if (!previous) next.push(role);
+      return next;
+    });
+    if (saved) {
+      forgetDraft(selected.id);
+      const savedRole = saved.find((role) => role.accountId === selectedAccountId &&
+        (role.id === selected.id || (selected.presetId && role.presetId === selected.presetId)));
+      if (savedRole) {
+        setSelectedId(savedRole.id);
+        if (!enable) setFeedback({ action: "save", target: savedRole.id, message: "角色修改已保存。", kind: "success" });
+      }
+    }
+  }
+
+  function disableRole() {
+    writeRoles("disable", (latest) => latest.map((role) => role.accountId === selectedAccountId
+      ? { ...role, isActive: false, useInAi: false } : role));
+  }
+
+  function applyGeneratedFields(text: string) {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("模型没有返回可识别的角色设定");
+    const result = JSON.parse(match[0]);
+    const patch: Partial<WorkRoleProfile> = {};
+    for (const field of ["jobTitle", "responsibilities", "productsMarkets", "permissions", "preferences", "rules"] as const) {
+      if (typeof result[field] === "string") patch[field] = result[field];
+    }
+    if (!Object.keys(patch).length) throw new Error("模型没有返回可识别的角色设定");
+    update(patch);
   }
 
   async function generateDraft() {
-    if (!selected || generating) return;
+    if (generating) return;
+    setFeedback(null);
     setGenerating(true);
     try {
       const system = "你是外贸工作角色整理助手。根据用户提供的工作描述，生成可用于邮件 AI 的角色设定。只输出 JSON，字段为 jobTitle、responsibilities、productsMarkets、permissions、preferences、rules。不要编造用户没有提供的事实。";
       const user = `角色名称：${selected.name}\n公司：${selected.company}\n职位：${selected.jobTitle}\n工作描述：${selected.preferences}\n负责事项：${selected.responsibilities}\n产品与市场：${selected.productsMarkets}\n补充限制：${selected.permissions}\n${selected.rules}`;
       const text = await aiPrompt(system, user);
-      const match = text.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error("模型没有返回可识别的角色设定");
-      update(JSON.parse(match[0]) as Partial<WorkRoleProfile>);
+      applyGeneratedFields(text);
     } catch (error) {
-      window.alert(`整理工作角色失败：${String(error)}`);
+      setFeedback({ action: "generate", target: selected.id, message: `整理工作角色失败：${extractErrorMessage(error)}`, kind: "error" });
     } finally {
       setGenerating(false);
     }
   }
 
   async function generateFromHistory() {
-    if (!selected || generating || !historyConsent || !selectedAccountId) return;
+    if (generating || !historyConsent || !selectedAccountId) return;
+    setFeedback(null);
+    setHistoryConsent(false);
     setGenerating(true);
     try {
       const samples: StyleSample[] = await getSentSamples(30, selectedAccountId);
@@ -141,12 +277,10 @@ export default function WorkRoleTab() {
         .slice(0, 18_000);
       const system = "你是外贸工作角色整理助手。请根据脱敏后的当前邮箱账号已发送邮件样本，提取反复出现的工作职责、产品与市场、可处理范围、沟通偏好和防呆规则。只输出 JSON，字段为 jobTitle、responsibilities、productsMarkets、permissions、preferences、rules。不得带入客户姓名、邮箱、价格、订单号、日期、交期或其他旧邮件事实，也不要猜测。";
       const text = await aiPrompt(system, `当前角色：${JSON.stringify(selected)}\n\n当前账号的脱敏已发送邮件样本：\n${redacted}`);
-      const match = text.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error("模型没有返回可识别的角色设定");
-      update(JSON.parse(match[0]) as Partial<WorkRoleProfile>);
-      window.alert(`已根据当前账号 ${samples.length} 封脱敏已发送邮件整理角色，请检查后再设为当前角色。`);
+      applyGeneratedFields(text);
+      setFeedback({ action: "history", target: selected.id, message: `已根据 ${samples.length} 封脱敏邮件整理角色内容。请检查后保存。`, kind: "success" });
     } catch (error) {
-      window.alert(`根据历史邮件整理失败：${String(error)}`);
+      setFeedback({ action: "history", target: selected.id, message: `根据历史邮件整理失败：${extractErrorMessage(error)}`, kind: "error" });
     } finally {
       setGenerating(false);
     }
@@ -156,7 +290,7 @@ export default function WorkRoleTab() {
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <div>
         <h2 style={{ margin: 0, fontSize: 20 }}>我的工作角色</h2>
-        <p style={hint}>简单理解：告诉 AI 你是谁、平时负责什么、回复邮件有什么习惯。每个邮箱可以有多个角色，写邮件时会按发件账号使用对应角色。</p>
+        <p style={hint}>告诉 AI 你的职责和写邮件的习惯。每个邮箱可以启用一个角色，AI 写作时会按发件邮箱使用。</p>
       </div>
 
       <section style={card}>
@@ -169,26 +303,37 @@ export default function WorkRoleTab() {
 
       {!selectedAccountId ? <div style={empty}>请先选择一个邮箱账号。</div> : <>
         <section style={card}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}><strong>第二步：选择或新建一个角色</strong><button type="button" onClick={() => addRole()} style={secondary}><Plus size={14} />新建角色</button></div>
-          <div style={{ display: "flex", gap: 7, flexWrap: "wrap", marginTop: 10 }}>
-            {scopedRoles.map((role) => <button key={role.id} type="button" onClick={() => setSelectedId(role.id)} style={{ ...roleButton, background: role.id === selected?.id ? "var(--color-sidebar-active)" : "transparent" }}>{role.name}{role.useInAi ? " · 当前使用" : ""}</button>)}
-            {!scopedRoles.length && <span style={hint}>还没有角色，可以从右上角新建，或使用下面的常用模板。</span>}
+          <strong>第二步：选择工作角色</strong>
+          <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+            <select aria-label="选择要编辑的工作角色" value={selected.id} onChange={(event) => chooseRole(event.target.value)} style={input}>
+              <optgroup label="预设工作角色">
+                {presetRoles.map((role, index) => <option key={role.id} value={role.id}>{role.name || ROLE_PRESETS[index].name}{role.id === activeRole?.id ? " · 已启用" : ""}</option>)}
+              </optgroup>
+              <optgroup label="我的自定义角色">
+                {customRoles.map((role) => <option key={role.id} value={role.id}>{role.name || "自定义工作角色"}{role.id === activeRole?.id ? " · 已启用" : ""}</option>)}
+                <option value={ADD_CUSTOM_ROLE}>＋ 自定义工作角色</option>
+              </optgroup>
+            </select>
+            {!selected.presetId && <button type="button" disabled={generating} onClick={removeSelectedCustomRole} title="删除这个自定义工作角色" aria-label="删除这个自定义工作角色" style={deleteButton}><X size={15} /></button>}
           </div>
-          <select defaultValue="" onChange={(event) => { const preset = ROLE_PRESETS[Number(event.target.value)]; if (preset) addRole(preset); }} style={{ ...input, marginTop: 10 }}>
-            <option value="">从常用模板新建…</option>
-            {ROLE_PRESETS.map((preset, index) => <option key={preset.name} value={index}>{preset.name}</option>)}
-          </select>
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px 12px", marginTop: 8 }}>
+            <span role="status" style={hint}>{activeRole ? <>此邮箱的 AI 写作正在使用 <strong>「{activeRole.name || "自定义工作角色"}」</strong></> : "此邮箱尚未启用工作角色。"}</span>
+            {activeRole && <button type="button" onClick={disableRole} style={secondary}>停用角色</button>}
+          </div>
+          <SettingsFeedback notice={(feedback?.action === "delete" && feedback.target === selected.id) || (feedback?.action === "disable" && feedback.target === selectedAccountId) ? feedback : null} />
         </section>
 
-        {selected && <>
           <section style={card}>
             <strong>第三步：用一句话告诉 AI 你的工作方式</strong>
-            <p style={{ ...hint, margin: "5px 0 8px" }}>例如：“我负责家居照明出口，主要开发欧洲客户；回复时先确认数量和目的港，价格和交期需要确认后再承诺。”</p>
+            <p style={{ ...hint, margin: "5px 0 8px" }}>例如：“我负责跟进客户询价和订单，回复时先确认数量和交货地点，核实价格和交期后再答复。”</p>
             <textarea value={selected.preferences} onChange={(event) => update({ preferences: event.target.value })} placeholder="写下你的职位、产品、客户、日常工作和沟通习惯…" rows={5} style={{ ...input, resize: "vertical", lineHeight: 1.6 }} />
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 9 }}>
-              <button type="button" onClick={() => activate(selected.id)} style={primary}><Save size={14} />设为这个邮箱当前使用</button>
+              {!editingActiveRole && <button type="button" disabled={generating} onClick={() => saveRole(true)} style={primary}><Check size={14} />{draft ? "保存并启用" : "启用此角色"}</button>}
+              {draft && <button type="button" disabled={generating} onClick={() => saveRole(false)} style={editingActiveRole ? primary : secondary}><Save size={14} />{editingActiveRole ? "保存修改" : "只保存"}</button>}
               <button type="button" disabled={generating} onClick={() => void generateDraft()} style={secondary}><Sparkles size={14} />{generating ? "整理中…" : "让 AI 帮我整理"}</button>
             </div>
+            <SettingsFeedback notice={feedback?.target === selected.id && (feedback.action === "save" || feedback.action === "generate") ? feedback : null} />
+            {draft && <p role="status" style={{ ...hint, margin: "8px 0 0" }}>此角色有未保存的修改。</p>}
           </section>
 
           <details style={card}>
@@ -209,12 +354,11 @@ export default function WorkRoleTab() {
           <details style={card}>
             <summary style={summary}>可选：从当前账号的历史邮件学习 <span style={hint}>最多 30 封，先脱敏</span></summary>
             <p style={{ ...hint, margin: "10px 0" }}>只读取这个邮箱账号的已发送邮件，脱敏后发送给当前配置的 AI 服务商；不会上传整个邮箱、附件或全部历史邮件。</p>
-            <label style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12, lineHeight: 1.5 }}><input type="checkbox" checked={historyConsent} onChange={(event) => setHistoryConsent(event.target.checked)} />我同意本次使用最多 30 封脱敏样本整理这个工作角色。</label>
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 7, fontSize: 12, lineHeight: 1.5 }}><input type="checkbox" checked={historyConsent} onChange={(event) => setHistoryConsent(event.target.checked)} />我同意本次使用最多 30 封脱敏邮件整理角色内容。</label>
             <button type="button" disabled={!historyConsent || generating} onClick={() => void generateFromHistory()} style={{ ...secondary, marginTop: 9, opacity: historyConsent ? 1 : 0.55 }}><Sparkles size={14} />{generating ? "学习中…" : "根据历史邮件整理"}</button>
+            <SettingsFeedback notice={feedback?.action === "history" && feedback.target === selected.id ? feedback : null} />
           </details>
 
-          <button type="button" onClick={() => { if (!window.confirm("确定删除这个工作角色吗？")) return; setRoles((old) => old.filter((role) => role.id !== selected.id)); }} style={{ ...secondary, color: "#b33", alignSelf: "flex-start" }}><Trash2 size={14} />删除当前角色</button>
-        </>}
       </>}
     </div>
   );
@@ -233,6 +377,6 @@ const input: React.CSSProperties = { boxSizing: "border-box", width: "100%", pad
 const hint: React.CSSProperties = { color: "var(--color-text-secondary)", fontSize: 13, lineHeight: 1.6 };
 const empty: React.CSSProperties = { padding: 16, border: "1px dashed var(--color-border)", borderRadius: 8, color: "var(--color-text-secondary)" };
 const summary: React.CSSProperties = { cursor: "pointer", display: "flex", justifyContent: "space-between", gap: 10, listStyle: "none", fontWeight: 600, fontSize: 13 };
-const roleButton: React.CSSProperties = { padding: "7px 10px", borderRadius: 7, border: "1px solid var(--color-border)", color: "var(--color-text-primary)", cursor: "pointer" };
 const primary: React.CSSProperties = { display: "inline-flex", alignItems: "center", gap: 5, padding: "8px 12px", border: 0, borderRadius: 7, background: "var(--color-accent)", color: "#fff", cursor: "pointer" };
 const secondary: React.CSSProperties = { display: "inline-flex", alignItems: "center", gap: 5, padding: "8px 12px", border: "1px solid var(--color-border)", borderRadius: 7, background: "transparent", color: "var(--color-text-primary)", cursor: "pointer" };
+const deleteButton: React.CSSProperties = { flex: "0 0 auto", display: "inline-flex", alignItems: "center", justifyContent: "center", width: 38, height: 38, border: "1px solid #fecaca", borderRadius: 7, background: "#fff1f2", color: "#dc2626", cursor: "pointer" };

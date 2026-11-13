@@ -72,6 +72,36 @@ use crate::realtime_policy::{RealtimePollPolicy, RealtimeRuntimeState, SyncTrigg
 use crate::reconcile;
 use crate::thread::compute_thread_id;
 
+/// Reject a MIME prefix before it reaches the parser. An incomplete MIME
+/// message can still yield a valid text body while its attachment part is
+/// absent, so the batch path must enforce the size it fetched beforehand.
+fn verify_raw_message_size(uid: u32, raw: &[u8], expected_size: Option<u32>) -> Result<()> {
+    if let Some(expected) = expected_size {
+        let expected = expected as usize;
+        if raw.len() != expected {
+            return Err(PebbleError::Sync(format!(
+                "IMAP message UID {uid} incomplete: received {} of {expected} bytes",
+                raw.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_downloaded_message_identity(expected: Option<&str>, actual: Option<&str>) -> Result<()> {
+    // A UID is scoped to one mailbox. Length alone cannot catch a response
+    // from a different mailbox that happens to contain the same UID.
+    if let Some(expected) = expected.filter(|value| !value.trim().is_empty()) {
+        let normalize = |value: &str| value.trim().trim_start_matches('<').trim_end_matches('>').to_string();
+        if actual.map(normalize).as_deref() != Some(normalize(expected).as_str()) {
+            return Err(PebbleError::Sync(
+                "Downloaded MIME Message-ID does not match the stored header; local content unchanged".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Collect all message-ID references (In-Reply-To + References) from a batch of
 /// pre-parsed messages. Used to limit the thread-mappings query to only the IDs
 /// that are actually needed by this batch.
@@ -176,20 +206,45 @@ pub fn persist_message_attachments(
     message_id: &str,
     attachments: Vec<AttachmentData>,
 ) {
+    if let Err(error) = persist_message_attachments_checked(store, attachments_root, message_id, attachments) {
+        warn!("Failed to persist attachments for message {message_id}: {error}");
+    }
+}
+
+/// Strict variant used by IMAP hydration. A body download is not complete
+/// until every decoded attachment is both written and recorded in SQLite.
+pub fn persist_message_attachments_checked(
+    store: &Store,
+    attachments_root: &Path,
+    message_id: &str,
+    attachments: Vec<AttachmentData>,
+) -> Result<()> {
     use std::io::Write;
     const CHUNK_SIZE: usize = 64 * 1024;
 
     for att_data in attachments.into_iter() {
         let att_dir = attachments_root.join(message_id);
-        if std::fs::create_dir_all(&att_dir).is_err() {
-            warn!("Failed to create attachment dir for message {}", message_id);
-            continue;
-        }
+        std::fs::create_dir_all(&att_dir).map_err(|e| {
+            PebbleError::Storage(format!(
+                "failed to create attachment directory {}: {e}",
+                att_dir.display()
+            ))
+        })?;
 
         let safe_filename = sanitize_filename(&att_data.meta.filename);
         if safe_filename.is_empty() {
-            warn!("Attachment has empty filename after sanitization, skipping");
-            continue;
+            return Err(PebbleError::Storage(
+                "attachment has empty filename after sanitization".to_string(),
+            ));
+        }
+        let AttachmentData { meta, data } = att_data;
+        if meta.size != data.len() {
+            return Err(PebbleError::Sync(format!(
+                "attachment {} is incomplete: decoded {} of {} bytes",
+                meta.filename,
+                data.len(),
+                meta.size
+            )));
         }
 
         let mut file_path = att_dir.join(&safe_filename);
@@ -206,30 +261,21 @@ pub fn persist_message_attachments(
             file_path = att_dir.join(format!("{stem}_{counter}{ext}"));
             counter += 1;
         }
-        let file = match std::fs::File::create(&file_path) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!(
-                    "Failed to create attachment file {}: {}",
-                    file_path.display(),
-                    e
-                );
-                continue;
-            }
-        };
+        let file = std::fs::File::create(&file_path).map_err(|e| {
+            PebbleError::Storage(format!(
+                "failed to create attachment file {}: {e}",
+                file_path.display()
+            ))
+        })?;
         let mut writer = std::io::BufWriter::with_capacity(CHUNK_SIZE, file);
 
-        let AttachmentData { meta, data } = att_data;
-        let mut write_ok = true;
         for chunk in data.chunks(CHUNK_SIZE) {
             if let Err(e) = writer.write_all(chunk) {
-                warn!(
-                    "Failed to write attachment file {}: {}",
-                    file_path.display(),
-                    e
-                );
-                write_ok = false;
-                break;
+                let _ = std::fs::remove_file(&file_path);
+                return Err(PebbleError::Storage(format!(
+                    "failed to write attachment file {}: {e}",
+                    file_path.display()
+                )));
             }
         }
         // Release the attachment buffer as soon as bytes are flushed to the
@@ -237,18 +283,12 @@ pub fn persist_message_attachments(
         // in a tight loop where peak memory matters.
         drop(data);
 
-        if !write_ok {
-            let _ = std::fs::remove_file(&file_path);
-            continue;
-        }
         if let Err(e) = writer.flush() {
-            warn!(
-                "Failed to flush attachment file {}: {}",
-                file_path.display(),
-                e
-            );
             let _ = std::fs::remove_file(&file_path);
-            continue;
+            return Err(PebbleError::Storage(format!(
+                "failed to flush attachment file {}: {e}",
+                file_path.display()
+            )));
         }
 
         let attachment = pebble_core::Attachment {
@@ -261,10 +301,9 @@ pub fn persist_message_attachments(
             content_id: meta.content_id,
             is_inline: meta.is_inline,
         };
-        if let Err(e) = store.insert_attachment(&attachment) {
-            warn!("Failed to store attachment record: {}", e);
-        }
+        store.insert_attachment(&attachment)?;
     }
+    Ok(())
 }
 
 /// Async wrapper that offloads attachment I/O to a blocking thread.
@@ -281,6 +320,24 @@ pub(crate) async fn persist_message_attachments_async(
         persist_message_attachments(&store, &attachments_root, &message_id, attachments);
     })
     .await;
+}
+
+/// Strict async wrapper for IMAP hydration. Errors are returned so the body
+/// job remains retryable instead of being marked complete with missing files.
+pub(crate) async fn persist_message_attachments_async_checked(
+    store: Arc<Store>,
+    attachments_root: PathBuf,
+    message_id: String,
+    attachments: Vec<AttachmentData>,
+) -> Result<()> {
+    if attachments.is_empty() {
+        return Ok(());
+    }
+    tokio::task::spawn_blocking(move || {
+        persist_message_attachments_checked(&store, &attachments_root, &message_id, attachments)
+    })
+    .await
+    .map_err(|error| PebbleError::Internal(format!("attachment task failed: {error}")))?
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -326,6 +383,7 @@ fn prepare_imap_folder_cursor_for_status(
     if let (Some(stored), Some(current)) = (cursor.uidvalidity, uidvalidity) {
         if stored != current {
             cursor.last_uid = None;
+            cursor.highest_modseq = None;
             cursor.history_complete = false;
             cursor.history_next_sequence = None;
             cursor.history_recovery_server_exists = None;
@@ -350,8 +408,15 @@ fn can_advance_imap_folder_cursor(has_unresolved_failures: bool) -> bool {
     !has_unresolved_failures
 }
 
-fn should_run_imap_deletion_diff(_server_exists: u32, local_count: usize) -> bool {
-    local_count > 0
+fn should_run_imap_deletion_diff(server_exists: u32, local_count: usize) -> bool {
+    local_count > 0 || server_exists > 0
+}
+
+pub(crate) fn valid_imap_uid_inventory(expected_epoch: Option<u64>, status: crate::imap::ImapMailboxStatus, uids: &[u32]) -> bool {
+    let unique: HashSet<_> = uids.iter().copied().collect();
+    expected_epoch.is_some_and(|epoch| epoch > 0 && Some(epoch) == status.uid_validity.map(u64::from))
+        && unique.len() == status.exists as usize && unique.len() == uids.len()
+        && !unique.contains(&0) && status.uid_next.is_none_or(|next| unique.iter().all(|&uid| uid < next))
 }
 
 fn can_seed_imap_polling_baseline_after_startup(initial_sync_succeeded: bool) -> bool {
@@ -419,7 +484,8 @@ fn is_retryable_imap_connection_error(error: &PebbleError) -> bool {
     };
     let lower = message.to_ascii_lowercase();
 
-    lower.contains("os error 10053")
+    lower.contains("imap uidvalidity unavailable")
+        || lower.contains("os error 10053")
         || lower.contains("os error 10054")
         || lower.contains("connection reset")
         || lower.contains("connection aborted")
@@ -974,9 +1040,17 @@ impl SyncWorker {
             }
         };
         self.clear_folder_quarantine(folder, &mut cursor);
+        self.prepare_verified_imap_cursor(folder, cursor, status)
+    }
+
+    fn prepare_verified_imap_cursor(&self, folder: &Folder, cursor: ImapFolderCursor, status: crate::imap::ImapMailboxStatus) -> Result<ImapFolderCursor> {
+        let Some(epoch) = status.uid_validity.filter(|&uid| uid > 0).map(u64::from) else {
+            return Err(PebbleError::Sync("IMAP response omitted UIDVALIDITY; local mail left unchanged".into()));
+        };
+        let previous = cursor.uidvalidity;
         let mut cursor = prepare_imap_folder_cursor_for_status(
             cursor,
-            status.uid_validity.map(u64::from),
+            Some(epoch),
             status.highest_modseq,
         );
         if cursor.history_cursor_version < HISTORY_CURSOR_VERSION {
@@ -989,6 +1063,11 @@ impl SyncWorker {
             cursor.history_next_sequence = (status.exists > 0).then_some(status.exists);
         } else if cursor.history_next_sequence.is_none() && !cursor.history_complete && status.exists > 0 {
             cursor.history_next_sequence = Some(status.exists);
+        }
+        if let Some(old) = previous.filter(|&old| old != epoch) {
+            let state = serde_json::to_string(&cursor).map_err(|e| PebbleError::Internal(e.to_string()))?;
+            let retain = !matches!(folder.role, Some(pebble_core::FolderRole::Trash | pebble_core::FolderRole::Spam));
+            self.base.store.replace_imap_uid_epoch(&self.base.account_id, &folder.id, old, &state, retain)?;
         }
         Ok(cursor)
     }
@@ -1266,128 +1345,6 @@ impl SyncWorker {
         }
     }
 
-    /// Repair historical local-only moves made by older rule code. Those
-    /// versions changed message_folders but did not persist a remote MOVE, so
-    /// there is no source mailbox in a pending-op record. We locate each UID
-    /// once across the server mailboxes, then move only when the target mailbox
-    /// does not already contain it. This is bounded and idempotent.
-    async fn repair_historical_local_moves(&self, limit: u32) -> Result<u32> {
-        let folders = self.base.store.list_folders(&self.base.account_id)?;
-        let mut targets: Vec<(Folder, Vec<(String, u32)>)> = Vec::new();
-        let mut needed = HashSet::new();
-        let mut remaining = limit as usize;
-
-        for folder in &folders {
-            if remaining == 0 || folder.remote_id.starts_with("__local_") {
-                continue;
-            }
-            let mut refs = Vec::new();
-            for (message_id, remote_id) in self
-                .base
-                .store
-                .list_message_remote_ids_by_folder(&folder.id)?
-            {
-                let Ok(uid) = remote_id.parse::<u32>() else {
-                    continue;
-                };
-                refs.push((message_id, uid));
-                needed.insert(uid);
-                remaining = remaining.saturating_sub(1);
-                if remaining == 0 {
-                    break;
-                }
-            }
-            if !refs.is_empty() {
-                targets.push((folder.clone(), refs));
-            }
-        }
-        if needed.is_empty() {
-            return Ok(0);
-        }
-
-        let mut server_uids: std::collections::HashMap<String, HashSet<u32>> =
-            std::collections::HashMap::new();
-        for folder in &folders {
-            if folder.remote_id.starts_with("__local_") {
-                continue;
-            }
-            match self
-                .provider
-                .inner()
-                .fetch_all_uids(&folder.remote_id)
-                .await
-            {
-                Ok(uids) => {
-                    let matching: HashSet<u32> =
-                        uids.into_iter().filter(|uid| needed.contains(uid)).collect();
-                    if !matching.is_empty() {
-                        server_uids.insert(folder.remote_id.clone(), matching);
-                    }
-                }
-                Err(error) => warn!(
-                    "Historical move repair skipped mailbox {}: {}",
-                    folder.remote_id, error
-                ),
-            }
-        }
-
-        let mut repaired = 0u32;
-        for (target, refs) in targets {
-            for (message_id, uid) in refs {
-                if server_uids
-                    .get(&target.remote_id)
-                    .is_some_and(|uids| uids.contains(&uid))
-                {
-                    continue;
-                }
-                let Some(source_remote_id) = server_uids.iter().find_map(|(mailbox, uids)| {
-                    (mailbox != &target.remote_id && uids.contains(&uid)).then_some(mailbox.clone())
-                }) else {
-                    continue;
-                };
-                match self
-                    .provider
-                    .inner()
-                    .move_message_with_dedup(
-                        &source_remote_id,
-                        uid,
-                        &target.remote_id,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        server_uids
-                            .entry(source_remote_id.clone())
-                            .or_default()
-                            .remove(&uid);
-                        server_uids
-                            .entry(target.remote_id.clone())
-                            .or_default()
-                            .insert(uid);
-                        repaired += 1;
-                        info!(
-                            "Repaired historical local move {} UID {}: {} -> {}",
-                            message_id, uid, source_remote_id, target.remote_id
-                        );
-                    }
-                    Err(error) => warn!(
-                        "Historical move repair failed for {} UID {}: {}",
-                        message_id, uid, error
-                    ),
-                }
-            }
-        }
-        if repaired > 0 {
-            info!(
-                account_id = %self.base.account_id,
-                repaired,
-                "Historical local-only rule moves repaired on server"
-            );
-        }
-        Ok(repaired)
-    }
-
     /// Continue filling history for folders whose `history_complete` flag is
     /// still false, advancing each folder at most `max_pages_per_folder`
     /// pages per call. Safe to call repeatedly: already-stored UIDs are
@@ -1483,7 +1440,7 @@ impl SyncWorker {
                             .await
                             .map(|status| status.exists as u64)
                             .unwrap_or(0);
-                        if server_exists > 0 && local_count < server_exists.saturating_mul(90) / 100 {
+                        if server_exists > 0 && local_count < server_exists {
                             let same_gap = cursor.history_recovery_server_exists
                                 == Some(server_exists as u32)
                                 && cursor.history_recovery_local_count == Some(local_count);
@@ -1876,7 +1833,22 @@ impl SyncWorker {
         raw: &[u8],
     ) -> Result<()> {
         let parsed = parse_raw_email(raw)?;
-
+        let target = base.store.get_message(message_id)?
+            .ok_or_else(|| PebbleError::Internal("Body download target missing".into()))?;
+        verify_downloaded_message_identity(
+            target.message_id_header.as_deref(),
+            parsed.message_id_header.as_deref(),
+        )?;
+        base.store.delete_attachments_by_message(message_id)?;
+        persist_message_attachments_async_checked(
+            Arc::clone(&base.store),
+            base.attachments_dir.clone(),
+            message_id.to_string(),
+            parsed.attachments,
+        )
+        .await?;
+        // Leave the header-only marker in place until attachment persistence
+        // succeeds, so an I/O failure cannot strand a falsely completed body.
         base.store.update_message_content(
             message_id,
             &parsed.body_text,
@@ -1885,14 +1857,6 @@ impl SyncWorker {
             parsed.has_attachments,
             None,
         )?;
-        base.store.delete_attachments_by_message(message_id)?;
-        persist_message_attachments_async(
-            Arc::clone(&base.store),
-            base.attachments_dir.clone(),
-            message_id.to_string(),
-            parsed.attachments,
-        )
-        .await;
         base.store.complete_body_download_job(message_id)?;
 
         if let Some(mut message) = base.store.get_message(message_id)? {
@@ -2130,7 +2094,7 @@ impl SyncWorker {
                 let uids: Vec<u32> = chunk.iter().map(|c| c.uid).collect();
                 let raws = match provider
                     .inner()
-                    .fetch_messages_raw_by_uids(folder_remote_id, &uids)
+                    .fetch_messages_raw_by_uids_with_sizes(folder_remote_id, &uids)
                     .await
                 {
                     Ok(raws) => raws,
@@ -2168,11 +2132,11 @@ impl SyncWorker {
                         continue;
                     }
                 };
-                let raw_by_uid: std::collections::HashMap<u32, Vec<u8>> =
-                    raws.into_iter().collect();
+                let raw_by_uid: std::collections::HashMap<u32, (Vec<u8>, Option<u32>)> =
+                    raws.into_iter().map(|(uid, raw, size)| (uid, (raw, size))).collect();
                 for candidate in chunk {
-                    let raw = if let Some(raw) = raw_by_uid.get(&candidate.uid) {
-                        raw.clone()
+                    let (mut raw, expected_size) = if let Some((raw, size)) = raw_by_uid.get(&candidate.uid) {
+                        (raw.clone(), size.or(size_by_uid.get(&candidate.uid).copied()))
                     } else {
                         // Some IMAP servers accept a batch command but omit a
                         // body item. Retry this UID once through the mature
@@ -2182,7 +2146,9 @@ impl SyncWorker {
                             None => continue,
                         };
                         match provider.inner().fetch_message_raw_by_uid(&folder.remote_id, candidate.uid).await {
-                            Ok(raw) => raw,
+                            // The single-message path already verifies the
+                            // size from the same FETCH, not the old estimate.
+                            Ok(raw) => (raw, None),
                             Err(error) => {
                                 let _ = self.base.store.fail_body_download_job(
                                     &candidate.message_id,
@@ -2192,6 +2158,27 @@ impl SyncWorker {
                             }
                         }
                     };
+                    if let Err(error) = verify_raw_message_size(
+                        candidate.uid,
+                        &raw,
+                        expected_size,
+                    ) {
+                        warn!("Body backfill: size changed for {}; fetching this UID with its current RFC822.SIZE ({error})", candidate.message_id);
+                        let folder = match self.base.store.get_folder(&_folder_id)? {
+                            Some(folder) => folder,
+                            None => continue,
+                        };
+                        // The single-message path verifies against the size
+                        // from its own FETCH. Do not reuse stale batch metadata
+                        // or accept the original mismatching bytes.
+                        match provider.inner().fetch_message_raw_by_uid(&folder.remote_id, candidate.uid).await {
+                            Ok(verified) => raw = verified,
+                            Err(error) => {
+                                let _ = self.base.store.fail_body_download_job(&candidate.message_id, &error.to_string());
+                                continue;
+                            }
+                        }
+                    }
                     match self.base.store.get_message(&candidate.message_id)? {
                         Some(message) if message.remote_version.as_deref() == Some("headers-only") => {}
                         _ => continue,
@@ -2313,7 +2300,7 @@ impl SyncWorker {
             .inner()
             .get_mailbox_status(&folder.remote_id)
             .await?;
-        let cursor = self.stored_imap_folder_cursor(folder);
+        let cursor = self.prepare_verified_imap_cursor(folder, self.stored_imap_folder_cursor(folder), status)?;
         let mut next_end = cursor.history_next_sequence.unwrap_or(status.exists);
         let page_limit = max_pages.unwrap_or(u32::MAX) as usize;
 
@@ -2420,7 +2407,7 @@ impl SyncWorker {
                 }
                 // 小页全部失败：返回错误让回填暂停（游标不推进），下轮再试，
                 // 避免"遍历完但一封没存却标记完成"的静默丢失。
-                if out.is_empty() && had_failure {
+                if had_failure {
                     return Err(PebbleError::Network(format!(
                         "History backfill page {start_seq}:{end_seq} for {} failed after small-page retry",
                         folder.name
@@ -2450,6 +2437,14 @@ impl SyncWorker {
             .iter()
             .map(|(uid, _)| uid.to_string())
             .collect();
+        let epoch = self.stored_imap_folder_cursor(folder).uidvalidity.unwrap_or(0);
+        if epoch != 0 && self.base.store.has_detached_imap_uid_match(&self.base.account_id, &folder.id, epoch, &all_remote_ids)? {
+            let current = self.provider.inner().get_mailbox_status(&folder.remote_id).await?;
+            if current.uid_validity.map(u64::from) != Some(epoch) {
+                return Err(PebbleError::Sync("IMAP UIDVALIDITY changed during mail fetch; retry next pass".into()));
+            }
+            self.base.store.restore_visible_history(&self.base.account_id, &folder.id, epoch, &all_remote_ids)?;
+        }
         let existing_ids = self
             .base
             .store
@@ -2496,22 +2491,6 @@ impl SyncWorker {
 
         let mut stored_count = 0u32;
 
-        // 按 Message-ID 去重：本地已存在的（如发送后本地存的 local-sent 副本）
-        // 服务器对应副本跳过，避免"已发送"出现两封一模一样的邮件。
-        let existing_message_ids = {
-            let headers: Vec<String> = parsed_messages
-                .iter()
-                .filter_map(|(_, res)| match res {
-                    Ok(p) => p.message_id_header.clone(),
-                    Err(_) => None,
-                })
-                .collect();
-            self.base
-                .store
-                .get_existing_message_ids(&self.base.account_id, &headers)
-                .unwrap_or_default()
-        };
-
         // Build the whole batch before touching SQLite. The old implementation
         // committed one transaction per message, which serialized every
         // header into its own writer lock and made large mailboxes crawl.
@@ -2537,44 +2516,6 @@ impl SyncWorker {
             };
 
             let now = now_timestamp();
-
-            // 跳过本地已存在相同 Message-ID 的服务器副本（如"已发送"重复）
-            if let Some(mid) = &parsed.message_id_header {
-                if existing_message_ids.contains(mid) {
-                    // A locally moved IMAP message is already associated with
-                    // the destination folder, but the server assigns it a new
-                    // UID there. Rebind that existing row instead of blindly
-                    // skipping this header. This also collapses duplicate rows
-                    // left by older move/reconcile cycles and wakes body fetch.
-                    if let Some(rebound_id) = self
-                        .base
-                        .store
-                        .rebind_message_remote_id_by_header_in_folder(
-                            &self.base.account_id,
-                            &folder.id,
-                            mid,
-                            &remote_id,
-                            None,
-                        )?
-                    {
-                        let _ = self.base.store.clear_sync_failure(
-                            &self.base.account_id,
-                            &folder.id,
-                            &remote_id,
-                        );
-                        info!(
-                            "Rebound moved IMAP message {} in {} to destination UID {}",
-                            rebound_id, folder.name, remote_id
-                        );
-                        continue;
-                    }
-                    debug!(
-                        "Message-ID {} already exists locally (account {}), skipping server copy",
-                        mid, self.base.account_id
-                    );
-                    continue;
-                }
-            }
 
             // Build a temporary message to compute thread_id
             let mut msg = Message {
@@ -2624,7 +2565,9 @@ impl SyncWorker {
             .map(|(_, msg, _, _)| (msg.clone(), vec![folder.id.clone()]))
             .collect();
 
-        if let Err(error) = self.base.store.insert_messages_batch(&batch) {
+        let (inserted, deferred) = match self.base.store.insert_imap_messages_batch(&batch) {
+            Ok(result) => result,
+            Err(error) => {
             let reason = error.to_string();
             for (uid, _, _, remote_id) in &pending {
                 let _ = self.base.store.upsert_sync_failure(
@@ -2637,9 +2580,22 @@ impl SyncWorker {
                 error!("Failed to store message UID {}: {}", uid, error);
             }
             return Ok(0);
+            }
+        };
+        let deferred: HashSet<String> = deferred.into_iter().collect();
+        for remote_id in &deferred {
+            self.base.store.upsert_sync_failure(&self.base.account_id, &folder.id, &remote_id,
+                "imap", "本地发送或移动任务仍在处理，等待任务结束后核对服务器副本")?;
         }
+        let inserted: HashSet<String> = inserted.into_iter().collect();
 
         for (_, msg, attachments, remote_id) in pending {
+            if !inserted.contains(&msg.id) {
+                if !deferred.contains(&remote_id) {
+                    self.base.store.clear_sync_failure(&self.base.account_id, &folder.id, &remote_id)?;
+                }
+                continue;
+            }
             stored_count += 1;
             let _ = self.base.store.clear_sync_failure(
                 &self.base.account_id,
@@ -2816,20 +2772,21 @@ impl SyncWorker {
         let cursor = self.try_imap_folder_cursor_for_sync(folder).await?;
         let since_uid = cursor.last_uid;
 
-        let count = if let Some(uid) = since_uid {
+        let (count, cursor) = if let Some(uid) = since_uid {
             // 先存头，再逐封尽力补全正文/附件；单封超时不阻塞整批新邮件。
-            self.sync_folder_headers_with_hydration(
+            (self.sync_folder_headers_with_hydration(
                 folder,
                 Some(uid),
                 HISTORY_PAGE_SIZE_FAST,
                 true,
             )
-                .await?
+                .await?, cursor)
         } else {
             // Folder was just added to the selection (or its cursor was
             // lost): backfill the full history before switching to
             // incremental polls.
-            self.sync_folder_history(folder, true).await?
+            let count = self.sync_folder_history(folder, false).await?;
+            (count, self.stored_imap_folder_cursor(folder))
         };
         if count > 0 {
             info!(
@@ -2844,7 +2801,7 @@ impl SyncWorker {
         Ok(())
     }
 
-    /// Reconcile a folder: detect flag changes and server-side deletions.
+    /// Reconcile a folder: detect flag changes and changes in visible UIDs.
     ///
     /// When the server supports CONDSTORE (RFC 4551), this method first checks
     /// the mailbox HIGHESTMODSEQ against the stored value. If they match, no
@@ -2880,15 +2837,16 @@ impl SyncWorker {
         if Self::is_local_folder(folder) {
             return Ok(());
         }
+        // A reused UID in a new epoch must not inherit the old local body.
+        let cursor = self.try_imap_folder_cursor_for_sync(folder).await?;
+        let expected_epoch = cursor.uidvalidity;
+        self.persist_imap_folder_cursor_after_sync(folder, cursor)?;
 
         // Step 1: Get local state
         let local_state = self
             .base
             .store
             .list_remote_ids_by_folder(&self.base.account_id, &folder.id)?;
-        if local_state.is_empty() {
-            return Ok(());
-        }
 
         // Read stored MODSEQ from this folder's cursor.
         let stored_modseq = self
@@ -2975,32 +2933,48 @@ impl SyncWorker {
             }
         }
 
-        // Step 6: Detect deletions (always — CONDSTORE doesn't cover expunges).
+        // Step 6: Reconcile visibility (CONDSTORE doesn't cover expunges).
         // EXISTS can stay unchanged when one message is expunged and another
         // is added, so compare UID sets whenever local state exists.
-        let server_exists = self
+        let (inventory, server_uids) = self
             .provider
             .inner()
-            .select_exists(&folder.remote_id)
+            .fetch_uid_inventory(&folder.remote_id)
             .await?;
-        if should_run_imap_deletion_diff(server_exists, local_state.len()) {
-            let server_uids = self
-                .provider
-                .inner()
-                .fetch_all_uids(&folder.remote_id)
-                .await?;
+        if should_run_imap_deletion_diff(inventory.exists, local_state.len()) {
+            if !valid_imap_uid_inventory(expected_epoch, inventory, &server_uids) {
+                return Err(PebbleError::Sync("IMAP inventory changed or was incomplete; local mail left unchanged, retry next pass".into()));
+            }
+            let epoch = expected_epoch.expect("inventory validated against a known epoch");
             let local_remote_ids: Vec<(String, String)> = local_state
                 .iter()
                 .map(|(id, rid, _, _, _)| (id.clone(), rid.clone()))
                 .collect();
-            let deleted = reconcile::detect_deletions(&local_remote_ids, &server_uids);
-            if !deleted.is_empty() {
-                info!(
-                    "Soft-deleting {} server-removed messages from {}",
-                    deleted.len(),
-                    folder.name
-                );
-                self.base.store.bulk_soft_delete(&deleted)?;
+            let absent = reconcile::detect_deletions(&local_remote_ids, &server_uids);
+            if !absent.is_empty() {
+                if matches!(folder.role, Some(pebble_core::FolderRole::Trash | pebble_core::FolderRole::Spam)) {
+                    self.base.store.bulk_soft_delete(&absent)?;
+                } else {
+                    let absent: HashSet<_> = absent.into_iter().collect();
+                    let missing_rows: Vec<_> = local_remote_ids.into_iter().filter(|(id, _)| absent.contains(id)).collect();
+                    self.base.store.detach_missing_imap_uids(&self.base.account_id, &folder.id, epoch, &missing_rows)?;
+                }
+            }
+            let mut local_uids: HashSet<u32> = local_state.iter().filter_map(|(_,uid,_,_,_)|uid.parse().ok()).collect();
+            if self.base.store.has_detached_imap_uids(&self.base.account_id, &folder.id, epoch)? {
+                let visible: Vec<_> = server_uids.iter().filter(|uid| !local_uids.contains(uid)).map(u32::to_string).collect();
+                if self.base.store.restore_visible_history(&self.base.account_id, &folder.id, epoch, &visible)? > 0 {
+                    local_uids = self.base.store.list_remote_ids_by_folder(&self.base.account_id, &folder.id)?
+                        .into_iter().filter_map(|(_,uid,_,_,_)|uid.parse().ok()).collect();
+                }
+            }
+            let missing: Vec<u32> = server_uids.iter().copied().filter(|uid|!local_uids.contains(uid)).take(50).collect();
+            if !missing.is_empty() {
+                let headers = self.provider.inner().fetch_headers_by_uids(&folder.remote_id, epoch as u32, &missing).await?;
+                for uid in missing.iter().filter(|uid|!headers.iter().any(|(found,_)|found==*uid)) {
+                    self.base.store.upsert_sync_failure(&self.base.account_id,&folder.id,&uid.to_string(),"imap","UID header missing from repair response")?;
+                }
+                self.store_fetched_messages(folder, headers, false, true).await?;
             }
         }
 
@@ -3530,9 +3504,8 @@ impl SyncWorker {
                                 if let Err(e) = self.reconcile_imap_folders().await {
                                     warn!("Manual folder list sync error for account {}: {}", self.base.account_id, e);
                                 }
-                                if let Err(e) = self.repair_historical_local_moves(200).await {
-                                    warn!("Manual historical move repair error for account {}: {}", self.base.account_id, e);
-                                }
+                                // No guessing a source mailbox by UID: numeric IDs
+                                // are valid only in the mailbox that assigned them.
                                 if let Err(e) = self
                                     .backfill_incomplete_history(HISTORY_BACKFILL_PAGES_PER_RUN)
                                     .await
@@ -3634,6 +3607,22 @@ mod tests {
     }
 
     #[test]
+    fn truncated_batch_mime_is_rejected_before_parsing() {
+        let error = verify_raw_message_size(42, b"body only", Some(1024)).unwrap_err();
+        assert!(error.to_string().contains("received 9 of 1024 bytes"));
+        assert!(verify_raw_message_size(42, &[0; 1024], Some(1024)).is_ok());
+        assert!(verify_raw_message_size(42, b"body only", None).is_ok());
+    }
+
+    #[test]
+    fn downloaded_mime_must_match_the_header_identity() {
+        assert!(verify_downloaded_message_identity(Some("<original@example.test>"), Some("<other@example.test>")).is_err());
+        assert!(verify_downloaded_message_identity(Some("<original@example.test>"), None).is_err());
+        assert!(verify_downloaded_message_identity(Some(" <original@example.test> "), Some("<original@example.test>")).is_ok());
+        assert!(verify_downloaded_message_identity(None, None).is_ok());
+    }
+
+    #[test]
     fn zero_poll_interval_is_manual_only() {
         let config = SyncConfig {
             poll_interval_secs: 0,
@@ -3717,8 +3706,20 @@ mod tests {
     }
 
     #[test]
-    fn imap_deletion_diff_skips_empty_local_state() {
-        assert!(!should_run_imap_deletion_diff(10, 0));
+    fn imap_inventory_repairs_empty_local_state_when_server_has_mail() {
+        assert!(should_run_imap_deletion_diff(10, 0));
+        assert!(!should_run_imap_deletion_diff(0, 0));
+    }
+
+    #[test]
+    fn imap_inventory_requires_matching_epoch_and_a_complete_consistent_uid_set() {
+        let status = crate::imap::ImapMailboxStatus { uid_validity: Some(17), uid_next: Some(104), exists: 2, ..Default::default() };
+        assert!(valid_imap_uid_inventory(Some(17), status, &[101, 103]));
+        assert!(!valid_imap_uid_inventory(Some(18), status, &[101, 103]));
+        assert!(!valid_imap_uid_inventory(None, status, &[101, 103]));
+        assert!(!valid_imap_uid_inventory(Some(17), status, &[101]));
+        assert!(!valid_imap_uid_inventory(Some(17), status, &[101, 101]));
+        assert!(!valid_imap_uid_inventory(Some(17), status, &[101, 104]));
     }
 
     #[test]

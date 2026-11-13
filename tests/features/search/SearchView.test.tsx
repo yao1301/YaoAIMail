@@ -1,8 +1,9 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SearchHit } from "../../../src/lib/api";
 import SearchView from "../../../src/features/search/SearchView";
 import { useUIStore } from "../../../src/stores/ui.store";
+import { deleteMessage } from "../../../src/lib/api";
 
 let searchResults: SearchHit[] = [];
 
@@ -52,6 +53,7 @@ vi.mock("@tanstack/react-virtual", () => ({
         start: index * 76,
       })),
     measureElement: vi.fn(),
+    measure: vi.fn(),
   }),
 }));
 
@@ -60,8 +62,8 @@ vi.mock("../../../src/features/search/SearchFilters", () => ({
 }));
 
 vi.mock("../../../src/features/search/SearchResultItem", () => ({
-  default: ({ hit, isSelected, onContextMenu }: { hit: SearchHit; isSelected: boolean; onContextMenu?: React.MouseEventHandler<HTMLDivElement> }) => (
-    <div role="option" aria-selected={isSelected} onContextMenu={onContextMenu}>
+  default: ({ hit, isSelected, onContextMenu, onClick }: { hit: SearchHit; isSelected: boolean; onContextMenu?: React.MouseEventHandler<HTMLDivElement>; onClick?: () => void }) => (
+    <div role="option" aria-selected={isSelected} onContextMenu={onContextMenu} onClick={onClick}>
       {hit.subject}
     </div>
   ),
@@ -72,7 +74,7 @@ vi.mock("../../../src/features/search/SearchMessageContextMenu", () => ({
 }));
 
 vi.mock("../../../src/components/MessageDetail", () => ({
-  default: () => <div>Message detail</div>,
+  default: ({ messageId }: { messageId: string }) => <div data-testid="message-detail">Message detail {messageId}</div>,
 }));
 
 describe("SearchView", () => {
@@ -80,6 +82,30 @@ describe("SearchView", () => {
     vi.clearAllMocks();
     searchResults = [];
     useUIStore.setState({ activeView: "search", searchQuery: "" });
+    vi.mocked(deleteMessage).mockReset().mockResolvedValue(undefined);
+  });
+
+  it("Delete advances to the next result in the displayed search order", async () => {
+    searchResults = [1, 2, 3].map(index => ({ message_id: `m-${index}`, subject: `Result ${index}`,
+      score: 1, snippet: "Body", from_address: "sender@example.test", date: index }));
+    render(<SearchView />);
+    fireEvent.click(screen.getByRole("option", { name: "Result 2" }));
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    await waitFor(() => expect(screen.getByTestId("message-detail").textContent).toContain("m-1"));
+    expect(deleteMessage).toHaveBeenCalledWith("m-2");
+  });
+
+  it("advances during a slow delete and restores the local search selection on failure", async () => {
+    let reject!: (reason: Error) => void;
+    vi.mocked(deleteMessage).mockImplementationOnce(() => new Promise<void>((_, fail) => { reject = fail; }));
+    searchResults = [1, 2, 3].map(index => ({ message_id: `m-${index}`, subject: `Result ${index}`,
+      score: 1, snippet: "Body", from_address: "sender@example.test", date: index }));
+    render(<SearchView />);
+    fireEvent.click(screen.getByRole("option", { name: "Result 2" }));
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    expect(screen.getByTestId("message-detail").textContent).toContain("m-1");
+    await act(async () => { reject(new Error("offline")); });
+    expect(screen.getByTestId("message-detail").textContent).toContain("m-2");
   });
 
   it("picks up context search queries while already mounted", () => {

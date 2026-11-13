@@ -4,6 +4,7 @@ use pebble_core::traits::{FolderProvider, LabelProvider};
 use pebble_core::{FolderRole, Message, PebbleError, ProviderType};
 use tauri::State;
 use tracing::{info, warn};
+use pebble_store::local_messages::is_local_message_id;
 
 use super::provider_dispatch::{parse_imap_uid, ConnectedProvider};
 use super::{
@@ -83,7 +84,7 @@ pub async fn archive_message(
         );
         let inbox = find_folder_by_role(&state, &msg.account_id, FolderRole::Inbox)?;
 
-        let local_only = source_folder.remote_id.starts_with("__local_")
+        let local_only = is_local_message_id(&msg.remote_id) || source_folder.remote_id.starts_with("__local_")
             || inbox.remote_id.starts_with("__local_");
         let outcome = if local_only {
             RemoteMutationOutcome::LocalOnly
@@ -255,7 +256,7 @@ pub async fn archive_message(
     // Try to find Archive folder; if not available, just soft-delete locally
     match find_folder_by_role(&state, &msg.account_id, FolderRole::Archive) {
         Ok(archive_folder) => {
-            let is_local = archive_folder.remote_id.starts_with("__local_");
+            let is_local = is_local_message_id(&msg.remote_id) || archive_folder.remote_id.starts_with("__local_");
             let outcome = if is_local {
                 RemoteMutationOutcome::LocalOnly
             } else {
@@ -507,14 +508,13 @@ pub async fn delete_message(
     // 本地消息（本地草稿/从未同步到服务器的邮件）没有服务器 remote_id，
     // 直接走本地删除；否则 remote_id 为空时 parse_imap_uid("") 会失败，
     // 表现为"删除失败"（草稿箱删不掉的根因）。
-    if msg.remote_id.is_empty() || msg.remote_id.starts_with("__local_") {
+    if is_local_message_id(&msg.remote_id) {
+        if !state.store.delete_local_message(&message_id, trash_folder.as_ref().map(|f|f.id.as_str()), is_permanent)? {
+            return Err(PebbleError::Sync("邮件刚完成同步，请刷新后重试删除".into()));
+        }
         if is_permanent {
-            state
-                .store
-                .hard_delete_messages(std::slice::from_ref(&message_id))?;
             remove_search_documents(&state, std::slice::from_ref(&message_id))?;
         } else {
-            state.store.soft_delete_message(&message_id)?;
             refresh_search_document(&state, &message_id)?;
         }
         return Ok(());
@@ -789,6 +789,14 @@ pub async fn restore_message(
 
     let inbox = find_folder_by_role(&state, &msg.account_id, FolderRole::Inbox)?;
 
+    if is_local_message_id(&msg.remote_id) {
+        if !state.store.restore_local_message(&message_id, &inbox.id)? {
+            return Err(PebbleError::Sync("邮件刚完成同步，请刷新后重试恢复".into()));
+        }
+        refresh_search_document(&state, &message_id)?;
+        return Ok(());
+    }
+
     let source_folder = find_message_folder(&state, &message_id, &msg.account_id).ok();
 
     let outcome = match provider_type {
@@ -992,7 +1000,7 @@ pub async fn move_to_folder(
             PebbleError::Internal(format!("Target folder not found: {target_folder_id}"))
         })?;
 
-    let is_local_move = source_folder.remote_id.starts_with("__local_")
+    let is_local_move = is_local_message_id(&msg.remote_id) || source_folder.remote_id.starts_with("__local_")
         || target_folder.remote_id.starts_with("__local_");
 
     let base_payload = || {
@@ -1170,11 +1178,9 @@ async fn empty_folder_impl(
         .map(|account| account.provider)
         .ok_or_else(|| PebbleError::Internal(format!("Account not found: {account_id}")))?;
 
-    let (conn, connect_error) =
-        match ConnectedProvider::connect(&state, &account_id, &provider_type).await {
-            Ok(conn) => (Some(conn), None),
-            Err(e) => (None, Some(e.to_string())),
-        };
+    let mut conn = None;
+    let mut connect_error = None;
+    let mut connection_attempted = false;
 
     let mut total_deleted: u32 = 0;
     const PAGE_SIZE: u32 = 500;
@@ -1185,6 +1191,29 @@ async fn empty_folder_impl(
             .list_messages_by_folder(&trash.id, PAGE_SIZE, 0)?;
         if messages.is_empty() {
             break;
+        }
+
+        let page_len = messages.len();
+        let mut remote_messages = Vec::new();
+        let mut local_ids = Vec::new();
+        for message in messages {
+            if is_local_message_id(&message.remote_id) {
+                if !state.store.delete_local_message(&message.id, None, true)? {
+                    return Err(PebbleError::Sync("邮件刚完成同步，请刷新后重试清空".into()));
+                }
+                local_ids.push(message.id);
+            } else { remote_messages.push(message); }
+        }
+        remove_search_documents(&state, &local_ids)?;
+        total_deleted += local_ids.len() as u32;
+        let messages = remote_messages;
+        if messages.is_empty() { if page_len < PAGE_SIZE as usize { break; } else { continue; } }
+        if !connection_attempted {
+            connection_attempted = true;
+            match ConnectedProvider::connect(&state, &account_id, &provider_type).await {
+                Ok(provider) => conn = Some(provider),
+                Err(error) => connect_error = Some(error.to_string()),
+            }
         }
 
         let mut ids_to_delete: Vec<String> = Vec::new();
@@ -1298,7 +1327,7 @@ async fn empty_folder_impl(
         remove_search_documents(&state, &ids_to_delete)?;
         total_deleted += batch_count;
 
-        if batch_count < PAGE_SIZE {
+        if page_len < PAGE_SIZE as usize {
             break;
         }
     }

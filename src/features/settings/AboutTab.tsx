@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
+import { useEffect, useRef } from "react";
 import type { ReactNode, Ref } from "react";
 import { useTranslation } from "react-i18next";
 import { getVersion } from "@tauri-apps/api/app";
@@ -7,19 +8,7 @@ import { Copy, RefreshCw, X } from "lucide-react";
 import iconUrl from "@/assets/app-icon.png";
 import { readAppLog, type AppLogSnapshot } from "@/lib/api";
 
-const REPO = "QingJ01/Pebble";
-const RELEASES_URL = `https://github.com/${REPO}/releases`;
-
-function openUrl(url: string) {
-  invoke("open_external_url", { url }).catch((err) => console.warn("Failed to open external URL", err));
-}
-
-interface UpdateState {
-  status: "idle" | "checking" | "latest" | "available" | "error";
-  latestVersion?: string;
-  releaseUrl?: string;
-  error?: string;
-}
+const DOWNLOAD_URL = "https://yaowaimao.com/zh/ai-mail#download";
 
 type DiagnosticLogState =
   | { status: "loading" }
@@ -32,13 +21,12 @@ const DIAGNOSTIC_LOG_MAX_BYTES = 64 * 1024;
 
 export default function AboutTab() {
   const { t } = useTranslation();
-  const [appVersion, setAppVersion] = useState<string>("");
-  const [update, setUpdate] = useState<UpdateState>({ status: "idle" });
-  const [diagnosticLog, setDiagnosticLog] = useState<DiagnosticLogState | null>(null);
+  const [appVersion, setAppVersion] = useWorkspaceState<string>("src/features/settings/AboutTab.tsx:AboutTab:appVersion", "");
+  const [diagnosticLog, setDiagnosticLog] = useWorkspaceState<DiagnosticLogState | null>("src/features/settings/AboutTab.tsx:AboutTab:diagnosticLog", null);
   const diagnosticClickCount = useRef(0);
   const diagnosticClickTimer = useRef<number | null>(null);
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/AboutTab.tsx:", () => {
     getVersion().then(setAppVersion).catch(() => setAppVersion("0.1.3"));
   }, []);
 
@@ -47,31 +35,6 @@ export default function AboutTab() {
       window.clearTimeout(diagnosticClickTimer.current);
     }
   }, []);
-
-  async function handleCheckUpdate() {
-    setUpdate({ status: "checking" });
-    try {
-      const info = await invoke<{
-        latest_version: string;
-        release_url: string;
-        is_newer: boolean;
-      }>("check_for_update", { currentVersion: appVersion });
-      if (info.is_newer) {
-        setUpdate({
-          status: "available",
-          latestVersion: info.latest_version,
-          releaseUrl: info.release_url,
-        });
-      } else {
-        setUpdate({ status: "latest", latestVersion: info.latest_version });
-      }
-    } catch (err) {
-      setUpdate({
-        status: "error",
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
 
   async function loadDiagnosticLog() {
     setDiagnosticLog({ status: "loading" });
@@ -155,160 +118,53 @@ export default function AboutTab() {
           </div>
         </div>
 
-        <p style={{ fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.7, margin: "0 0 8px" }}>
-          {t(
-            "about.description",
-            "A local-first desktop email client built with Rust and React. Mail, search index, and attachments stay on your device. No telemetry. Outbound traffic happens only when you use a feature that requires it: mail sync with your provider, translation (sends the selected text to the service you configure), or WebDAV settings backup (runs against the server you provide).",
-          )}
+        <p style={{ fontSize: "14px", fontWeight: 600, color: "var(--color-text-primary)", margin: "0 0 8px" }}>
+          {t("about.description")}
         </p>
-        <p style={{ fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.7, margin: "0 0 8px" }}>
-          {t(
-            "about.features",
-            "Supports Gmail, Outlook (experimental), IMAP, and POP3 accounts. Includes Kanban board, full-text search, snooze, rules engine, built-in translation, and WebDAV settings backup.",
-          )}
-        </p>
+        <div style={{ display: "grid", gap: "6px", fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.7, marginBottom: "12px" }}>
+          <p style={{ margin: 0 }}>{t("about.mailWorkflow")}</p>
+          <p style={{ margin: 0 }}>{t("about.aiWriting")}</p>
+          <p style={{ margin: 0 }}>{t("about.customerWorkflow")}</p>
+        </div>
         <p style={{ fontSize: "12px", color: "var(--color-text-tertiary, var(--color-text-secondary))", lineHeight: 1.5, margin: 0 }}>
-          {t("about.license", "Open source under AGPL-3.0 license.")}
-        </p>
-        <p style={{ fontSize: "12px", color: "var(--color-text-tertiary, var(--color-text-secondary))", lineHeight: 1.5, margin: "8px 0 0" }}>
-          本产品（YaoAIMail）基于开源项目 Pebble（AGPL-3.0，原作者 QingJ01）二次开发而来，
-          保留原项目版权；本产品在原项目基础上新增外贸业务功能（客户管理、开发客户、AI 写作、
-          地址本/客户按账号归属等），修改代码同样遵循 AGPL-3.0 协议开源。
+          {t("about.license")}
         </p>
       </div>
 
-      {/* Check for updates */}
-      <div style={{ marginBottom: "24px" }}>
-        <h3
-          style={{
-            fontSize: "14px",
-            fontWeight: 600,
-            color: "var(--color-text-primary)",
-            marginTop: 0,
-            marginBottom: "12px",
-          }}
-        >
+      <section aria-labelledby="about-privacy-ai" style={{ marginBottom: "24px", padding: "14px 16px", border: "1px solid var(--color-border)", borderRadius: "8px" }}>
+        <h3 id="about-privacy-ai" style={{ margin: "0 0 8px", fontSize: "14px", fontWeight: 600, color: "var(--color-text-primary)" }}>
+          {t("about.privacyAiTitle", "Privacy and AI use")}
+        </h3>
+        <p style={{ margin: 0, fontSize: "13px", lineHeight: 1.8, color: "var(--color-text-secondary)" }}>
+          {t("about.privacyAiNotice", "Mail and attachments are stored on your device. When you use AI features, relevant emails, instructions, and reference materials are sent to the AI service provider you configure. Follow your organization's rules for data and AI use.")}
+        </p>
+      </section>
+
+      <section aria-labelledby="about-updates" style={{ marginBottom: "24px" }}>
+        <h3 id="about-updates" style={{ fontSize: "14px", fontWeight: 600, color: "var(--color-text-primary)", margin: "0 0 12px" }}>
           {t("about.updates", "Updates")}
         </h3>
-
-        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-          <button
-            onClick={handleCheckUpdate}
-            disabled={update.status === "checking"}
-            style={{
-              padding: "8px 18px",
-              fontSize: "13px",
-              fontWeight: 500,
-              border: "1px solid var(--color-border)",
-              borderRadius: "6px",
-              backgroundColor: "var(--color-bg-hover)",
-              color: "var(--color-text-primary)",
-              cursor: update.status === "checking" ? "wait" : "pointer",
-              opacity: update.status === "checking" ? 0.6 : 1,
-            }}
-          >
-            {update.status === "checking"
-              ? t("about.checking", "Checking...")
-              : t("about.checkUpdate", "Check for updates")}
-          </button>
-
-          {update.status === "latest" && (
-            <span style={{ fontSize: "13px", color: "#22c55e" }}>
-              {t("about.upToDate", "You're on the latest version")}
-            </span>
-          )}
-        </div>
-
-        {update.status === "available" && (
-          <div
-            style={{
-              marginTop: "12px",
-              padding: "12px 14px",
-              borderRadius: "6px",
-              backgroundColor: "rgba(59, 130, 246, 0.08)",
-              border: "1px solid rgba(59, 130, 246, 0.2)",
-              fontSize: "13px",
-              color: "var(--color-text-primary)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-            }}
-          >
-            <span>
-              {t("about.newVersion", "New version available: {{version}}", {
-                version: update.latestVersion,
-              })}
-            </span>
-            <button
-              onClick={() => openUrl(update.releaseUrl || RELEASES_URL)}
-              style={{
-                padding: "6px 14px",
-                fontSize: "12px",
-                fontWeight: 500,
-                border: "none",
-                borderRadius: "6px",
-                backgroundColor: "var(--color-accent, #3b82f6)",
-                color: "#fff",
-                cursor: "pointer",
-              }}
-            >
-              {t("about.download", "Download")}
-            </button>
-          </div>
-        )}
-
-        {update.status === "error" && (
-          <div
-            style={{
-              marginTop: "12px",
-              padding: "10px 14px",
-              borderRadius: "6px",
-              backgroundColor: "rgba(220, 53, 69, 0.1)",
-              border: "1px solid rgba(220, 53, 69, 0.3)",
-              fontSize: "13px",
-              color: "#dc3545",
-            }}
-          >
-            {t("about.checkFailed", "Failed to check for updates")}: {update.error}
-          </div>
-        )}
-      </div>
-
-      {/* Links */}
-      <div>
-        <h3
+        <button
+          type="button"
+          onClick={() => {
+            void invoke("open_external_url", { url: DOWNLOAD_URL }).catch((error) => {
+              console.warn("Failed to open the official download page", error);
+            });
+          }}
           style={{
-            fontSize: "14px",
-            fontWeight: 600,
+            padding: "8px 18px",
+            fontSize: "13px",
+            fontWeight: 500,
+            border: "1px solid var(--color-border)",
+            borderRadius: "6px",
+            backgroundColor: "var(--color-bg-hover)",
             color: "var(--color-text-primary)",
-            marginTop: 0,
-            marginBottom: "12px",
+            cursor: "pointer",
           }}
         >
-          {t("about.links", "Links")}
-        </h3>
-        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-          {[
-            { label: "GitHub Releases", url: RELEASES_URL },
-            { label: t("about.sourceCode", "Source Code"), url: `https://github.com/${REPO}` },
-            { label: t("about.reportIssue", "Report an Issue"), url: `https://github.com/${REPO}/issues` },
-          ].map((link) => (
-            <a
-              key={link.url}
-              href={link.url}
-              onClick={(e) => { e.preventDefault(); openUrl(link.url); }}
-              style={{
-                fontSize: "13px",
-                color: "var(--color-accent, #3b82f6)",
-                textDecoration: "none",
-                cursor: "pointer",
-              }}
-            >
-              {link.label}
-            </a>
-          ))}
-        </div>
-      </div>
+          {t("about.downloadUpdate")}
+        </button>
+      </section>
 
       {diagnosticLog && (
         <DiagnosticLogDialog

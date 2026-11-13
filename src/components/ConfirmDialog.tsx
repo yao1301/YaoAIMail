@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 interface Props {
@@ -9,6 +9,11 @@ interface Props {
   destructive?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
+  alternateLabel?: string;
+  onAlternate?: () => void;
+  busy?: boolean;
+  busyLabel?: string;
+  children?: ReactNode;
 }
 
 function getFocusableElements(container: HTMLElement | null): HTMLElement[] {
@@ -31,6 +36,11 @@ export default function ConfirmDialog({
   destructive,
   onConfirm,
   onCancel,
+  alternateLabel,
+  onAlternate,
+  busy = false,
+  busyLabel,
+  children,
 }: Props) {
   const { t } = useTranslation();
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -38,6 +48,8 @@ export default function ConfirmDialog({
   const cancelRef = useRef<HTMLButtonElement>(null);
   const onConfirmRef = useRef(onConfirm);
   const onCancelRef = useRef(onCancel);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
 
   useEffect(() => { onConfirmRef.current = onConfirm; }, [onConfirm]);
   useEffect(() => { onCancelRef.current = onCancel; }, [onCancel]);
@@ -56,6 +68,7 @@ export default function ConfirmDialog({
     function handleKey(e: KeyboardEvent) {
       if (e.key === "Escape") {
         e.preventDefault();
+        if (busyRef.current) return;
         onCancelRef.current();
         return;
       }
@@ -106,6 +119,8 @@ export default function ConfirmDialog({
         ref={dialogRef}
         style={{
           width: "380px",
+          maxWidth: 'calc(100vw - 32px)',
+          maxHeight: 'calc(100vh - 48px)',
           backgroundColor: "var(--color-sidebar-bg)",
           color: "var(--color-text-primary)",
           border: "1px solid var(--color-border)",
@@ -125,14 +140,16 @@ export default function ConfirmDialog({
         </h3>
         <p
           id="confirm-dialog-message"
-          style={{ margin: 0, fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.5, whiteSpace: "pre-wrap" }}
+          style={{ margin: 0, fontSize: "13px", color: "var(--color-text-secondary)", lineHeight: 1.5, whiteSpace: "pre-wrap", maxHeight: '50vh', overflow: 'auto', overflowWrap: 'anywhere' }}
         >
           {message}
         </p>
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+        {children}
+        <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: "8px" }}>
           <button
             ref={cancelRef}
             onClick={onCancel}
+            disabled={busy}
             style={{
               padding: "7px 16px",
               borderRadius: "6px",
@@ -148,6 +165,7 @@ export default function ConfirmDialog({
           <button
             ref={confirmRef}
             onClick={onConfirm}
+            disabled={busy}
             style={{
               padding: "7px 16px",
               borderRadius: "6px",
@@ -159,8 +177,12 @@ export default function ConfirmDialog({
               cursor: "pointer",
             }}
           >
-            {confirmLabel || t("common.confirm", "Confirm")}
+            {(busy && busyLabel) || confirmLabel || t("common.confirm", "Confirm")}
           </button>
+          {alternateLabel && onAlternate && <button type="button" onClick={onAlternate} disabled={busy}
+            style={{ padding: '7px 16px', borderRadius: 6, border: 'none', backgroundColor: 'var(--color-accent)', color: '#fff', fontSize: 13, fontWeight: 600, cursor: busy ? 'wait' : 'pointer' }}>
+            {busy ? busyLabel ?? t('compose.savingDraft', '正在保存…') : alternateLabel}
+          </button>}
         </div>
       </div>
     </div>

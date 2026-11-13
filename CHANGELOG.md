@@ -1,12 +1,274 @@
 # Changelog
 
-All notable changes to Pebble will be documented in this file.
+All notable changes to YaoAIMail are documented in this file. YaoAIMail is a
+Windows desktop mail client for cross-border B2B sellers, developed as a fork of
+[QingJ01/Pebble](https://github.com/QingJ01/Pebble) and released under
+[AGPL-3.0](./LICENSE).
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses semantic version tags.
 
 Chinese version: [CHANGELOG.zh-CN.md](./CHANGELOG.zh-CN.md).
 
 ## [Unreleased]
+
+## [1.1.43] - 2026-11-13
+
+### Reading
+
+- Links in a message body now show their target site first and let you choose: open in your default browser, or preview inside the app. Keyboard activation, middle-click and the link context menu all use the same path. Address links still start a new message, and a body link can never navigate a mail window to an address belonging to the app itself.
+- The in-app preview runs in its own titled window with separate browser data and no access to mail-window permissions, and it blocks third-party sub-windows and downloads. Sites that need a login or a download, and intranet addresses, open in the default browser instead.
+
+### Mail reliability
+
+- Downloaded mail now stays in its original folder. The auto-created "Local History" folder from earlier versions is migrated on startup: messages return to their own folder, or to a normal archive folder when that folder no longer exists, keeping body, attachments and deletion state. Folders you created yourself are never matched by display name.
+- A message that is absent from the server's current UID list keeps its local copy, body and attachments; only its server identifier is retired. An incomplete or missing list is never used as proof of deletion, and the link is restored only after the same identifier reappears under the same account, folder and UIDVALIDITY.
+- Read and star changes now apply locally when a message has no verified server identifier yet, instead of failing immediately and retrying in the background. Obsolete retries are finished at startup and current local flags are kept; a local id recorded earlier is never replayed against a server id the message later receives.
+
+### Settings
+
+- Preferences saved in a detached settings window now reach the main, reading and compose windows: theme, fonts, font size, background image, language, receive mode, notifications, tray behaviour, unread count, shortcuts and mail image privacy. A compose window follows the AI writing defaults while keeping options you picked by hand for the current draft.
+- Account, sync-folder, filter-rule, trusted-sender and backup-restore changes refresh in every window. Refresh messages carry only a change marker; configuration values, keys and mail are never broadcast between windows.
+
+### Work roles and About
+
+- The work role settings now offer ready-made examples for general foreign trade, customer development, order follow-up and trade management, each pre-filled with a job title, responsibilities and writing preferences that you can adjust.
+- The About page now describes the product as a mail and order follow-up, multilingual AI writing, customer development and customer management client. It keeps the privacy note and the Pebble / AGPL-3.0 credit, drops the old in-app GitHub update check, and the update button opens the official download page at https://yaowaimao.com/zh/ai-mail#download.
+
+## [1.1.42] - 2026-11-08
+
+Personal edition. Commercial account and credit integration is archived and is
+not part of this build: the app uses the providers you configure yourself, with
+no YaoAI account, credits or unlock required.
+
+### Added
+
+- Account matters overview: a single-round summary built from local evidence, with background refresh when the app starts.
+- DeepSeek Search and Fetch support in lead development and company research, with an explicit consent step before a paid authorization is used.
+- A lightweight logistics query module in the foreign-trade toolbox.
+- Rotating startup tips, and an AI privacy note on the About page.
+
+### Fixed
+
+- New-mail notifications are attributed to the right account, and no longer reappear briefly after a filter archives the message.
+- Single-record deletion of an externally configured API no longer fails, and the onboarding flow is complete.
+
+### Changed
+
+- Dead entries in the foreign-trade toolbox are fixed; logistics querying was audited and consolidated into one module instead of several inconsistent entry points.
+
+## [1.1.41] - 2026-11-03
+
+### Mail and draft reliability
+
+- Separate the internal account nickname from the outward sender name. Queued messages retain their original sender identity and pause with a clear warning if the configured identity no longer matches.
+- Improve draft saving, save-and-close behavior and delivery of generated AI content to the correct draft.
+- Repair IMAP selected-folder cache handling behind UIDVALIDITY, message-size and body-fetch errors; reconcile missing-body jobs that were incorrectly marked complete.
+
+### AI and workspace windows
+
+- Support multiple model IDs under one custom provider configuration, with optional model-list discovery and manual entry as a fallback.
+- Improve detaching lead research, credit research and compose tabs into windows, including progress feedback and safer background-task handoff.
+- Fix the startup failure caused by accessing `lazy` before initialization.
+
+### Distribution
+
+- Provide a six-file Windows share ZIP and the exact modified source archive separately. Neither package includes mailbox data, API credentials, attachments, logs, private input history or the personal portable `data` directory.
+- No test email was sent and the personal portable installation was not replaced.
+
+## [1.1.40] - 2026-11-01
+
+### Mail reliability
+
+- Persist outgoing mail before SMTP submission. A send is complete only after provider acceptance and local filing stages finish.
+- Retry only local filing, rules and indexing after provider acceptance; pause uncertain sends instead of resubmitting them automatically.
+- Add account-scoped handling for confirmed sent records and clearer account attribution for pending-mail errors.
+- Prevent a slow SMTP QUIT response from turning an already accepted message into a misleading send failure.
+- Repair small remote-history gaps and partial-folder sync handling while preserving local history outside the server-visible range.
+
+### Usability
+
+- Allow dragging an existing message into a draft AI instruction field as context; unify reference-file processing and errors.
+- Improve draft status, next-message navigation after deletion, retained search tabs, account ordering and folder boundaries.
+- Show which account an email-operation error belongs to.
+
+### Distribution
+
+- Supply the binary package with its exact modified source archive. The package excludes personal mail, attachments, credentials, browser data, logs and input history.
+- New send protections do not resend older messages. Previously confirmed queue records were handled separately in the local profile.
+
+## [1.1.39] - 2026-10-27
+
+### Customer profile
+
+- Separate public-company research from customer correspondence so recent email volume no longer crowds out business details.
+- Read bounded passages from longer pages and directories. Model citations resolve to the actual passage reviewed by the app.
+- Keep the previous detailed profile when a refresh fails or would discard substantially more information. A saved historical profile is not presented as newly verified.
+
+### Mail and AI workspace
+
+- Advance to the next message after deleting the current one, and preserve search results when switching tabs.
+- Use one file-reading path across the home workbench, AI writing and message instructions. Added or dropped files provide extracted contents to the model, with clear errors for unreadable or out-of-range files.
+- Refine the reference-file control in the message instruction panel.
+
+### Distribution
+
+- Ship the binary and its exact modified source archive together. The public package excludes private mail, API credentials, personal input history and user data.
+- Profile and public-search results still depend on accessible sources and the configured model. A citation provides traceability, not independent verification.
+
+## [1.1.38] - 2026-10-25
+
+### Added and improved
+
+- Confirmable workbench actions for extracting drafts, organizing selected mail and scheduling saved drafts while the application is running online.
+- Shared document reading through the existing three AI instruction inputs; preserve reply headers and isolate late results across messages and accounts.
+- Unified customer profile refresh from scoped correspondence and public sources, with visible CRM status, characteristics and follow-up plans.
+- Prospect email prechecks, optional manual verification, evidence and correspondence feedback; simpler saved search conditions. Cross-industry quality and full result pages remain subject to source and model limitations.
+- Per-model proxy choice using one shared proxy configuration, clearer connection tests and visible held-send failures.
+- Single and batch draft sending with shared validation, confirmation and duplicate protection, preserving HTML tables and attachments. Draft status appears only in list rows; toolbar actions use consistent icons.
+- Removed redundant document-draft buttons and retained historical quote-card rendering and sent-message editing fixes.
+
+## [1.1.37] - 2026-10-18
+
+### Added and improved
+
+- Multi-source, multilingual company research with evidence-grounded follow-up, registry records, complete reports, retained snapshots and explicit coverage boundaries.
+- Compact prospect deliveries, reusable task context and concise native progress; improved assistant intent handling, account overviews and model configuration.
+- Preserve historical quote cards and the accumulated mail rendering and editing improvements.
+
+### Release safety
+
+- Anonymized regression fixtures and prevented release builds from implicitly embedding local dotenv settings. User profiles, credentials, mail and input history are not distributed.
+- Removed a legacy fallback's fixed industry relevance vocabulary; it now uses the current task's product and requested buyer-role terms, with cross-industry regression coverage.
+- Unavailable sources and incomplete screening remain explicit; limited name screening is not comprehensive credit or compliance clearance.
+
+## [1.1.36] - 2026-09-22
+
+### Fixed
+
+- Fixed Outlook replies copying the generated quote marker onto tables, cells and text blocks, which made sender and recipient fields render as multiple oversized rounded cards. Only structurally valid outer quote containers are now carded; existing messages recover when reopened without rewriting the mail database.
+
+## [1.1.35] - 2026-09-21
+
+### Fixed
+
+- Fixed system folders (Sent, Drafts, Junk, Trash) being wrongly nested under Inbox for accounts whose server uses the INBOX.-prefixed naming (e.g. INBOX.Sent). Wrongly nested folders heal automatically on the next sync; user-created folder hierarchies are unaffected.
+
+### Changed
+
+- Customer profile detail now grows with its content: long profiles are laid out in full instead of scrolling many screens inside a small fixed-height box.
+- The settings shortcuts page now lists previously hidden fixed global shortcuts: compose new mail (Ctrl+N), reply (Ctrl+R), reply all (Ctrl+Shift+R), forward (Ctrl+F), focus search (Ctrl+K), open settings (Ctrl+,).
+- New compose-window shortcut Ctrl+Enter sends the current email immediately, using the same validation as the send button.
+
+### Removed
+
+- Removed the "Competitor Watch" feature from company research.
+
+## [1.1.34] - 2026-09-14
+
+### Fixed
+
+- Fixed inline images (signature logos, embedded pictures) from the original message being lost or broken in reply, reply-all and forward quotes. References are now resolved to local data before the compose editor opens; all three paths are covered.
+- Fixed embedded images such as pasted screenshots not rendering in some receiving clients (Outlook, Gmail): outgoing HTML data URIs are converted to standard inline MIME parts with Content-ID on send.
+- Fixed inline images missing in the local "Sent" folder: the local archive now matches what was actually sent, keeping all embedded images viewable.
+
+## [1.1.33] - 2026-09-13
+
+### Fixed
+
+- Fixed packaged builds stripping all sender styling from email bodies (tables, colors, fonts, alignment falling back to plain browser defaults while the Dev build looked correct). Tauri's build-time CSP modification injected a nonce into style-src, which per the CSP specification disables 'unsafe-inline', so inline styles inside the email Shadow DOM were blocked entirely. `dangerousDisableAssetCspModification: ["style-src"]` is now set; all other CSP directives are unchanged.
+
+## [1.1.32] - 2026-09-13
+
+### Changed
+
+- Historical reply content from Outlook, NetEase, Zoho, Gmail, Yahoo and other standard business email formats is normalized into consistent cards inside the final email Shadow DOM. Fixed-width notification layouts and oversized images are constrained to the reading area without rewriting stored mail.
+- WPS/Excel clipboard ranges are pasted as editable HTML tables instead of local-only images. Cell colors, fonts, borders, alignment, merged cells, fixed layout and source column widths survive the compose editor and outgoing HTML.
+- Account editing shows the saved IMAP/POP3/SMTP host, username, security and port values. Standard ports update automatically when protocol or transport security changes; saved passwords remain hidden and unchanged unless replaced.
+- "Send new mail to the same recipients" now copies the original To, Cc and Bcc fields, with case-insensitive de-duplication across roles.
+
+### Fixed
+
+- Fixed WPS tables with empty cells or style-only spacer rows being rejected so that paste appeared to do nothing. The paste path now falls back to basic HTML or safe plain text instead of silently swallowing clipboard content.
+- Preserved the complete historical-message card presentation in production builds, including nested original-message headers, metadata sections, body padding, borders and image-size limits.
+
+## [1.1.31] - 2026-09-09
+
+Personal portable edition; no public share ZIP was issued for this version.
+
+### Added
+
+- Portable personal mode: when the profile folder contains a `portable-key` file, account credentials, API keys, model settings and other encrypted user data use a key stored inside that folder, so the application and its `data` directory can be copied to another machine as one folder. The public build keeps using the Windows credential store and is unchanged.
+- WebView2 data (local storage, session storage, cache and interface preferences) is now bound to an absolute folder inside the profile, so a moved installation no longer depends on paths from the original computer.
+
+### Fixed
+
+- The account dialog now fills standard ports automatically: IMAP 993/143, POP3 995/110, SMTP 465/587/25, following the protocol and the selected transport security.
+- Editing an existing account shows the saved IMAP / POP3 / SMTP host, port, login user name, security mode, certificate policy and proxy settings again, instead of appearing empty. A failed read is reported in the dialog rather than silently shown as blank fields, and saved passwords stay hidden and unchanged unless replaced.
+
+## [1.1.30] - 2026-09-06
+
+### Added
+
+- "Send new mail to the same recipients" from the message context menu now copies the original To, Cc and Bcc fields, de-duplicating addresses across all three roles.
+
+## [1.1.29] - 2026-09-03
+
+### Fixed
+
+- Zoho `Original:` blocks (`isReplyContent`) that keep the title, the From/Date/To/Subject metadata list and the following body inside one wrapper are now split into a card title, a metadata header and a body, with nested original quotes recognized as nested cards. A `compose-original-quote` also takes its leading "date + wrote" line as the header instead of rendering an outer frame with no padding.
+- Dash-delimited reply headers, common in Foxmail and mobile clients, are recognized only when at least five hyphens, sender and recipient fields, a subject and a date or address, and a following quote block are all present. This covers real missed cases without carding ordinary system notifications.
+
+### Changed
+
+- Images are limited to the reading width and to `min(70vh, 720px)` in height. Trusted widths are kept, height-only small images keep their height, and images without reliable dimensions scale proportionally.
+
+### Notes
+
+- Audited all 5,294 non-deleted messages in a local mailbox: 1,369 carry reply relations with quote signals across Outlook, NetEase, Gmail, Zoho, Yahoo, `isReplyContent`, `compose-original-quote`, standard cite blocks and dash-delimited headers. Five remaining candidates were reviewed one by one; three were genuine misses and two were correctly left uncarded.
+
+## [1.1.28] - 2026-09-03
+
+### Fixed
+
+- Historical quote cards were detected but rendered with a transparent background, 0px border, 0px padding and 0px margin in packaged builds. Styles were previously applied to a detached tree and then serialized to HTML, and the production WebView2 discarded them during that `innerHTML` parse. Card borders, background, spacing and colours are now written directly to the final nodes inside the live Shadow DOM, with `!important`, after the HTML has been inserted. Stored mail in the server or the local database is still not rewritten.
+
+## [1.1.27] - 2026-09-02
+
+### Fixed
+
+- Inline card styles were added to the generated card HTML. The cards became visible in the Dev build but still rendered as plain text in packaged builds; see 1.1.28 for the root cause and the final fix.
+
+## [1.1.26] - 2026-09-02
+
+### Fixed
+
+- Packaged builds did not show historical quote cards even though the same code worked in development. The production WebView can reorganize complex Outlook, NetEase and Zoho tables and nested nodes while inserting mail HTML, which happened before the carding function ran. Carding and common wrapper-table detection now complete in a detached DOM first, and the finished HTML is written into the Shadow DOM once.
+
+## [1.1.25] - 2026-09-02
+
+### Added
+
+- "Re-download message": fetch the full original MIME again and rebuild the body, HTML, attachments and search index for one message.
+
+### Fixed
+
+- Historical reply recognition no longer depends on Outlook, NetEase, Zoho, Gmail or Yahoo class and id markers, which are often lost when mail is re-synced or sanitized. A generic From/Sent/To/Subject header, the `On … wrote:` and `在…写道：` forms, `blockquote[type=cite]` and the client-specific structures are all recognized, so cards work across folders, accounts and sender domains. Plain-text mail is always wrapped with `textContent` and is never interpreted as executable HTML.
+- Large IMAP messages whose parts arrive separately no longer lose their attachments or mark the download as complete too early.
+- Non-image files with a Content-ID, such as PDFs, are no longer treated as inline content and are shown and downloadable as real attachments.
+- The "All unread" count now covers inbox, archive and custom folders and excludes junk mail, and the tab can be closed directly.
+
+### Changed
+
+- Custom model providers take a full Chat Completions endpoint, and old root-address configurations keep working. Nested provider errors are shown as readable messages and B.AI request parameters are supplied.
+
+## [1.1.24] - 2026-09-01
+
+### Changed
+
+- Address book multi-select works by clicking the name, e-mail or company text itself. Batch commands appear only while contacts are selected and stay pinned under the filter area, so long lists can be handled without scrolling back up.
+- An AI-generated new message takes its subject from the title bar, and a reply no longer generates or overwrites the subject. Send and cancel are moved closer to the writing area.
+- AI drafts use your default signature first, keep its formatting and appear only once. Generated text is converted to mail rich text, so raw Markdown markers such as `**` and `##` are no longer visible.
+- The model dropdown separates built-in providers from your custom models, and custom models can be added without a limit.
 
 ## [1.1.23] - 2026-08-29
 
@@ -459,7 +721,16 @@ This release includes:
 - Windows installers are not code-signed yet, so Windows SmartScreen may show a warning.
 - Outlook support is still experimental and depends on Microsoft Graph permissions configured by the user.
 
-[Unreleased]: https://github.com/QingJ01/Pebble/compare/v1.1.21...HEAD
+[Unreleased]: https://github.com/QingJ01/Pebble/compare/v1.1.40...HEAD
+[1.1.40]: https://github.com/QingJ01/Pebble/compare/v1.1.39...v1.1.40
+[1.1.39]: https://github.com/QingJ01/Pebble/compare/v1.1.38...v1.1.39
+[1.1.38]: https://github.com/QingJ01/Pebble/compare/v1.1.37...v1.1.38
+[1.1.37]: https://github.com/QingJ01/Pebble/compare/v1.1.36...v1.1.37
+[1.1.36]: https://github.com/QingJ01/Pebble/compare/v1.1.35...v1.1.36
+[1.1.35]: https://github.com/QingJ01/Pebble/compare/v1.1.34...v1.1.35
+[1.1.34]: https://github.com/QingJ01/Pebble/compare/v1.1.33...v1.1.34
+[1.1.33]: https://github.com/QingJ01/Pebble/compare/v1.1.32...v1.1.33
+[1.1.32]: https://github.com/QingJ01/Pebble/compare/v1.1.23...v1.1.32
 [1.1.21]: https://github.com/QingJ01/Pebble/compare/v1.1.1...v1.1.21
 [1.1.1]: https://github.com/QingJ01/Pebble/compare/v0.1.3...v1.1.1
 [0.1.3]: https://github.com/QingJ01/Pebble/compare/v0.1.2...v0.1.3

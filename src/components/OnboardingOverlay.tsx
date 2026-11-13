@@ -1,45 +1,88 @@
 import { useCallback, useEffect, useState } from "react";
-import { Inbox, FolderOpen, Sparkles, Check, ChevronLeft, ChevronRight, X, ExternalLink, Copy, FolderSearch } from "lucide-react";
+import { Inbox, FolderOpen, Sparkles, Check, Circle, ChevronLeft, ChevronRight, X, ExternalLink, Copy, FolderSearch } from "lucide-react";
 import { useAccountsQuery } from "@/hooks/queries";
 import { useUIStore } from "@/stores/ui.store";
 import { useToastStore } from "@/stores/toast.store";
-import { openDataDir, getDataDir } from "@/lib/api";
+import { openDataDir, getDataDir, getTranslateConfig } from "@/lib/api";
+import { SHOW_ONBOARDING_EVENT } from "@/lib/onboarding";
 
 const ONBOARDING_KEY = "pebble-onboarding-v2";
+const PROGRESS_KEY = "pebble-onboarding-progress";
+type AiStatus = "checking" | "ready" | "disabled" | "missing" | "error";
+const AI_STATUS_LABEL: Record<AiStatus, string> = {
+  checking: "正在检查配置…", ready: "已配置并启用（连接状态请在模型设置中测试）",
+  disabled: "尚未启用，请勾选“启用翻译/AI大模型”并保存", missing: "尚未配置，普通收发邮件不受影响", error: "暂时无法读取，请到模型设置中查看",
+};
 
 type StepId = "email" | "storage" | "api" | "done";
 
 const STEPS: { id: StepId; icon: React.ReactNode; title: string }[] = [
   { id: "email", icon: <Inbox size={26} />, title: "设置邮箱账号" },
   { id: "storage", icon: <FolderOpen size={26} />, title: "数据保存位置" },
-  { id: "api", icon: <Sparkles size={26} />, title: "AI 模型 API Key" },
+  { id: "api", icon: <Sparkles size={26} />, title: "AI 模型（可选）" },
   { id: "done", icon: <Check size={26} />, title: "准备就绪" },
 ];
 
 export default function OnboardingOverlay() {
   const [visible, setVisible] = useState(false);
   const [stepIdx, setStepIdx] = useState(0);
+  const [suspended, setSuspended] = useState(false);
+  const [aiStatus, setAiStatus] = useState<AiStatus>("checking");
   const { data: accounts = [] } = useAccountsQuery();
   const setActiveView = useUIStore((s) => s.setActiveView);
   const addToast = useToastStore((s) => s.addToast);
 
   useEffect(() => {
+    const resume = () => {
+      setStepIdx(0);
+      setSuspended(false);
+      setVisible(true);
+    };
+    window.addEventListener(SHOW_ONBOARDING_EVENT, resume);
+    // Also accept requests from detached settings windows.
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    if ("__TAURI_INTERNALS__" in window) {
+      void import("@tauri-apps/api/event").then(({ listen }) => listen(SHOW_ONBOARDING_EVENT, resume))
+        .then(unlisten => { if (disposed) unlisten(); else stopListening = unlisten; }).catch(() => {});
+    }
     try {
       if (!localStorage.getItem(ONBOARDING_KEY)) {
+        const saved = Number(localStorage.getItem(PROGRESS_KEY) ?? 0);
+        if (Number.isInteger(saved) && saved >= 0 && saved < STEPS.length) setStepIdx(saved);
         setVisible(true);
       }
     } catch {
-      // ignore storage errors
+      setVisible(true);
     }
+    return () => { disposed = true; stopListening?.(); window.removeEventListener(SHOW_ONBOARDING_EVENT, resume); };
   }, []);
+
+  useEffect(() => {
+    if (!visible) return;
+    let cancelled = false;
+    setAiStatus("checking");
+    void getTranslateConfig().then(config => {
+      if (cancelled) return;
+      if (!config) { setAiStatus("missing"); return; }
+      const parsed = JSON.parse(config.config);
+      const provider = parsed.providers?.find((p: { id: string }) => p.id === parsed.active_id) ?? parsed.providers?.[0];
+      const configured = parsed.type === "llm" && typeof provider?.api_key === "string" && provider.api_key.trim()
+        && typeof provider?.model === "string" && provider.model.trim();
+      setAiStatus(!configured ? "missing" : config.is_enabled ? "ready" : "disabled");
+    }).catch(() => { if (!cancelled) setAiStatus("error"); });
+    return () => { cancelled = true; };
+  }, [visible]);
 
   const finish = useCallback(() => {
     try {
       localStorage.setItem(ONBOARDING_KEY, "done");
+      localStorage.removeItem(PROGRESS_KEY);
     } catch {
       // ignore
     }
     setVisible(false);
+    setSuspended(false);
   }, []);
 
   const skipAll = useCallback(() => {
@@ -55,15 +98,14 @@ export default function OnboardingOverlay() {
   }, []);
 
   const openSettingsTab = useCallback(
-    (tab: "accounts" | "translation") => {
-      finish();
+    (tab: "accounts" | "translation" | "general") => {
+      try { localStorage.setItem(PROGRESS_KEY, String(stepIdx)); } catch { /* Keep in-memory progress. */ }
+      setVisible(false);
+      setSuspended(true);
+      useUIStore.getState().setSettingsTab(tab);
       setActiveView("settings");
-      requestAnimationFrame(() => {
-        useUIStore.getState().setSettingsTab(tab);
-        window.dispatchEvent(new CustomEvent(`pebble:focus-${tab}`));
-      });
     },
-    [finish, setActiveView],
+    [stepIdx, setActiveView],
   );
 
   const handleAddAccount = useCallback(() => {
@@ -73,7 +115,7 @@ export default function OnboardingOverlay() {
   const handleSetupAi = useCallback(() => {
     openSettingsTab("translation");
     addToast({
-      message: "在「翻译 → 服务商 → AI 模型」里添加 Provider 并填入 API Key",
+      message: "选择 AI 模型，填写 API Key 和模型 ID，勾选“启用翻译/AI大模型”后保存；需要代理的模型可单独勾选“使用代理”。",
       type: "info",
     });
   }, [openSettingsTab, addToast]);
@@ -99,7 +141,10 @@ export default function OnboardingOverlay() {
     };
   }, []);
 
-  if (!visible) return null;
+  if (!visible) return suspended ? <button type="button" onClick={() => { setSuspended(false); setVisible(true); }}
+    style={{ position: "fixed", right: 24, bottom: 36, zIndex: 9998, border: "1px solid var(--color-border)", borderRadius: 8, padding: "9px 14px", background: "var(--color-bg-primary)", color: "var(--color-accent)", cursor: "pointer", fontSize: 13 }}>
+    继续新手引导
+  </button> : null;
 
   return (
     <div
@@ -115,6 +160,9 @@ export default function OnboardingOverlay() {
       }}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="新手引导"
         style={{
           width: "min(520px, 92vw)",
           maxHeight: "88vh",
@@ -154,6 +202,7 @@ export default function OnboardingOverlay() {
             type="button"
             onClick={skipAll}
             title="跳过引导（之后可在设置中再次查看）"
+            aria-label="关闭新手引导"
             style={{
               padding: 6,
               border: 0,
@@ -173,13 +222,13 @@ export default function OnboardingOverlay() {
             <EmailStep accountCount={accountCount} onAdd={handleAddAccount} />
           )}
           {currentStep.id === "storage" && (
-            <StorageStep path={dataDirPath} />
+            <StorageStep path={dataDirPath} onManage={() => openSettingsTab("general")} />
           )}
           {currentStep.id === "api" && (
-            <ApiKeyStep onSetup={handleSetupAi} />
+            <ApiKeyStep onSetup={handleSetupAi} status={aiStatus} />
           )}
           {currentStep.id === "done" && (
-            <DoneStep accountCount={accountCount} />
+            <DoneStep accountCount={accountCount} path={dataDirPath} aiStatus={aiStatus} />
           )}
         </div>
 
@@ -316,7 +365,7 @@ function EmailStep({ accountCount, onAdd }: { accountCount: number; onAdd: () =>
           )}
           <div>
             <div style={{ fontSize: 13, fontWeight: 600 }}>
-              {ready ? "邮箱已就绪" : "尚未配置邮箱"}
+              {ready ? "邮箱已添加" : "尚未配置邮箱"}
             </div>
             <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>
               {ready ? `共 ${accountCount} 个账号` : "点右侧按钮添加第一个账号"}
@@ -347,7 +396,7 @@ function EmailStep({ accountCount, onAdd }: { accountCount: number; onAdd: () =>
   );
 }
 
-function StorageStep({ path }: { path: string }) {
+function StorageStep({ path, onManage }: { path: string; onManage: () => void }) {
   const addToast = useToastStore((s) => s.addToast);
   const [opening, setOpening] = useState(false);
 
@@ -380,7 +429,7 @@ function StorageStep({ path }: { path: string }) {
   return (
     <div>
       <p style={{ margin: "0 0 14px", fontSize: 13, lineHeight: 1.7, color: "var(--color-text-secondary)" }}>
-        你的邮件、附件、搜索索引都保存在本地。下次启动会继续显示，无需担心隐私。
+        你的邮件、附件和搜索索引保存在此电脑，下次启动会继续使用。建议定期备份整个数据文件夹；使用 AI 时，必要的邮件和参考内容会交给你配置的服务商处理。
       </p>
       <div
         style={{
@@ -454,18 +503,19 @@ function StorageStep({ path }: { path: string }) {
           {path || "正在获取路径…"}
         </code>
         <p style={{ margin: "10px 0 0", fontSize: 11, lineHeight: 1.6, color: "var(--color-text-secondary)" }}>
-          想换成其他位置（便携模式、网盘同步、外接硬盘等）？在启动 YaoAIMail 之前设置环境变量 <code>PEBBLE_PROFILE_DIR</code> 为目标完整路径即可。
+          如需更换位置，可到“设置 → 通用”选择空文件夹，完全退出并重新打开软件后生效。
         </p>
+        <button type="button" onClick={onManage} style={{ marginTop: 8, border: 0, background: "transparent", color: "var(--color-accent)", cursor: "pointer", fontSize: 12 }}>前往设置保存位置</button>
       </div>
     </div>
   );
 }
 
-function ApiKeyStep({ onSetup }: { onSetup: () => void }) {
+function ApiKeyStep({ onSetup, status }: { onSetup: () => void; status: AiStatus }) {
   return (
     <div>
       <p style={{ margin: "0 0 14px", fontSize: 13, lineHeight: 1.7, color: "var(--color-text-secondary)" }}>
-        AI 写作、智能翻译、AI 业务助手都依赖大模型 API Key。至少配置一个 Provider，才能让 AI 功能正常工作。
+        AI 写作、翻译和工作台需要配置大模型。填写 API Key 和模型 ID，勾选“启用翻译/AI大模型”并保存。暂不使用 AI 也可以正常收发邮件。
       </p>
       <div
         style={{
@@ -478,12 +528,15 @@ function ApiKeyStep({ onSetup }: { onSetup: () => void }) {
       >
         <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 6 }}>支持的服务商</div>
         <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, lineHeight: 1.8, color: "var(--color-text-primary)" }}>
-          <li>OpenAI（含 GPT-4o、GPT-5 系列）</li>
-          <li>DeepSeek（国内直连、价格友好）</li>
+          <li>OpenAI</li>
+          <li>DeepSeek</li>
           <li>Google Gemini</li>
           <li>任意 OpenAI 兼容接口（自建代理或第三方）</li>
         </ul>
       </div>
+      <p style={{ fontSize: 12, lineHeight: 1.7, color: "var(--color-text-secondary)" }}>
+        当前状态：{AI_STATUS_LABEL[status]}。需要代理时，在“设置 → 代理”填写地址，再在对应模型下勾选“使用代理”。外部搜索 API 可以稍后配置；DeepSeek 付费搜索默认关闭，需要另行勾选开启。
+      </p>
       <button
         type="button"
         onClick={onSetup}
@@ -507,7 +560,7 @@ function ApiKeyStep({ onSetup }: { onSetup: () => void }) {
   );
 }
 
-function DoneStep({ accountCount }: { accountCount: number }) {
+function DoneStep({ accountCount, path, aiStatus }: { accountCount: number; path: string; aiStatus: AiStatus }) {
   return (
     <div>
       <p style={{ margin: "0 0 14px", fontSize: 13, lineHeight: 1.7, color: "var(--color-text-secondary)" }}>
@@ -519,11 +572,11 @@ function DoneStep({ accountCount }: { accountCount: number }) {
           label="邮箱账号"
           value={accountCount > 0 ? `已配置 ${accountCount} 个` : "未配置（稍后在「设置 → 账号」添加）"}
         />
-        <SummaryRow ok={true} label="数据位置" value="已使用默认（Windows: %APPDATA%\\com.qingj01.pebble）" />
+        <SummaryRow ok={Boolean(path)} label="数据位置" value={path || "暂时无法读取，请到“设置 → 通用”查看"} />
         <SummaryRow
-          ok={true}
+          ok={aiStatus === "ready"}
           label="AI 模型"
-          value={"在「设置 → 翻译 → AI 模型」中配置"}
+          value={AI_STATUS_LABEL[aiStatus]}
         />
       </div>
     </div>
@@ -543,7 +596,7 @@ function SummaryRow({ ok, label, value }: { ok: boolean; label: string; value: s
         background: ok ? "rgba(34,197,94,0.06)" : "var(--color-bg-secondary)",
       }}
     >
-      <Check size={16} color={ok ? "#15803d" : "var(--color-text-secondary)"} />
+      {ok ? <Check size={16} color="#15803d" /> : <Circle size={16} color="var(--color-text-secondary)" />}
       <div style={{ flex: 1 }}>
         <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{label}</div>
         <div style={{ fontSize: 13, color: "var(--color-text-primary)", marginTop: 2 }}>{value}</div>

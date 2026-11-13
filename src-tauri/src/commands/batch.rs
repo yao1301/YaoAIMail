@@ -3,6 +3,7 @@ use super::messages::{find_folder_by_role, find_message_folder, refresh_search_d
 use crate::state::AppState;
 use pebble_core::traits::{FolderProvider, LabelProvider};
 use pebble_core::{FolderRole, Message, PebbleError, ProviderType};
+use pebble_store::local_messages::is_local_message_id;
 use pebble_store::Store;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -52,6 +53,17 @@ fn queue_batch_pending_op(
     )?;
     state.store.mark_pending_mail_op_failed(&op_id, error)?;
     Ok(())
+}
+
+fn split_local_flag_updates<'a>(
+    messages: &'a [Message],
+    local_commit_ids: &mut Vec<String>,
+) -> Vec<&'a Message> {
+    let (local, remote): (Vec<_>, Vec<_>) = messages
+        .iter()
+        .partition(|message| is_local_message_id(&message.remote_id));
+    local_commit_ids.extend(local.into_iter().map(|message| message.id.clone()));
+    remote
 }
 
 fn batch_local_commit_ids(
@@ -615,7 +627,11 @@ pub async fn mark_folder_all_read(
     //    take minutes for hundreds of mails — it must not block the UI).
     let messages = state.store.get_messages_batch(&local_ids)?;
     for msg in messages {
+        if is_local_message_id(&msg.remote_id) {
+            continue;
+        }
         let payload = json!({
+            "remote_id": msg.remote_id,
             "folder_remote_id": folder.remote_id,
             "is_read": true,
             "is_starred": null,
@@ -659,6 +675,10 @@ async fn batch_mark_read_inner(
     for (account_id, (provider_type, messages)) in &groups {
         if matches!(provider_type, ProviderType::Pop3) {
             synced_ids.extend(messages.iter().map(|msg| msg.id.clone()));
+            continue;
+        }
+        let messages = split_local_flag_updates(messages, &mut synced_ids);
+        if messages.is_empty() {
             continue;
         }
 
@@ -813,6 +833,10 @@ pub async fn batch_star(
     for (account_id, (provider_type, messages)) in &groups {
         if matches!(provider_type, ProviderType::Pop3) {
             synced_ids.extend(messages.iter().map(|msg| msg.id.clone()));
+            continue;
+        }
+        let messages = split_local_flag_updates(messages, &mut synced_ids);
+        if messages.is_empty() {
             continue;
         }
 

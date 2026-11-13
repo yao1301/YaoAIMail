@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
+import { useRef } from "react";
 import { Pencil, Send, Sparkles, Trash2, Upload } from "lucide-react";
 import {
   deleteKnowledgeItem,
@@ -11,6 +12,7 @@ import {
   aiPrompt,
 } from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
+import { SettingsFeedback, type SettingsNotice } from "./SettingsFeedback";
 import { useMailStore } from "@/stores/mail.store";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { extractDocumentText } from "@/lib/documentText";
@@ -26,33 +28,40 @@ export default function KnowledgeBaseTab() {
   const setActiveView = useUIStore((state) => state.setActiveView);
   const openRightPanel = useUIStore((state) => state.openRightPanel);
   const fileRef = useRef<HTMLInputElement | null>(null);
-  const [items, setItems] = useState<KnowledgeItem[]>([]);
-  const [editingId, setEditingId] = useState<string | undefined>();
-  const [name, setName] = useState("");
-  const [content, setContent] = useState("");
-  const [sourceType, setSourceType] = useState("note");
-  const [scopeAccountIds, setScopeAccountIds] = useState<string[] | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<KnowledgeSnippet[]>([]);
-  const [knowledgeAnswer, setKnowledgeAnswer] = useState("");
-  const [questionBusy, setQuestionBusy] = useState(false);
-  const [marketingBusyId, setMarketingBusyId] = useState<string | null>(null);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; item: KnowledgeItem } | null>(null);
+  const [items, setItems] = useWorkspaceState<KnowledgeItem[]>("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:items", []);
+  const [editingId, setEditingId] = useWorkspaceState<string | undefined>("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:editingId");
+  const [name, setName] = useWorkspaceState("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:name", "");
+  const [content, setContent] = useWorkspaceState("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:content", "");
+  const [sourceType, setSourceType] = useWorkspaceState("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:sourceType", "note");
+  const [scopeAccountIds, setScopeAccountIds] = useWorkspaceState<string[] | null>("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:scopeAccountIds", null);
+  const [saving, setSaving] = useWorkspaceState("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:saving", false);
+  const [searchQuery, setSearchQuery] = useWorkspaceState("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:searchQuery", "");
+  const [searchResults, setSearchResults] = useWorkspaceState<KnowledgeSnippet[]>("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:searchResults", []);
+  const [knowledgeAnswer, setKnowledgeAnswer] = useWorkspaceState("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:knowledgeAnswer", "");
+  const [questionBusy, setQuestionBusy] = useWorkspaceState("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:questionBusy", false);
+  const [marketingBusyId, setMarketingBusyId] = useWorkspaceState<string | null>("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:marketingBusyId", null);
+  const [contextMenu, setContextMenu] = useWorkspaceState<{ x: number; y: number; item: KnowledgeItem } | null>("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:contextMenu", null);
+  const [feedback, setFeedback] = useWorkspaceState<Record<string, SettingsNotice | undefined>>("src/features/settings/KnowledgeBaseTab.tsx:KnowledgeBaseTab:feedback", {});
   const addToast = useToastStore((state) => state.addToast);
+
+  function showFeedback(action: string, message?: string, kind: SettingsNotice["kind"] = "error") {
+    setFeedback((current) => ({ ...current, [action]: message ? { message, kind } : undefined }));
+  }
 
   async function refresh() {
     // 管理页展示全部资料，适用账号由每份资料自己的范围决定。
     setItems(await listKnowledgeItems(null));
   }
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/KnowledgeBaseTab.tsx:", () => {
     refresh().catch((error) => {
       addToast({ message: `读取资料库失败：${extractErrorMessage(error)}`, type: "error" });
     });
   }, [addToast]);
 
   function resetEditor() {
+    showFeedback("save");
+    showFeedback("file");
     setEditingId(undefined);
     setName("");
     setContent("");
@@ -62,45 +71,44 @@ export default function KnowledgeBaseTab() {
 
   async function handleSave() {
     setSaving(true);
+    showFeedback("save");
     try {
       await saveKnowledgeItem({ id: editingId, name, content, sourceType, accountIds: scopeAccountIds ?? [] });
       await refresh();
       resetEditor();
-      addToast({ message: "资料已保存到本地资料库", type: "success" });
+      showFeedback("save", "资料已保存到本地资料库。", "success");
     } catch (error) {
-      addToast({ message: `保存失败：${extractErrorMessage(error)}`, type: "error" });
+      showFeedback("save", `保存失败：${extractErrorMessage(error)}`);
     } finally {
       setSaving(false);
     }
   }
 
   async function handleFile(file: File) {
+    showFeedback("file");
     const lower = file.name.toLowerCase();
     if (!SUPPORTED_EXTENSIONS.some((extension) => lower.endsWith(extension))) {
-      addToast({
-        message: "支持 TXT、Markdown、CSV、JSON、HTML、XML、Word DOCX、Excel XLS/XLSX 和带文字层的 PDF。",
-        type: "info",
-        duration: 8_000,
-      });
+      showFeedback("file", "请选择 TXT、Markdown、CSV、JSON、HTML、XML、Word DOCX、Excel XLS/XLSX 或带文字层的 PDF。");
       return;
     }
     if (file.size > 25 * 1024 * 1024) {
-      addToast({ message: "文件过大，请控制在 25MB 以内", type: "error" });
+      showFeedback("file", "文件过大，请控制在 25 MB 以内。");
       return;
     }
-    setEditingId(undefined);
-    setName(file.name);
-    setSourceType("file");
     const extracted = (await extractDocumentText(file)).trim();
     if (!extracted) {
       throw new Error("没有提取到可搜索文字；扫描版 PDF 需要 OCR，当前版本暂不支持。");
     }
+    setEditingId(undefined);
+    setName(file.name);
+    setSourceType("file");
     setContent(extracted);
   }
 
   async function runKnowledgeQuestion() {
     const question = searchQuery.trim();
     if (!question || questionBusy) return;
+    showFeedback("question");
     setQuestionBusy(true);
     setKnowledgeAnswer("");
     try {
@@ -113,7 +121,7 @@ export default function KnowledgeBaseTab() {
       );
       setKnowledgeAnswer(answer.trim() || "资料库没有返回可用答案。");
     } catch (error) {
-      addToast({ message: `资料问答失败：${extractErrorMessage(error)}`, type: "error" });
+      showFeedback("question", `资料问答失败：${extractErrorMessage(error)}`);
     } finally {
       setQuestionBusy(false);
     }
@@ -122,6 +130,8 @@ export default function KnowledgeBaseTab() {
   async function generateMarketing(item: KnowledgeItem) {
     const approved = window.confirm(`将“${item.name}”中最多 6,000 字的相关内容发送给当前配置的 AI 服务商，用于生成营销素材。不会发送其他资料，是否继续？`);
     if (!approved) return;
+    const action = `item:${item.id}`;
+    showFeedback(action);
     setMarketingBusyId(item.id);
     try {
       const result = await agentRun(
@@ -130,10 +140,21 @@ export default function KnowledgeBaseTab() {
       );
       await saveKnowledgeItem({ name: `${item.name} · AI营销素材`, content: result.content, sourceType: "marketing", accountIds: item.accountIds ?? (item.accountId ? [item.accountId] : []) });
       await refresh();
-      addToast({ message: "营销素材已生成并保存，可继续编辑", type: "success" });
+      showFeedback(action, "营销素材已生成并保存，可继续编辑。", "success");
     } catch (error) {
-      addToast({ message: `生成失败：${extractErrorMessage(error)}`, type: "error" });
+      showFeedback(action, `生成失败：${extractErrorMessage(error)}`);
     } finally { setMarketingBusyId(null); }
+  }
+
+  async function removeItem(item: KnowledgeItem) {
+    const action = `item:${item.id}`;
+    showFeedback(action);
+    try {
+      await deleteKnowledgeItem(item.id);
+      await refresh();
+    } catch (error) {
+      showFeedback(action, `删除资料失败：${extractErrorMessage(error)}`);
+    }
   }
 
   return (
@@ -150,6 +171,7 @@ export default function KnowledgeBaseTab() {
           <textarea value={searchQuery} onChange={(event) => setSearchQuery(event.currentTarget.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void runKnowledgeQuestion(); } }} placeholder="例如：我们这款产品有哪些功率和认证？付款方式、交期分别是什么？" rows={4} style={questionInput} />
           <button type="button" onClick={() => void runKnowledgeQuestion()} disabled={questionBusy || !searchQuery.trim()} style={{ ...sendButton, opacity: questionBusy || !searchQuery.trim() ? 0.55 : 1 }}><Send size={14} />{questionBusy ? "回答中" : "提问"}</button>
         </div>
+        <SettingsFeedback notice={feedback.question} />
         <div style={{ marginTop: 6, fontSize: 11, color: "var(--color-text-secondary)" }}>Enter 提问 · Shift + Enter 换行 · 只使用当前邮箱账号可用的资料</div>
       </div>
       {knowledgeAnswer && <div style={answerBox}><div style={{ fontWeight: 700, marginBottom: 7 }}>资料中心回答</div><MarkdownView text={knowledgeAnswer} /></div>}
@@ -165,8 +187,9 @@ export default function KnowledgeBaseTab() {
         <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>新建文字资料，或导入 Word、Excel、PDF 等文件。资料会保存在本地并建立检索索引。</div>
         <div style={{ display: "flex", gap: 8 }}>
           <button type="button" onClick={() => fileRef.current?.click()} style={buttonStyle}><Upload size={14} />选择文件</button>
-          <input ref={fileRef} type="file" accept=".txt,.md,.markdown,.csv,.json,.html,.htm,.xml,.docx,.xlsx,.xls,.pdf,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" style={{ display: "none" }} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file) handleFile(file).catch((error) => { addToast({ message: `文件解析失败：${extractErrorMessage(error)}`, type: "error" }); }); }} />
+          <input ref={fileRef} type="file" accept=".txt,.md,.markdown,.csv,.json,.html,.htm,.xml,.docx,.xlsx,.xls,.pdf,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" style={{ display: "none" }} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file) void handleFile(file).catch((error) => showFeedback("file", `文件解析失败：${extractErrorMessage(error)}`)); }} />
         </div>
+        <SettingsFeedback notice={feedback.file} />
         <AccountScopeSelect value={scopeAccountIds} onChange={setScopeAccountIds} label="这份资料可以给哪些邮箱账号使用？" />
         <input value={name} onChange={(event) => setName(event.currentTarget.value)} placeholder="资料名称，例如：付款与报价规则" style={inputStyle} />
         <textarea value={content} onChange={(event) => setContent(event.currentTarget.value)} placeholder="粘贴或输入资料内容…" style={{ ...inputStyle, minHeight: "180px", resize: "vertical", fontFamily: "inherit" }} />
@@ -176,6 +199,7 @@ export default function KnowledgeBaseTab() {
           </button>
           {(editingId || name || content) && <button type="button" onClick={resetEditor} style={buttonStyle}>取消</button>}
         </div>
+        <SettingsFeedback notice={feedback.save} />
       </div>
 
       <h3 style={{ fontSize: "14px", marginBottom: "10px" }}>已有资料（{items.length}）</h3>
@@ -192,8 +216,9 @@ export default function KnowledgeBaseTab() {
             <span style={{ fontSize: "11px", color: "var(--color-text-secondary)" }}>{item.chunks?.length || 0} 个片段</span>
             <button type="button" title="基于所选资料生成营销素材" disabled={marketingBusyId === item.id} onClick={() => void generateMarketing(item)} style={iconButtonStyle}><Sparkles size={14} /></button>
             <button type="button" title="编辑" onClick={() => { setEditingId(item.id); setName(item.name); setContent(item.content); setSourceType(item.sourceType); setScopeAccountIds(item.accountIds ?? (item.accountId ? [item.accountId] : null)); }} style={iconButtonStyle}><Pencil size={14} /></button>
-            <button type="button" title="删除" onClick={async () => { await deleteKnowledgeItem(item.id); await refresh(); }} style={{ ...iconButtonStyle, color: "#dc3545" }}><Trash2 size={14} /></button>
+            <button type="button" title="删除" onClick={() => void removeItem(item)} style={{ ...iconButtonStyle, color: "#dc3545" }}><Trash2 size={14} /></button>
           </div>
+          <SettingsFeedback notice={feedback[`item:${item.id}`]} />
           <div style={{ marginTop: "8px", color: "var(--color-text-secondary)", fontSize: "12px", lineHeight: 1.5, whiteSpace: "pre-wrap", maxHeight: "72px", overflow: "hidden" }}>
             {item.content.slice(0, 260)}
           </div>

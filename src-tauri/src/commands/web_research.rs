@@ -174,6 +174,8 @@ fn provider_limiter(name: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
     let slot = match name {
         "bing_rss" => &BING_SEARCH_LIMITER,
         "duckduckgo_html" => &DDG_SEARCH_LIMITER,
+        "brave_web" => &BRAVE_WEB_LIMITER,
+        "yahoo_web" => &YAHOO_WEB_LIMITER,
         _ => &MOJEEK_SEARCH_LIMITER,
     };
     // Email completion can launch several companies at once. Bound each
@@ -185,6 +187,11 @@ fn provider_limiter(name: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
 struct BingRssProvider;
 struct DuckDuckGoProvider;
 struct MojeekProvider;
+struct BraveWebProvider;
+struct YahooWebProvider;
+static BRAVE_WEB_LIMITER: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static YAHOO_WEB_LIMITER: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+pub const PUBLIC_SEARCH_PROVIDERS: usize = 5;
 
 fn search_policy() -> FetchPolicy {
     FetchPolicy {
@@ -316,6 +323,18 @@ fn unwrap_ddg_url(raw: &str) -> String {
     raw.to_string()
 }
 
+fn unwrap_yahoo_url(raw: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(raw) else { return raw.to_string() };
+    if url.host_str() != Some("r.search.yahoo.com") { return raw.to_string(); }
+    let Some((_, encoded)) = url.path().split_once("/RU=") else { return raw.to_string() };
+    let encoded = encoded.split("/RK=").next().unwrap_or(encoded).split("/RS=").next().unwrap_or(encoded);
+    // URL form decoding is data parsing only. Never evaluate search-page JS.
+    let pair = format!("target={}", encoded.replace('+', "%2B"));
+    let target = reqwest::Url::parse(&format!("https://example.invalid/?{pair}")).ok()
+        .and_then(|u| u.query_pairs().find(|(k,_)| k == "target").map(|(_,v)| v.into_owned()));
+    target.filter(|v| validate_public_url_syntax(v).is_ok()).unwrap_or_default()
+}
+
 fn parse_html_results(
     html: &str,
     provider: &str,
@@ -329,7 +348,7 @@ fn parse_html_results(
         let Ok(row_selector) = Selector::parse(row_selector) else { continue };
         for row in document.select(&row_selector) {
             let Some((raw_url, title)) = first_link(row, link_selectors) else { continue };
-            let url = if provider == "duckduckgo_html" { unwrap_ddg_url(&raw_url) } else { raw_url };
+            let url = match provider { "duckduckgo_html" => unwrap_ddg_url(&raw_url), "yahoo_web" => unwrap_yahoo_url(&raw_url), _ => raw_url };
             if validate_public_url_syntax(&url).is_err() || hits.iter().any(|hit: &SearchHit| hit.url == url) {
                 continue;
             }
@@ -345,6 +364,51 @@ fn parse_html_results(
         if !hits.is_empty() { break; }
     }
     hits
+}
+
+fn parse_brave_web(html: &str) -> Vec<SearchHit> {
+    // Observed public HTML result cards. Exclude the AI answer box, related
+    // questions and sublinks; do not depend on Svelte's private JS objects.
+    let document = Html::parse_document(html);
+    let rows = Selector::parse(".snippet[data-type='web']").unwrap();
+    let titles = Selector::parse(".search-snippet-title").unwrap();
+    let links = Selector::parse(".result-content > a[href]").unwrap();
+    document.select(&rows).filter_map(|row| {
+        let title = row.select(&titles).next()?.text().collect::<Vec<_>>().join(" ");
+        let url = row.select(&links).next()?.value().attr("href")?.to_string();
+        validate_public_url_syntax(&url).ok()?;
+        Some(SearchHit { provider: "brave_web".into(), title: compact_text(&title,240), url,
+            snippet: first_text(row, &[".generic-snippet", ".snippet-description"]), rank: 0 })
+    }).take(20).enumerate().map(|(i,mut h)| {h.rank=i+1;h}).collect()
+}
+
+impl SearchProvider for BraveWebProvider {
+    fn name(&self) -> &'static str { "brave_web" }
+    fn index_family(&self) -> &'static str { "brave" }
+    fn search<'a>(&'a self, client: &'a reqwest::Client, query: &'a str) -> SearchFuture<'a> {
+        Box::pin(async move {
+            let url = search_url("https://search.brave.com/search", query, &[("source", "web")])?;
+            let page = safe_fetch(client, &url, self.name(), search_policy()).await;
+            if page.evidence.status != EvidenceStatus::Ok { return Err(page.evidence.error); }
+            let hits = parse_brave_web(&page.text);
+            if hits.is_empty() { Err("Brave 公开网页未返回可解析结果（可能限流/验证），不绕过验证".into()) } else { Ok(hits) }
+        })
+    }
+}
+
+impl SearchProvider for YahooWebProvider {
+    fn name(&self) -> &'static str { "yahoo_web" }
+    fn index_family(&self) -> &'static str { "bing" }
+    fn search<'a>(&'a self, client: &'a reqwest::Client, query: &'a str) -> SearchFuture<'a> {
+        Box::pin(async move {
+            let mut url = reqwest::Url::parse("https://search.yahoo.com/search").map_err(|e| e.to_string())?;
+            url.query_pairs_mut().append_pair("p",query);
+            let page = safe_fetch(client, url.as_str(), self.name(), search_policy()).await;
+            if page.evidence.status != EvidenceStatus::Ok { return Err(page.evidence.error); }
+            let hits = parse_html_results(&page.text, self.name(), &["div.algo-sr"], &[".compTitle a"], &[".compText"]);
+            if hits.is_empty() { Err("Yahoo 公开网页未返回可解析结果（可能限流/验证），不绕过验证".into()) } else { Ok(hits) }
+        })
+    }
 }
 
 impl SearchProvider for BingRssProvider {
@@ -391,7 +455,8 @@ impl SearchProvider for MojeekProvider {
 
 fn provider_family(provider: &str) -> &'static str {
     match provider {
-        "bing_rss" | "duckduckgo_html" => "bing",
+        "bing_rss" | "duckduckgo_html" | "yahoo_web" => "bing",
+        "brave_web" => "brave",
         "mojeek" => "mojeek",
         _ => "other",
     }
@@ -451,15 +516,25 @@ async fn provider_search(provider: &dyn SearchProvider, client: &reqwest::Client
 
 /// Multi-source, cached evidence search. Consensus is based on independent
 /// index families, so DDG + Bing never pretend to be two independent sources.
+async fn collect_public_results(mut tasks: tokio::task::JoinSet<Vec<SearchHit>>, timeout: Duration) -> Vec<SearchHit> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut hits = Vec::new();
+    while let Ok(Some(result)) = tokio::time::timeout_at(deadline,tasks.join_next()).await {
+        if let Ok(mut completed) = result { hits.append(&mut completed); }
+    }
+    tasks.abort_all();
+    hits
+}
+
 pub async fn multi_source_search(client: &reqwest::Client, query: &str, limit: usize) -> Vec<SourceEvidence> {
     let query = compact_text(query, 500);
     if query.is_empty() { return Vec::new(); }
-    let key = query.to_ascii_lowercase();
+    let key = query.clone();
     {
         let mut cache = search_cache().lock().await;
         cache.retain(|_, entry| now_timestamp() - entry.created_at <= SEARCH_CACHE_TTL_SECS);
         if let Some(entry) = cache.get(&key) {
-            for provider in [&BingRssProvider as &dyn SearchProvider, &DuckDuckGoProvider, &MojeekProvider] {
+            for provider in [&BingRssProvider as &dyn SearchProvider, &DuckDuckGoProvider, &MojeekProvider, &BraveWebProvider, &YahooWebProvider] {
                 let mut circuits = search_circuits().lock().await;
                 circuits.entry(provider.name().to_string()).or_default().cache_hits += 1;
             }
@@ -467,15 +542,18 @@ pub async fn multi_source_search(client: &reqwest::Client, query: &str, limit: u
         }
     }
 
-    let (bing, ddg, mojeek) = tokio::join!(
-        provider_search(&BingRssProvider, client, &query),
-        provider_search(&DuckDuckGoProvider, client, &query),
-        provider_search(&MojeekProvider, client, &query),
-    );
+    let mut tasks = tokio::task::JoinSet::new();
+    for provider in [&BingRssProvider as &'static dyn SearchProvider, &DuckDuckGoProvider, &MojeekProvider, &BraveWebProvider, &YahooWebProvider] {
+        let client=client.clone(); let query=query.clone();
+        tasks.spawn(async move {provider_search(provider,&client,&query).await});
+    }
+    // Keep already completed sources when another source stalls. The caller's
+    // task deadline must never throw away a successful fast provider wholesale.
+    let completed = collect_public_results(tasks,Duration::from_secs(8)).await;
     #[derive(Default)]
     struct Merged { title: String, url: String, snippet: String, providers: HashSet<String>, families: HashSet<String>, rank_score: usize }
     let mut merged: HashMap<String, Merged> = HashMap::new();
-    for hit in bing.into_iter().chain(ddg).chain(mojeek) {
+    for hit in completed {
         let Some(normalized) = normalized_result_url(&hit.url) else { continue };
         let item = merged.entry(normalized.clone()).or_default();
         if item.title.is_empty() || hit.title.len() > item.title.len() { item.title = hit.title; }
@@ -517,7 +595,7 @@ pub async fn multi_source_search(client: &reqwest::Client, query: &str, limit: u
 #[tauri::command]
 pub async fn get_web_search_health() -> Vec<SearchProviderHealth> {
     let circuits = search_circuits().lock().await;
-    [(&BingRssProvider as &dyn SearchProvider), &DuckDuckGoProvider, &MojeekProvider]
+    [(&BingRssProvider as &dyn SearchProvider), &DuckDuckGoProvider, &MojeekProvider, &BraveWebProvider, &YahooWebProvider]
         .into_iter().map(|provider| {
             let state = circuits.get(provider.name()).cloned().unwrap_or_default();
             SearchProviderHealth {
@@ -560,7 +638,7 @@ fn equivalent_site_host(left: &str, right: &str) -> bool {
     left == right
 }
 
-fn same_site(root: &reqwest::Url, target: &reqwest::Url) -> bool {
+pub(super) fn same_site(root: &reqwest::Url, target: &reqwest::Url) -> bool {
     match (root.host_str(), target.host_str()) {
         (Some(left), Some(right)) => equivalent_site_host(left, right),
         _ => false,
@@ -578,18 +656,37 @@ fn absolute_same_site_url(root: &reqwest::Url, current: &reqwest::Url, raw: &str
     validate_public_url_syntax(target.as_str()).ok()
 }
 
-fn html_page_content(html: &str, base: &reqwest::Url, root: &reqwest::Url) -> (String, String, Vec<String>) {
+fn visible_element_text(node: scraper::ElementRef<'_>) -> String {
+    node.descendants().filter_map(|text| {
+        let value = text.value().as_text()?;
+        let hidden = text.ancestors().filter_map(scraper::ElementRef::wrap).any(|parent| {
+            matches!(parent.value().name(), "script" | "style" | "noscript" | "template" | "svg" | "head")
+                || parent.value().attr("hidden").is_some()
+                || parent.value().attr("aria-hidden") == Some("true")
+        });
+        (!hidden).then_some(value.to_string())
+    }).collect::<Vec<_>>().join(" ")
+}
+
+/// The extraction rules live in `pebble_websearch::content` so they are covered
+/// by that crate's tests instead of needing a desktop runtime to run.
+const MAX_PAGE_TEXT: usize = pebble_websearch::content::MAX_PAGE_TEXT;
+
+pub(crate) fn html_page_content(html: &str, base: &reqwest::Url, root: &reqwest::Url) -> (String, String, Vec<String>) {
     let document = Html::parse_document(html);
     let title = Selector::parse("title").ok().and_then(|selector| document.select(&selector).next())
         .map(|node| compact_text(&node.text().collect::<Vec<_>>().join(" "), 240)).unwrap_or_default();
     let mut text = String::new();
-    for selector_text in ["main", "article", "body"] {
+    // Readability receives the whole visible body as fallback/supplement.
+    // Taking <main> here first discarded the footer before address extraction.
+    for selector_text in ["body", "main", "article"] {
         let Ok(selector) = Selector::parse(selector_text) else { continue };
         if let Some(node) = document.select(&selector).next() {
-            text = compact_text(&node.text().collect::<Vec<_>>().join(" "), 120_000);
+            text = compact_text(&visible_element_text(node), MAX_PAGE_TEXT);
             if !text.is_empty() { break; }
         }
     }
+    let text = pebble_websearch::content::main_content_text(html, base.as_str(), &text);
     let mut links = Vec::new();
     if let Ok(selector) = Selector::parse("a[href]") {
         for node in document.select(&selector) {
@@ -601,6 +698,67 @@ fn html_page_content(html: &str, base: &reqwest::Url, root: &reqwest::Url) -> (S
     links.sort();
     links.dedup();
     (title, text, links)
+}
+
+/// Discovery reads obey robots before reading content and keep all links as
+/// untrusted candidates. Each subsequent target is independently SSRF-checked.
+pub async fn research_robots_allowed(client:&reqwest::Client,url:&str)->Result<(),String>{
+    static CACHE:OnceLock<tokio::sync::Mutex<HashMap<String,(Instant,Result<Vec<String>,String>)>>>=OnceLock::new();
+    let parsed=validate_public_url_syntax(url)?;let robots_url=parsed.join("/robots.txt").map_err(|_|"robots地址无效".to_string())?;
+    let cached={let mut cache=CACHE.get_or_init(Default::default).lock().await;
+        cache.retain(|_,(at,result)|at.elapsed()<Duration::from_secs(if result.is_ok(){600}else{60}));
+        cache.get(robots_url.as_str()).map(|(_,result)|result.clone())};
+    let policy=if let Some(policy)=cached{policy}else{
+        let robots=tokio::time::timeout(Duration::from_secs(7),safe_fetch(client,robots_url.as_str(),"research_robots",FetchPolicy{max_bytes:256*1024,timeout:Duration::from_secs(6),allow_pdf:false})).await;
+        let policy=match robots{
+            Ok(page) if matches!(page.evidence.http_status,Some(404)|Some(410))=>Ok(vec![]),
+            Ok(page) if page.evidence.status==EvidenceStatus::Ok=>Ok(parse_robots(&page.text,&parsed).0),
+            _=>Err("未取得robots访问政策，未绕过限制读取网页".into()),
+        };
+        let mut cache=CACHE.get_or_init(Default::default).lock().await;
+        if cache.len()>=128{if let Some(key)=cache.keys().next().cloned(){cache.remove(&key);}}
+        cache.insert(robots_url.to_string(),(Instant::now(),policy.clone()));policy
+    };
+    let rules=policy?;
+    if robots_allows(&parsed,&rules){Ok(())}else{Err("robots禁止读取此页".into())}
+}
+
+pub(super) async fn read_discovery_page(client: &reqwest::Client, url: &str, session: Option<&super::search_router::SearchSession>) -> Option<(SiteCrawlPage, Vec<(String, String)>)> {
+    let parsed = validate_public_url_syntax(url).ok()?;
+    let robots_url = parsed.join("/robots.txt").ok()?;
+    let robots = safe_fetch(client, robots_url.as_str(), "discovery_robots", FetchPolicy {
+        max_bytes: 256 * 1024, timeout: Duration::from_secs(6), allow_pdf: false,
+    }).await;
+    // Do not silently ignore an unreachable or forbidden robots policy.
+    let missing_robots = robots.evidence.http_status == Some(404) || robots.evidence.http_status == Some(410);
+    if robots.evidence.status != EvidenceStatus::Ok && !missing_robots { return None; }
+    let (disallowed, _) = parse_robots(&robots.text, &parsed);
+    if !robots_allows(&parsed, &disallowed) { return None; }
+    let mut page = safe_fetch(client, url, "lead_discovery", FetchPolicy {
+        max_bytes: DEFAULT_HTML_LIMIT, timeout: Duration::from_secs(10), allow_pdf: false,
+    }).await;
+    let local_html=if let Some(session)=session {
+        super::search_router::supplement_with_deepseek(session,client,url,&mut page,Duration::from_secs(4)).await
+    }else{None};
+    if page.evidence.status != EvidenceStatus::Ok { return None; }
+    let base = validate_public_url_syntax(&page.final_url).ok()?;
+    // Cross-host redirects are not accepted as proof for the original company.
+    if !same_site(&parsed, &base) { return None; }
+    let html=local_html.as_deref().unwrap_or(&page.text);
+    let (local_title, local_text, _) = html_page_content(html, &base, &base);
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("a[href]").ok()?;
+    let links = document.select(&selector).filter_map(|a| {
+        let mut url = base.join(a.value().attr("href")?).ok()?;
+        url.set_fragment(None);
+        let checked = validate_public_url_syntax(url.as_str()).ok()?;
+        Some((checked.to_string(), compact_text(&visible_element_text(a), 120)))
+    }).take(300).collect();
+    let (title,text,raw_text)=match local_html {
+        Some(html)=>(if page.evidence.title.is_empty(){local_title}else{page.evidence.title.clone()},page.text,html),
+        None=>(local_title,local_text,page.text),
+    };
+    Some((SiteCrawlPage { url: page.final_url, title, text, evidence: page.evidence, is_pdf: false, raw_text }, links))
 }
 
 fn crawl_priority(url: &str) -> i32 {
@@ -690,61 +848,74 @@ async fn crawl_one(client: reqwest::Client, url: String) -> SiteCrawlPage {
     SiteCrawlPage { url: page.final_url, title, text, evidence: page.evidence, is_pdf, raw_text }
 }
 
+async fn collect_site_results(mut tasks:tokio::task::JoinSet<SiteCrawlPage>,deadline:tokio::time::Instant,root:&reqwest::Url)->Vec<SiteCrawlPage>{
+    let mut pages=vec![];
+    while !tasks.is_empty(){
+        match tokio::time::timeout_at(deadline,tasks.join_next()).await{
+            Ok(Some(Ok(page)))=>{if reqwest::Url::parse(&page.url).ok().is_some_and(|u|same_site(root,&u)){pages.push(page);}},
+            Ok(Some(Err(_)))=>continue,_=>{tasks.abort_all();break;}
+        }
+    }
+    pages
+}
+
 /// Bounded same-site research for official pages, sitemap entries and PDFs.
 /// It never leaves the verified host and every fetch uses the SSRF guard.
 pub async fn crawl_company_site(client: &reqwest::Client, website: &str, max_pages: usize) -> SiteCrawlResult {
-    let normalized = if website.starts_with("http://") || website.starts_with("https://") { website.to_string() } else { format!("https://{website}") };
-    let Ok(root) = validate_public_url_syntax(&normalized) else {
-        return SiteCrawlResult { root_url: normalized, pages: Vec::new(), discovered_urls: 0, robots_respected: true };
-    };
-    let root_origin = format!("{}://{}", root.scheme(), root.host_str().unwrap_or_default());
-    let homepage = safe_fetch(client, root.as_str(), "same_site_homepage", FetchPolicy { allow_pdf: false, ..FetchPolicy::default() }).await;
-    let robots_url = format!("{root_origin}/robots.txt");
-    let robots_page = safe_fetch(client, &robots_url, "robots", FetchPolicy { max_bytes: 256 * 1024, timeout: Duration::from_secs(8), allow_pdf: false }).await;
-    let (disallowed, mut sitemap_urls) = if robots_page.evidence.status == EvidenceStatus::Ok { parse_robots(&robots_page.text, &root) } else { (Vec::new(), Vec::new()) };
-    if sitemap_urls.is_empty() { sitemap_urls.push(format!("{root_origin}/sitemap.xml")); }
-    let mut queue = vec![root.to_string()];
-    if homepage.evidence.status == EvidenceStatus::Ok {
-        let base = reqwest::Url::parse(&homepage.final_url).unwrap_or_else(|_| root.clone());
-        let (_, _, links) = html_page_content(&homepage.text, &base, &root);
-        queue.extend(links);
+    use tokio::time::{Instant,timeout_at};
+    let deadline=Instant::now()+Duration::from_secs(35);
+    let normalized=if website.starts_with("http://")||website.starts_with("https://"){website.to_string()}else{format!("https://{website}")};
+    let empty=||SiteCrawlResult{root_url:normalized.clone(),pages:vec![],discovered_urls:0,robots_respected:false};
+    let Ok(root)=validate_public_url_syntax(&normalized) else{return empty()};
+    let origin=format!("{}://{}",root.scheme(),root.host_str().unwrap_or_default());
+    let robots=safe_fetch(client,&format!("{origin}/robots.txt"),"robots",FetchPolicy{max_bytes:256*1024,timeout:Duration::from_secs(6),allow_pdf:false}).await;
+    if robots.evidence.status!=EvidenceStatus::Ok && !matches!(robots.evidence.http_status,Some(404)|Some(410)){return empty();}
+    let(disallowed,mut sitemaps)=parse_robots(&robots.text,&root);
+    if !robots_allows(&root,&disallowed){return empty();}
+    let mut pages=vec![];let mut queue=vec![];
+    if let Ok(home)=timeout_at(deadline.min(Instant::now()+Duration::from_secs(10)),crawl_one(client.clone(),root.to_string())).await{
+        if home.evidence.status==EvidenceStatus::Ok{
+            if !same_site(&root,&reqwest::Url::parse(&home.url).unwrap_or_else(|_|root.clone())){return empty();}
+            let base=reqwest::Url::parse(&home.url).unwrap_or_else(|_|root.clone());
+            queue.extend(html_page_content(&home.raw_text,&base,&root).2);
+        }
+        pages.push(home);
     }
-    for path in ["/contact", "/contact-us", "/about", "/about-us", "/team", "/impressum", "/dealers", "/distributors", "/stockists", "/wholesale", "/catalog.pdf"] {
-        if let Ok(url) = root.join(path) { queue.push(url.to_string()); }
+    for path in ["/contact","/contact-us","/about","/about-us","/team","/impressum","/wholesale","/catalog.pdf"]{
+        if let Ok(url)=root.join(path){queue.push(url.to_string());}
     }
-    for sitemap in sitemap_urls.into_iter().take(3) {
-        let page = safe_fetch(client, &sitemap, "sitemap", FetchPolicy { max_bytes: DEFAULT_HTML_LIMIT, timeout: Duration::from_secs(10), allow_pdf: false }).await;
-        if page.evidence.status != EvidenceStatus::Ok { continue; }
-        let map_url = reqwest::Url::parse(&page.final_url).unwrap_or_else(|_| root.clone());
-        let (pages, child_maps) = parse_sitemap(&page.text, &root, &map_url);
-        queue.extend(pages);
-        for child in child_maps.into_iter().take(2) {
-            let child_page = safe_fetch(client, &child, "sitemap", FetchPolicy { max_bytes: DEFAULT_HTML_LIMIT, timeout: Duration::from_secs(10), allow_pdf: false }).await;
-            if child_page.evidence.status == EvidenceStatus::Ok {
-                let child_url = reqwest::Url::parse(&child_page.final_url).unwrap_or_else(|_| root.clone());
-                queue.extend(parse_sitemap(&child_page.text, &root, &child_url).0);
+    if sitemaps.is_empty(){sitemaps.push(format!("{origin}/sitemap.xml"));}
+    // Sitemap exploration must not consume the whole contact-discovery timeout.
+    let map_deadline=deadline.min(Instant::now()+Duration::from_secs(5));
+    for sitemap in sitemaps.into_iter().take(2){
+        let fetched=timeout_at(map_deadline,safe_fetch(client,&sitemap,"sitemap",FetchPolicy{max_bytes:DEFAULT_HTML_LIMIT,timeout:Duration::from_secs(4),allow_pdf:false})).await;
+        let Ok(page)=fetched else{break};
+        if page.evidence.status!=EvidenceStatus::Ok{continue;}
+        let base=reqwest::Url::parse(&page.final_url).unwrap_or_else(|_|root.clone());
+        let(urls,children)=parse_sitemap(&page.text,&root,&base);queue.extend(urls);
+        for child in children.into_iter().take(1){
+            if let Ok(page)=timeout_at(map_deadline,safe_fetch(client,&child,"sitemap",FetchPolicy{max_bytes:DEFAULT_HTML_LIMIT,timeout:Duration::from_secs(3),allow_pdf:false})).await{
+                if page.evidence.status==EvidenceStatus::Ok{
+                    let base=reqwest::Url::parse(&page.final_url).unwrap_or_else(|_|root.clone());
+                    queue.extend(parse_sitemap(&page.text,&root,&base).0);
+                }
             }
         }
     }
-    queue.sort_by_key(|url| std::cmp::Reverse(crawl_priority(url)));
-    let mut seen = HashSet::new();
-    queue.retain(|url| seen.insert(normalized_result_url(url).unwrap_or_else(|| url.clone())));
-    let discovered_urls = queue.len();
-    let selected = queue.into_iter().filter(|url| reqwest::Url::parse(url).ok().is_some_and(|parsed| robots_allows(&parsed, &disallowed))).take(max_pages.max(1).min(20)).collect::<Vec<_>>();
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
-    let mut tasks = tokio::task::JoinSet::new();
-    for url in selected {
-        let client = client.clone();
-        let semaphore = semaphore.clone();
-        tasks.spawn(async move {
-            let _permit = semaphore.acquire_owned().await.ok();
-            crawl_one(client, url).await
-        });
+    queue.sort_by_key(|u|std::cmp::Reverse(crawl_priority(u)));
+    let mut seen=HashSet::from([normalized_result_url(root.as_str()).unwrap_or_else(||root.to_string())]);
+    queue.retain(|u|seen.insert(normalized_result_url(u).unwrap_or_else(||u.clone())));
+    let discovered_urls=queue.len();
+    let selected=queue.into_iter().filter(|u|reqwest::Url::parse(u).ok().is_some_and(|u|same_site(&root,&u)&&robots_allows(&u,&disallowed)))
+        .take(max_pages.clamp(1,20).saturating_sub(pages.len())).collect::<Vec<_>>();
+    let semaphore=std::sync::Arc::new(tokio::sync::Semaphore::new(3));let mut tasks=tokio::task::JoinSet::new();
+    for url in selected{
+        let client=client.clone();let semaphore=semaphore.clone();
+        tasks.spawn(async move{let _permit=semaphore.acquire_owned().await.ok();crawl_one(client,url).await});
     }
-    let mut pages = Vec::new();
-    while let Some(result) = tasks.join_next().await { if let Ok(page) = result { pages.push(page); } }
-    pages.sort_by_key(|page| std::cmp::Reverse(crawl_priority(&page.url)));
-    SiteCrawlResult { root_url: root.to_string(), pages, discovered_urls, robots_respected: true }
+    pages.extend(collect_site_results(tasks,deadline,&root).await);
+    pages.sort_by_key(|p|std::cmp::Reverse(crawl_priority(&p.url)));
+    SiteCrawlResult{root_url:root.to_string(),pages,discovered_urls,robots_respected:true}
 }
 
 impl Default for FetchPolicy {
@@ -898,7 +1069,7 @@ pub fn validate_public_url_syntax(raw: &str) -> Result<reqwest::Url, String> {
     {
         return Err("网址指向本机、云元数据或 DNS 重绑定服务".to_string());
     }
-    if let Ok(ip) = lower.parse::<IpAddr>() {
+    if let Ok(ip) = lower.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
         if !ip_is_public(ip) {
             return Err("网址指向内网或保留地址".to_string());
         }
@@ -910,7 +1081,7 @@ pub fn validate_public_url_syntax(raw: &str) -> Result<reqwest::Url, String> {
     Ok(url)
 }
 
-async fn validate_public_dns(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
+pub(crate) async fn validate_public_dns(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
     let host = url.host_str().ok_or_else(|| "网址缺少主机名".to_string())?;
     let port = url.port_or_known_default().unwrap_or(443);
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -1136,6 +1307,37 @@ mod tests {
         assert_eq!(hits[0].title, "Example & Co");
         assert_eq!(hits[0].url, "https://example.com/about");
     }
+    #[tokio::test]
+    async fn a_slow_source_does_not_discard_completed_public_results() {
+        let mut tasks=tokio::task::JoinSet::new();
+        tasks.spawn(async {vec![SearchHit {provider:"fast".into(),title:"Gift wholesaler".into(),url:"https://example.org".into(),snippet:String::new(),rank:1}]});
+        tasks.spawn(async {std::future::pending::<Vec<SearchHit>>().await});
+        let result=collect_public_results(tasks,Duration::from_millis(40)).await;
+        assert_eq!(result.len(),1); assert_eq!(result[0].provider,"fast");
+    }
+
+    #[test]
+    fn scripts_styles_and_hidden_markup_are_not_product_proof() {
+        let root = reqwest::Url::parse("https://example.org/").unwrap();
+        let html = r#"<body><script>industrial pump distributor</script><style>.pump {}</style><div hidden>industrial pump</div><div aria-hidden="true">importer</div><main>We sell dental chairs.</main></body>"#;
+        let (_, text, _) = html_page_content(html, &root, &root);
+        assert!(text.contains("dental chairs")); assert!(!text.contains("pump")); assert!(!text.contains("importer"));
+    }
+
+    #[test]
+    fn parses_public_brave_cards_without_ai_answer_or_scripts() {
+        let html = r#"<div id="llm-snippet"><a href="https://wrong.org">AI answer</a></div><div class="snippet" data-type="web"><div class="result-content"><a href="https://example.org/Products"><div class="search-snippet-title">Example Pumps</div></a><div class="generic-snippet">Industrial pumps importer</div></div></div><script>web={url:'https://fake.org'}</script>"#;
+        let hits = parse_brave_web(html); assert_eq!(hits.len(),1);
+        assert_eq!(hits[0].title,"Example Pumps"); assert_eq!(hits[0].url,"https://example.org/Products");
+        assert!(hits[0].snippet.contains("importer")); assert_eq!(provider_family("brave_web"),"brave");
+    }
+
+    #[test]
+    fn unwraps_yahoo_tracking_but_rejects_private_destinations() {
+        assert_eq!(unwrap_yahoo_url("https://r.search.yahoo.com/_ylt=x/RU=https%3A%2F%2Fexample.org%2FA%2BB/RK=2/RS=x"), "https://example.org/A+B");
+        let bad = unwrap_yahoo_url("https://r.search.yahoo.com/_ylt=x/RU=http%3A%2F%2F127.0.0.1%2F/RK=2/RS=x");
+        assert!(bad.is_empty()); assert_eq!(provider_family("yahoo_web"),"bing");
+    }
 
     #[test]
     fn parses_html_search_fixture_and_unwraps_ddg_redirect() {
@@ -1172,6 +1374,19 @@ mod tests {
         let (_, visible, _) = html_page_content(html, &root, &root);
         assert!(!visible.contains("sales@example.com"));
         assert!(html.contains("sales%40example.com"));
+    }
+
+    #[tokio::test]
+    async fn a_slow_contact_page_does_not_erase_completed_first_party_evidence() {
+        let root=reqwest::Url::parse("https://example.org/").unwrap();
+        let page=|url:&str| SiteCrawlPage{url:url.into(),title:"Example Company".into(),text:"Contact our company".into(),
+            evidence:SourceEvidence::pending("fixture",url),is_pdf:false,raw_text:"<a href='mailto:sales@example.org'>Email</a>".into()};
+        let mut tasks=tokio::task::JoinSet::new();
+        let fast=page("https://example.org/contact");tasks.spawn(async move{fast});
+        let unrelated=page("https://other.example/contact");tasks.spawn(async move{unrelated});
+        tasks.spawn(async{std::future::pending::<SiteCrawlPage>().await});
+        let result=collect_site_results(tasks,tokio::time::Instant::now()+Duration::from_millis(40),&root).await;
+        assert_eq!(result.len(),1);assert!(result[0].raw_text.contains("sales@example.org"));
     }
 
     /// Real-world regression fixture supplied by the user. Run explicitly

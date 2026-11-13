@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Check, Copy, Languages, MoreHorizontal, Search, ShieldCheck, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useToastStore } from "@/stores/toast.store";
 
 interface Props {
   text: string;
@@ -24,13 +25,17 @@ export default function SelectionActionPopover({
   const [showSecondaryActions, setShowSecondaryActions] = useState(false);
 
   async function handleCopy() {
-    await navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      useToastStore.getState().addToast({ message: t("selection.copyFailed", "复制失败，请使用 Ctrl+C"), type: "error" });
+    }
   }
 
-  const left = Math.min(position.x, window.innerWidth - 260);
-  const top = Math.min(position.y + 10, window.innerHeight - 120);
+  const left = Math.max(8, Math.min(position.x + 8, window.innerWidth - 252));
+  const top = Math.max(8, Math.min(position.y + 10, window.innerHeight - 160));
 
   return (
     <div
@@ -48,10 +53,11 @@ export default function SelectionActionPopover({
         border: "1px solid var(--color-border)",
         backgroundColor: "var(--color-bg)",
         boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
-        zIndex: 1000,
+        zIndex: 1200,
         color: "var(--color-text-primary)",
       }}
       onClick={(e) => e.stopPropagation()}
+      onPointerDown={(e) => e.preventDefault()}
     >
       <button
         onClick={handleCopy}
@@ -65,6 +71,17 @@ export default function SelectionActionPopover({
       >
         {copied ? <Check size={14} /> : <Copy size={14} />}
         <span>{copied ? t("common.copied", "Copied") : t("common.copy", "Copy")}</span>
+      </button>
+
+      <button
+        type="button"
+        onClick={() => onTranslate(text, position)}
+        aria-label={t("selection.translateSelectedText", "Translate selected text")}
+        title={t("selection.translateSelectedText", "Translate selected text")}
+        style={{ ...primaryButtonStyle, backgroundColor: "var(--color-bg-secondary)", color: "var(--color-text-primary)" }}
+      >
+        <Languages size={14} />
+        <span>{t("selection.translate", "Translate")}</span>
       </button>
 
       <div style={{ position: "relative" }}>
@@ -93,15 +110,6 @@ export default function SelectionActionPopover({
               boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
             }}
           >
-            <button
-              role="menuitem"
-              onClick={() => onTranslate(text, position)}
-              aria-label={t("selection.translateSelectedText", "Translate selected text")}
-              style={menuButtonStyle}
-            >
-              <Languages size={14} />
-              <span>{t("selection.translate", "Translate")}</span>
-            </button>
             <button
               role="menuitem"
               onClick={() => onSearch(text)}

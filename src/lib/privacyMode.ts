@@ -1,5 +1,6 @@
 import type { PrivacyMode } from "@/lib/api";
-import { profileLocalStorage } from "@/lib/profileStorage";
+import { useSyncExternalStore } from "react";
+import { profileLocalStorage, subscribeProfileLocalStorage } from "@/lib/profileStorage";
 
 export const PRIVACY_MODE_KEY = "pebble-privacy-mode";
 export const DEFAULT_STORED_PRIVACY_MODE = "relaxed";
@@ -30,4 +31,14 @@ export function privacyModeToApi(mode: StoredPrivacyMode): PrivacyMode {
 
 export function defaultPrivacyMode(): PrivacyMode {
   return privacyModeToApi(readStoredPrivacyMode());
+}
+
+function subscribePrivacyMode(listener: () => void) {
+  return subscribeProfileLocalStorage((key) => {
+    if (key === null || key === PRIVACY_MODE_KEY) listener();
+  }, true);
+}
+
+export function useStoredPrivacyMode(): StoredPrivacyMode {
+  return useSyncExternalStore(subscribePrivacyMode, readStoredPrivacyMode);
 }

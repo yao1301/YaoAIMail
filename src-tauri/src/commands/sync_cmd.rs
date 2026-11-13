@@ -122,11 +122,16 @@ async fn start_sync_inner(
     let (stop_tx, stop_rx) = watch::channel(false);
     let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
 
-    let (error_tx, mut error_rx) = mpsc::unbounded_channel();
+    let (error_tx, mut error_rx) = mpsc::unbounded_channel::<pebble_mail::SyncError>();
     let app_handle = app.clone();
     tokio::spawn(async move {
         while let Some(sync_error) = error_rx.recv().await {
-            let _ = app_handle.emit(events::MAIL_ERROR, &sync_error);
+            let _ = app_handle.emit(events::MAIL_ERROR, serde_json::json!({
+                "account_id": account_id_for_errors,
+                "error_type": sync_error.error_type,
+                "message": sync_error.message,
+                "timestamp": sync_error.timestamp,
+            }));
             emit_realtime_status(
                 &app_handle,
                 realtime_status_payload(

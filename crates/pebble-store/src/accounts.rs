@@ -110,11 +110,54 @@ impl Store {
         display_name: &str,
         color: Option<&str>,
     ) -> Result<()> {
+        self.update_account_with_sender(id, email, display_name, color, None)
+    }
+
+    /// Outgoing name is separate from the local label. Legacy names are frozen
+    /// before the first rename, preserving the sender users previously chose.
+    pub fn account_sender_name(&self, id: &str) -> Result<String> {
+        let account = self.get_account(id)?.ok_or_else(|| PebbleError::Validation("账号不存在".into()))?;
+        Ok(self.get_sync_state(id)?.and_then(|s| s.extra.get("sender_name").and_then(|v| v.as_str()).map(str::to_owned))
+            .unwrap_or(account.display_name))
+    }
+
+    /// A provider subject remains bound even if a mailbox address is recycled.
+    pub fn bind_oauth_sender_identity(&self, id: &str, verified_email: &str, subject: &str) -> Result<()> {
+        if subject.trim().is_empty() || verified_email.trim().is_empty() { return Err(PebbleError::Validation("授权邮箱身份不完整".into())); }
         self.with_write(|conn| {
+            let (email,provider,raw):(String,String,Option<String>)=conn.query_row("SELECT email,provider,sync_state FROM accounts WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            if !matches!(provider.as_str(),"gmail"|"outlook") || !email.trim().eq_ignore_ascii_case(verified_email.trim()) {
+                return Err(PebbleError::Validation("账号已变化，请核对授权邮箱".into()));
+            }
+            let mut sync=SyncState::from_json_opt(raw.as_deref())?;
+            if let Some(old)=sync.extra.get("sender_oauth_subject").and_then(|v|v.as_str()) {
+                if old!=subject { return Err(PebbleError::Validation("授权属于另一个邮箱身份，请重新连接原账号".into())); }
+                return Ok(());
+            }
+            sync.extra.insert("sender_oauth_subject".into(),serde_json::Value::String(subject.to_owned()));
+            conn.execute("UPDATE accounts SET sync_state=?1 WHERE id=?2",rusqlite::params![sync.to_json()?,id])?;
+            Ok(())
+        })
+    }
+
+    pub fn update_account_with_sender(&self, id: &str, email: &str, display_name: &str, color: Option<&str>, sender_name: Option<&str>) -> Result<()> {
+        self.with_write(|conn| {
+            let (old_email, old_name, provider, raw): (String,String,String,Option<String>) = conn.query_row(
+                "SELECT email,display_name,provider,sync_state FROM accounts WHERE id=?1", [id],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+            if matches!(provider.as_str(), "gmail" | "outlook") && !old_email.trim().eq_ignore_ascii_case(email.trim()) {
+                return Err(PebbleError::Validation("授权邮箱地址不能直接修改，请重新添加账号".into()));
+            }
+            let mut sync = SyncState::from_json_opt(raw.as_deref())?;
+            let name = sender_name.map(str::to_owned).or_else(|| sync.extra.get("sender_name").and_then(|v| v.as_str()).map(str::to_owned)).unwrap_or(old_name);
+            if name.chars().any(char::is_control) || email.chars().any(char::is_control) {
+                return Err(PebbleError::Validation("发件身份不能包含控制字符".into()));
+            }
+            sync.extra.insert("sender_name".into(), serde_json::Value::String(name.trim().to_owned()));
             let now = pebble_core::now_timestamp();
             conn.execute(
-                "UPDATE accounts SET email = ?1, display_name = ?2, color = ?3, updated_at = ?4 WHERE id = ?5",
-                rusqlite::params![email, display_name, color, now, id],
+                "UPDATE accounts SET email = ?1, display_name = ?2, color = ?3, updated_at = ?4, sync_state=?6 WHERE id = ?5",
+                rusqlite::params![email.trim(), display_name, color, now, id, sync.to_json()?],
             )?;
             Ok(())
         })
@@ -335,6 +378,41 @@ mod cursor_tests {
 
         let cursor = store.get_sync_cursor(&account.id).unwrap();
         assert!(cursor.is_none());
+    }
+
+    #[test]
+    fn sender_identity_survives_local_rename_and_cursor_updates() {
+        let store=Store::open_in_memory().unwrap(); let account=test_account(); store.insert_account(&account).unwrap();
+        store.set_sync_cursor(&account.id,"cursor-1").unwrap();
+        store.update_account(&account.id,&account.email,"Local label",None).unwrap();
+        assert_eq!(store.account_sender_name(&account.id).unwrap(),account.display_name);
+        store.update_account_with_sender(&account.id,&account.email,"Another label",None,Some("Public Team")).unwrap();
+        store.set_sync_cursor(&account.id,"cursor-2").unwrap();
+        assert_eq!(store.account_sender_name(&account.id).unwrap(),"Public Team");
+        assert_eq!(store.get_sync_cursor(&account.id).unwrap().as_deref(),Some("cursor-2"));
+        assert!(store.update_account_with_sender(&account.id,&account.email,"Bad",None,Some("Bad\r\nBcc: injected@example.com")).is_err());
+        assert_eq!(store.account_sender_name(&account.id).unwrap(),"Public Team");
+    }
+
+    #[test]
+    fn sender_identity_oauth_mailbox_cannot_be_reassigned_by_editing_label() {
+        let store=Store::open_in_memory().unwrap(); let mut account=test_account(); account.provider=ProviderType::Gmail; store.insert_account(&account).unwrap();
+        assert!(store.update_account(&account.id,"other@example.com","Label",None).is_err());
+        assert_eq!(store.get_account(&account.id).unwrap().unwrap().email,account.email);
+    }
+
+    #[test]
+    fn sender_identity_oauth_subject_is_bound_without_clobbering_sync_state() {
+        let store=Store::open_in_memory().unwrap(); let mut account=test_account();account.provider=ProviderType::Outlook;store.insert_account(&account).unwrap();
+        store.set_sync_cursor(&account.id,"cursor").unwrap();
+        assert!(store.bind_oauth_sender_identity(&account.id,&account.email,"").is_err());
+        store.bind_oauth_sender_identity(&account.id,&account.email,"provider-subject-1").unwrap();
+        store.bind_oauth_sender_identity(&account.id,&account.email,"provider-subject-1").unwrap();
+        assert!(store.bind_oauth_sender_identity(&account.id,&account.email,"provider-subject-2").is_err());
+        assert!(store.bind_oauth_sender_identity(&account.id,"other@example.com","provider-subject-1").is_err());
+        store.update_account(&account.id,&account.email,"Private Label",None).unwrap();
+        assert_eq!(store.get_sync_cursor(&account.id).unwrap().as_deref(),Some("cursor"));
+        assert_eq!(store.get_sync_state(&account.id).unwrap().unwrap().extra["sender_oauth_subject"],"provider-subject-1");
     }
 
     #[test]

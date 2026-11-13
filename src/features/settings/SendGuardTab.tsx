@@ -1,25 +1,28 @@
-import { useEffect, useState } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
 import { getSendGuardConfig, setSendGuardConfig, type GuardMode, type SendGuardConfig } from "@/lib/api";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
-import { useToastStore } from "@/stores/toast.store";
 import { useUIStore } from "@/stores/ui.store";
+import { SettingsFeedback, type SettingsNotice } from "./SettingsFeedback";
 
 export default function SendGuardTab() {
-  const [config, setConfig] = useState<SendGuardConfig>({ enabled: false, mode: "soft" });
-  const [saving, setSaving] = useState(false);
+  const [config, setConfig] = useWorkspaceState<SendGuardConfig>("src/features/settings/SendGuardTab.tsx:SendGuardTab:config", { enabled: false, mode: "soft" });
+  const [saving, setSaving] = useWorkspaceState("src/features/settings/SendGuardTab.tsx:SendGuardTab:saving", false);
+  const [feedback, setFeedback] = useWorkspaceState<(SettingsNotice & { field: "enabled" | "mode" }) | null>("src/features/settings/SendGuardTab.tsx:SendGuardTab:feedback", null);
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/SendGuardTab.tsx:", () => {
     void getSendGuardConfig().then(setConfig).catch(() => {});
   }, []);
 
-  async function persist(next: SendGuardConfig) {
+  async function persist(next: SendGuardConfig, field: "enabled" | "mode") {
     setSaving(true);
+    setFeedback(null);
     try {
       setConfig(await setSendGuardConfig(next));
     } catch (error) {
-      useToastStore.getState().addToast({
+      setFeedback({
         message: `保存发送防呆设置失败：${extractErrorMessage(error)}`,
-        type: "error",
+        kind: "error",
+        field,
       });
     } finally {
       setSaving(false);
@@ -27,7 +30,7 @@ export default function SendGuardTab() {
   }
 
   function setMode(mode: GuardMode) {
-    void persist({ ...config, mode });
+    void persist({ ...config, mode }, "mode");
   }
 
   const buttonStyle: React.CSSProperties = {
@@ -47,10 +50,11 @@ export default function SendGuardTab() {
             type="checkbox"
             checked={config.enabled}
             disabled={saving}
-            onChange={() => void persist({ ...config, enabled: !config.enabled })}
+            onChange={() => void persist({ ...config, enabled: !config.enabled }, "enabled")}
           />
           启用发送防呆
         </label>
+        <SettingsFeedback notice={feedback?.field === "enabled" ? feedback : null} />
         <p style={{ margin: "6px 0 0 24px", fontSize: "12px", color: "var(--color-text-secondary)" }}>
           联系人类型不在这里重复维护，统一读取地址本中的角色标签。
         </p>
@@ -66,6 +70,7 @@ export default function SendGuardTab() {
             严格检查
           </button>
         </div>
+        <SettingsFeedback notice={feedback?.field === "mode" ? feedback : null} />
       </section>
 
       <section>

@@ -53,6 +53,10 @@ pub struct LlmProvider {
     pub api_key: String,
     pub model: String,
     pub mode: LLMMode,
+    /// Missing in older profiles, which always inherited the shared proxy.
+    /// Newly created profiles explicitly store false until the user opts in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_proxy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

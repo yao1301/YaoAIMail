@@ -43,7 +43,7 @@ describe("useAccountsQuery", () => {
     const result = await listAccounts();
 
     expect(result).toEqual(mockAccounts);
-    expect(mockInvoke).toHaveBeenCalledWith("list_accounts");
+    expect(mockInvoke).toHaveBeenCalledWith("list_accounts", undefined);
   });
 
   it("getOAuthAccountProxy should call the correct Tauri command", async () => {
@@ -75,7 +75,7 @@ describe("useAccountsQuery", () => {
     const result = await getGlobalProxy();
 
     expect(result).toEqual({ host: "127.0.0.1", port: 7890 });
-    expect(mockInvoke).toHaveBeenCalledWith("get_global_proxy");
+    expect(mockInvoke).toHaveBeenCalledWith("get_global_proxy", undefined);
   });
 
   it("updateGlobalProxy should call the correct Tauri command", async () => {

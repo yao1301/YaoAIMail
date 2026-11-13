@@ -4,6 +4,7 @@ type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 type NamespaceResolver = () => Promise<string>;
 
 let profileStorageNamespace: string | null = null;
+const localChanges = new EventTarget();
 
 function normalizeNamespace(namespace: string | null | undefined): string | null {
   const trimmed = namespace?.trim() ?? "";
@@ -14,16 +15,49 @@ function scopedKey(key: string): string {
   return profileStorageNamespace ? `pebble:profile:${profileStorageNamespace}:${key}` : key;
 }
 
-function createProfileStorage(storage: StorageLike): StorageLike {
+function createProfileStorage(storage: StorageLike, announce = false): StorageLike {
   return {
     getItem: (key) => storage.getItem(scopedKey(key)),
-    setItem: (key, value) => storage.setItem(scopedKey(key), value),
-    removeItem: (key) => storage.removeItem(scopedKey(key)),
+    setItem: (key, value) => {
+      storage.setItem(scopedKey(key), value);
+      if (announce) localChanges.dispatchEvent(new CustomEvent("change", { detail: key }));
+    },
+    removeItem: (key) => {
+      storage.removeItem(scopedKey(key));
+      if (announce) localChanges.dispatchEvent(new CustomEvent("change", { detail: key }));
+    },
   };
 }
 
-export const profileLocalStorage = createProfileStorage(localStorage);
+export const profileLocalStorage = createProfileStorage(localStorage, true);
 export const profileSessionStorage = createProfileStorage(sessionStorage);
+
+/** Observe saved settings in the same profile; session state stays window-local. */
+export function subscribeProfileLocalStorage(
+  listener: (key: string | null) => void,
+  includeLocal = false,
+): () => void {
+  function onStorage(event: StorageEvent) {
+    if (event.storageArea !== localStorage) return;
+    if (event.key === null) {
+      listener(null);
+      return;
+    }
+    const prefix = scopedKey("");
+    if (event.key.startsWith(prefix) && (prefix || !event.key.startsWith("pebble:profile:"))) {
+      listener(event.key.slice(prefix.length));
+    }
+  }
+  function onLocal(event: Event) {
+    listener((event as CustomEvent<string>).detail);
+  }
+  window.addEventListener("storage", onStorage);
+  if (includeLocal) localChanges.addEventListener("change", onLocal);
+  return () => {
+    window.removeEventListener("storage", onStorage);
+    if (includeLocal) localChanges.removeEventListener("change", onLocal);
+  };
+}
 
 // localStorage keys written by releases before profile-scoped storage existed.
 // On upgrades the scoped key starts out missing, so without copying these over

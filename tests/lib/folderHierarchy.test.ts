@@ -19,15 +19,15 @@ function folder(id: string, parentId: string | null, sortOrder: number): Folder 
 
 describe("withFolderDepth", () => {
   it("places a child immediately after its real parent, before the next root", () => {
-    const rsg = folder("RSG", null, 100);
-    const wash = folder("WASH GEC", null, 100);
-    const catchAll = folder("Catch-All", "RSG", 100);
+    const parentFolder = folder("Client Alpha", null, 100);
+    const siblingFolder = folder("Client Beta", null, 100);
+    const catchAll = folder("Catch-All", "Client Alpha", 100);
 
-    expect(withFolderDepth([rsg, wash, catchAll]).map(({ folder: item, depth }) => [item.id, depth]))
+    expect(withFolderDepth([parentFolder, siblingFolder, catchAll]).map(({ folder: item, depth }) => [item.id, depth]))
       .toEqual([
-        ["RSG", 0],
+        ["Client Alpha", 0],
         ["Catch-All", 1],
-        ["WASH GEC", 0],
+        ["Client Beta", 0],
       ]);
   });
 

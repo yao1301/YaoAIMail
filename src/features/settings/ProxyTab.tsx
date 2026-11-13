@@ -1,17 +1,17 @@
-import { useCallback, useEffect, useState } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
+import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import {
   getAccountProxySetting,
-  getGlobalProxy,
   getOAuthAccountProxySetting,
   updateAccountProxySetting,
-  updateGlobalProxy,
   updateOAuthAccountProxySetting,
 } from "@/lib/api";
 import type { Account, AccountProxyMode } from "@/lib/api";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { useAccountsQuery } from "@/hooks/queries";
 import { useToastStore } from "@/stores/toast.store";
+import GlobalProxySettings from "./GlobalProxySettings";
 
 type AccountProxyDraft = {
   mode: AccountProxyMode;
@@ -38,43 +38,17 @@ export default function ProxyTab() {
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
   const { data: accounts = [] } = useAccountsQuery();
-  const [proxyHost, setProxyHost] = useState("");
-  const [proxyPort, setProxyPort] = useState("");
-  const [proxyLoading, setProxyLoading] = useState(true);
-  const [proxySaving, setProxySaving] = useState(false);
-  const [proxyError, setProxyError] = useState<string | null>(null);
-  const [accountProxyDrafts, setAccountProxyDrafts] = useState<Record<string, AccountProxyDraft>>({});
+  const [accountProxyDrafts, setAccountProxyDrafts] = useWorkspaceState<Record<string, AccountProxyDraft>>("src/features/settings/ProxyTab.tsx:ProxyTab:accountProxyDrafts", {});
   const accountIdsKey = accounts.map((account) => `${account.id}:${account.provider}`).join("|");
   const proxyAccounts = accounts;
 
   const modeOptions: Array<{ mode: AccountProxyMode; label: string }> = [
-    { mode: "inherit", label: t("settings.accountProxyModeInherit", "Inherit global proxy") },
+    { mode: "inherit", label: t("settings.accountProxyModeInherit", "Use mail default (direct unless configured)") },
     { mode: "disabled", label: t("settings.accountProxyModeDisabled", "Do not use proxy") },
     { mode: "custom", label: t("settings.accountProxyModeCustom", "Use custom proxy") },
   ];
 
-  useEffect(() => {
-    let cancelled = false;
-    setProxyLoading(true);
-    getGlobalProxy()
-      .then((proxy) => {
-        if (cancelled) return;
-        setProxyHost(proxy?.host ?? "");
-        setProxyPort(proxy?.port ? String(proxy.port) : "");
-        setProxyError(null);
-      })
-      .catch((err) => {
-        if (!cancelled) setProxyError(extractErrorMessage(err));
-      })
-      .finally(() => {
-        if (!cancelled) setProxyLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/ProxyTab.tsx:", () => {
     let cancelled = false;
     const accountIds = new Set(proxyAccounts.map((account) => account.id));
     setAccountProxyDrafts((current) => {
@@ -137,27 +111,6 @@ export default function ProxyTab() {
     };
   }, [accountIdsKey]);
 
-  const saveGlobalProxy = useCallback(async () => {
-    setProxySaving(true);
-    setProxyError(null);
-    const trimmedHost = proxyHost.trim();
-    const trimmedPort = proxyPort.trim();
-    const parsedPort = trimmedPort ? Number.parseInt(trimmedPort, 10) : undefined;
-    const normalizedPort =
-      parsedPort === undefined || Number.isNaN(parsedPort) ? undefined : parsedPort;
-    try {
-      await updateGlobalProxy(trimmedHost || undefined, normalizedPort);
-      addToast({
-        message: t("settings.globalProxySaved", "Global proxy saved"),
-        type: "success",
-      });
-    } catch (err) {
-      setProxyError(extractErrorMessage(err));
-    } finally {
-      setProxySaving(false);
-    }
-  }, [addToast, proxyHost, proxyPort, t]);
-
   const updateAccountDraft = useCallback((accountId: string, patch: Partial<AccountProxyDraft>) => {
     setAccountProxyDrafts((current) => ({
       ...current,
@@ -206,90 +159,13 @@ export default function ProxyTab() {
 
   return (
     <div>
-      <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "8px" }}>
-        {t("settings.globalProxy", "Global Proxy")}
-      </h3>
-      <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", marginBottom: "12px", marginTop: 0 }}>
-        {t("settings.globalProxyDesc", "Used by translation, OAuth, Gmail/Outlook API requests, IMAP, POP3, and SMTP when an account does not define its own SOCKS5 proxy.")}
-      </p>
-      <div
-        role="group"
-        aria-label={t("settings.globalProxy", "Global Proxy")}
-        style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "flex-end" }}
-      >
-        <label style={{ display: "grid", gap: "6px", fontSize: "12px", color: "var(--color-text-secondary)", flex: "1 1 220px", minWidth: 0 }}>
-          {t("settings.globalProxyHost", "SOCKS5 Proxy")}
-          <input
-            aria-label={t("settings.globalProxyHost", "SOCKS5 Proxy")}
-            type="text"
-            value={proxyHost}
-            onChange={(e) => setProxyHost(e.target.value)}
-            placeholder="127.0.0.1"
-            disabled={proxyLoading || proxySaving}
-            style={{
-              width: "100%",
-              minWidth: 0,
-              boxSizing: "border-box",
-              padding: "8px 10px",
-              borderRadius: "6px",
-              border: "1px solid var(--color-border)",
-              backgroundColor: "var(--color-bg-primary)",
-              color: "var(--color-text-primary)",
-              fontSize: "13px",
-            }}
-          />
-        </label>
-        <label style={{ display: "grid", gap: "6px", fontSize: "12px", color: "var(--color-text-secondary)", width: "110px", minWidth: 0 }}>
-          {t("settings.globalProxyPort", "Port")}
-          <input
-            aria-label={t("settings.globalProxyPort", "Port")}
-            type="number"
-            value={proxyPort}
-            onChange={(e) => setProxyPort(e.target.value)}
-            placeholder="7890"
-            disabled={proxyLoading || proxySaving}
-            style={{
-              width: "100%",
-              minWidth: 0,
-              boxSizing: "border-box",
-              padding: "8px 10px",
-              borderRadius: "6px",
-              border: "1px solid var(--color-border)",
-              backgroundColor: "var(--color-bg-primary)",
-              color: "var(--color-text-primary)",
-              fontSize: "13px",
-            }}
-          />
-        </label>
-        <button
-          type="button"
-          onClick={saveGlobalProxy}
-          disabled={proxyLoading || proxySaving}
-          style={{
-            padding: "8px 12px",
-            borderRadius: "6px",
-            border: "1px solid var(--color-border)",
-            backgroundColor: "var(--color-bg-hover)",
-            color: "var(--color-text-primary)",
-            cursor: proxyLoading || proxySaving ? "default" : "pointer",
-            fontSize: "13px",
-            fontWeight: 500,
-          }}
-        >
-          {proxySaving ? t("common.saving", "Saving...") : t("common.save", "Save")}
-        </button>
-      </div>
-      {proxyError && (
-        <p style={{ fontSize: "12px", color: "var(--color-error)", marginTop: "8px", marginBottom: 0 }}>
-          {proxyError}
-        </p>
-      )}
-
+      <GlobalProxySettings />
+      <details style={{ marginTop: 24 }}><summary style={{ cursor: "pointer", fontSize: 13 }}>个别邮箱单独设置（可选）</summary>
       <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "8px", marginTop: "32px" }}>
         {t("settings.accountProxies", "Account Proxies")}
       </h3>
       <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", marginBottom: "12px", marginTop: 0 }}>
-        {t("settings.accountProxiesDesc", "Override the global SOCKS5 proxy for individual accounts.")}
+        {t("settings.accountProxiesDesc", "Choose the mail default, direct access or a custom proxy per account. AI proxy settings never apply here.")}
       </p>
 
       {proxyAccounts.length === 0 ? (
@@ -444,6 +320,7 @@ export default function ProxyTab() {
             })}
         </div>
       )}
+      </details>
     </div>
   );
 }

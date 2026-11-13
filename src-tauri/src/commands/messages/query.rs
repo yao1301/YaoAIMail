@@ -11,18 +11,25 @@ pub async fn list_messages(
     offset: u32,
     cursor_date: Option<i64>,
     cursor_id: Option<String>,
+    sender_ascending: Option<bool>,
 ) -> std::result::Result<Vec<MessageSummary>, PebbleError> {
     let store = state.store.clone();
     let cursor = cursor_date.zip(cursor_id);
-    tokio::task::spawn_blocking(move || match cursor {
-        Some(cursor) => match folder_ids {
-            Some(ids) if !ids.is_empty() => store.list_messages_by_folders_cursor(&ids, limit, Some(cursor)),
-            _ => store.list_messages_by_folder_cursor(&folder_id, limit, Some(cursor)),
-        },
-        None => match folder_ids {
-            Some(ids) if !ids.is_empty() => store.list_messages_by_folders(&ids, limit, offset),
-            _ => store.list_messages_by_folder(&folder_id, limit, offset),
-        },
+    tokio::task::spawn_blocking(move || {
+        if let Some(ascending) = sender_ascending {
+            let ids = folder_ids.filter(|ids| !ids.is_empty()).unwrap_or_else(|| vec![folder_id]);
+            return store.list_messages_by_sender(Some(&ids), limit, offset, ascending);
+        }
+        match cursor {
+            Some(cursor) => match folder_ids {
+                Some(ids) if !ids.is_empty() => store.list_messages_by_folders_cursor(&ids, limit, Some(cursor)),
+                _ => store.list_messages_by_folder_cursor(&folder_id, limit, Some(cursor)),
+            },
+            None => match folder_ids {
+                Some(ids) if !ids.is_empty() => store.list_messages_by_folders(&ids, limit, offset),
+                _ => store.list_messages_by_folder(&folder_id, limit, offset),
+            },
+        }
     })
     .await
     .map_err(|e| PebbleError::Internal(format!("Task join error: {e}")))?
@@ -34,9 +41,13 @@ pub async fn list_unread_messages(
     state: State<'_, AppState>,
     limit: u32,
     offset: u32,
+    sender_ascending: Option<bool>,
+    visible_ids: Option<Vec<String>>,
 ) -> std::result::Result<Vec<MessageSummary>, PebbleError> {
     let store = state.store.clone();
-    tokio::task::spawn_blocking(move || store.list_unread_messages(limit, offset))
+    tokio::task::spawn_blocking(move || {
+        store.list_unread_messages(limit, offset, sender_ascending, &visible_ids.unwrap_or_default())
+    })
         .await
         .map_err(|e| PebbleError::Internal(format!("Task join error: {e}")))?
 }

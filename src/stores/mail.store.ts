@@ -12,6 +12,7 @@ interface MailState {
   // ─── UI State ──────────────────────────────────────────────────────────────
   activeAccountId: string | null;
   activeFolderId: string | null;
+  folderVisit: number;
   /** Scope selected from the sidebar for the next mailbox search. */
   searchScope: SearchScope;
   /** 搜索范围：下拉切换后覆盖侧边栏选择；auto 跟随当前选择。 */
@@ -51,6 +52,7 @@ interface MailState {
 export const useMailStore = create<MailState>((set, get) => ({
   activeAccountId: null,
   activeFolderId: null,
+  folderVisit: 0,
   searchScope: null,
   searchRange: "auto",
   selectedMessageId: null,
@@ -72,13 +74,14 @@ export const useMailStore = create<MailState>((set, get) => ({
   },
 
   setActiveFolderId: (folderId) => {
-    set({
+    set((state) => ({
       activeFolderId: folderId,
+      folderVisit: state.folderVisit + 1,
       selectedMessageId: null,
       selectedThreadId: null,
       selectedMessageIds: new Set(),
       batchMode: false,
-    });
+    }));
   },
 
   setSearchScope: (scope) => set({ searchScope: scope }),

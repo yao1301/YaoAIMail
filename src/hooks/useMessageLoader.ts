@@ -1,93 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { getMessageWithHtml, getRenderedHtml, listAttachments, readAttachmentFile } from "@/lib/api";
+import { getMessageWithHtml, getRenderedHtml } from "@/lib/api";
 import { useUpdateFlagsMutation } from "@/hooks/mutations/useUpdateFlagsMutation";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
+import { inlineEmbeddedImages } from "@/lib/inlineImages";
 import type { Message, RenderedHtml, PrivacyMode } from "@/lib/api";
-
-function bytesToBase64(bytes: number[]): string {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    const chunk = bytes.slice(i, i + 0x8000);
-    binary += String.fromCharCode(...chunk);
-  }
-  return btoa(binary);
-}
-
-function normalizeCid(value: string): string {
-  let decoded = value.trim();
-  try {
-    decoded = decodeURIComponent(decoded);
-  } catch {
-    // A malformed percent escape must not prevent the rest of the message
-    // from rendering.
-  }
-  return decoded
-    .replace(/^cid:/i, "")
-    .replace(/^<+|>+$/g, "")
-    .trim()
-    .toLowerCase();
-}
-
-async function inlineEmbeddedImages(html: string, messageId: string): Promise<string> {
-  const attachments = await listAttachments(messageId);
-  if (!/\bcid:/i.test(html)) return html;
-
-  // IMAP servers and mail clients are inconsistent about Content-Disposition.
-  // A genuine inline image may have Content-ID but no `inline` disposition;
-  // filtering on `is_inline` alone leaves a broken image in the message body.
-  const candidates = attachments.filter((attachment) =>
-    Boolean(attachment.content_id)
-      || (attachment.is_inline && /^image\//i.test(attachment.mime_type)),
-  );
-  if (candidates.length === 0) return html;
-
-  const replacements = new Map<string, string>();
-  const filenameKeys = new Map<string, typeof candidates[number]>();
-  for (const attachment of candidates) {
-    filenameKeys.set(normalizeCid(attachment.filename), attachment);
-  }
-
-  await Promise.all(candidates.map(async (attachment) => {
-    try {
-      const file = await readAttachmentFile(attachment.id);
-      const dataUrl = `data:${file.mime_type || attachment.mime_type || "application/octet-stream"};base64,${bytesToBase64(file.bytes)}`;
-      if (attachment.content_id) {
-        replacements.set(normalizeCid(attachment.content_id), dataUrl);
-      }
-      // Some clients put the filename (or filename@server) in cid:. Keeping
-      // this fallback fixes those messages without allowing arbitrary remote
-      // URLs into the rendered email.
-      replacements.set(normalizeCid(attachment.filename), dataUrl);
-    } catch {
-      // A missing inline file should leave the image blocked rather than fail the message.
-    }
-  }));
-
-  const template = document.createElement("template");
-  template.innerHTML = html;
-  template.content.querySelectorAll<HTMLImageElement>("img[src]").forEach((image) => {
-    const src = image.getAttribute("src")?.trim() ?? "";
-    if (!/^cid:/i.test(src)) return;
-
-    const key = normalizeCid(src);
-    let replacement = replacements.get(key);
-    if (!replacement) {
-      // A common form is cid:image001.png@ABC while the MIME part stores only
-      // image001.png as its filename.
-      const filenameKey = key.split("@")[0];
-      const filenameAttachment = filenameKeys.get(filenameKey);
-      if (filenameAttachment) {
-        replacement = replacements.get(normalizeCid(filenameAttachment.filename));
-      }
-    }
-    if (!replacement && candidates.length === 1) {
-      replacement = replacements.get(normalizeCid(candidates[0].filename));
-    }
-    if (replacement) image.setAttribute("src", replacement);
-  });
-  return template.innerHTML;
-}
 
 export function useMessageLoader(messageId: string | null, privacyMode: PrivacyMode) {
   const flagsMutation = useUpdateFlagsMutation();
@@ -175,6 +92,7 @@ export function useMessageLoader(messageId: string | null, privacyMode: PrivacyM
             setRendered({ ...html, html: sanitizeHtml(h) }),
           );
           setError(null);
+          setHydrateFailed(false);
         })
         .catch(() => {});
     });

@@ -39,6 +39,11 @@
         overflow: hidden;
         transition: opacity .5s ease-out;
       }
+      /* A detached mail/compose window is not an application startup. This
+         selector is active before the splash markup can first be painted. */
+      html[data-subwindow="true"] #splash {
+        display: none;
+      }
       @media (prefers-color-scheme: light) {
         #splash {
           background: #f5f5f5;
@@ -104,6 +109,35 @@
         background: #d4714e;
         animation: splash-slide 1.2s ease-in-out .8s infinite;
       }
+      #splash .startup-tip {
+        width: min(520px, calc(100% - 48px));
+        min-height: 96px;
+        margin-top: 26px;
+        text-align: center;
+        color: #b8b8b8;
+        font-size: 13px;
+        line-height: 1.8;
+        overflow-wrap: anywhere;
+      }
+      #splash .startup-tip-label {
+        margin-bottom: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        color: #d4714e;
+      }
+      #splash .startup-tip-text { margin: 0; }
+      html[data-theme="light"] #splash { background: #f5f5f5; }
+      html[data-theme="light"] #splash .app-name { color: #333; }
+      html[data-theme="light"] #splash .startup-tip { color: #595959; }
+      html[data-theme="light"] #splash .loading-bar { background: rgba(0,0,0,.08); }
+      html[data-theme="dark"] #splash { background: #1a1a1a; }
+      html[data-theme="dark"] #splash .app-name { color: #e0e0e0; }
+      html[data-theme="dark"] #splash .loading-bar { background: rgba(255,255,255,.08); }
+      @media (max-height: 360px) {
+        #splash .app-logo { width: 44px; height: 44px; margin-bottom: 12px; }
+        #splash .loading-bar { margin-top: 14px; }
+        #splash .startup-tip { margin-top: 14px; min-height: 0; }
+      }
       @keyframes splash-slide {
         0%   { transform: translateX(-100%); }
         100% { transform: translateX(350%); }
@@ -111,6 +145,10 @@
     </style>
     <script>
       window.__splashStart=Date.now();
+      // React mounts after async profile/module loading, which is too late
+      // to suppress the first splash frame in an already-visible WebView.
+      var windowParams=new URLSearchParams(window.location.search);
+      if(windowParams.get('mailWindow')==='1'||windowParams.get('compose')==='1'||windowParams.get('workspaceWindow')==='1')document.documentElement.setAttribute('data-subwindow','true');
       // Apply saved theme immediately to avoid flash of wrong theme
       try{var t=localStorage.getItem('pebble-theme')||'light';var d=t==='system'?matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light':t;document.documentElement.setAttribute('data-theme',d)}catch(e){}
     </script>
@@ -118,7 +156,58 @@
       <img class="app-logo" src="/yao-logo.png" alt="YaoAIMail" />
       <div class="app-name">YaoAIMail</div>
       <div class="loading-bar"></div>
+      <div class="startup-tip" aria-label="使用提示">
+        <div class="startup-tip-label">使用提示</div>
+        <p class="startup-tip-text" id="startup-tip-text">邮件和附件保存在本机。使用 AI 功能时，相关邮件、指令及参考资料会发送至您配置的 AI 服务商。请遵守所在组织的数据与 AI 使用规定。</p>
+      </div>
     </div>
+    <script>
+      // Run before React/profile loading. Store only a display counter; never
+      // inspect mail, credentials or task history to select these local tips.
+      (function () {
+        var splash = document.getElementById('splash');
+        var text = document.getElementById('startup-tip-text');
+        if (!splash || !text || document.documentElement.getAttribute('data-subwindow') === 'true') return;
+        var tips = [
+          text.textContent,
+          '在 AI 指令栏拖入邮件或参考文件，再说明您的要求，AI 就能结合这些资料生成草稿。参考文件不会自动成为发信附件。',
+          'AI 生成的邮件会先进入草稿。发送前，请核对收件人、金额、日期及附件，确认无误后再发送。',
+          '在邮件正文中选中文字，即可使用翻译或复制。翻译功能需要先在设置中启用并配置相应服务。',
+          '您可以拖动标签，将邮件、草稿或工作页面移到独立窗口，方便对照资料和处理邮件。',
+          '需要 Gemini 等模型使用代理时，可在该模型的配置中勾选“使用代理”；其他模型可以保持直连。',
+          '使用“开发客户”时，可以保存常用搜索条件。继续查找会沿用当前条件；更换产品、市场或要求时，请新建任务。',
+          '建议定期备份整个数据文件夹，包括邮件、附件和设置。可在“设置 → 通用”中查看当前数据保存位置。'
+        ];
+        var key = 'yaoaimail-startup-tip-index-v1';
+        var index = 0;
+        try {
+          var saved = localStorage.getItem(key);
+          if (saved !== null && /^\d{1,6}$/.test(saved)) index = Number(saved) % tips.length;
+        } catch (error) { /* Tips still work when local storage is unavailable. */ }
+        function showTip() {
+          text.textContent = tips[index];
+          index = (index + 1) % tips.length;
+          try { localStorage.setItem(key, String(index)); } catch (error) {}
+        }
+        showTip();
+        // Never extend startup to make a tip readable. Rotate only if loading
+        // actually lasts longer, and release resources as soon as it ends.
+        var timer = window.setInterval(function () {
+          if (!splash.isConnected || splash.classList.contains('fade-out')) { stop(); return; }
+          if (!document.hidden) showTip();
+        }, 8000);
+        var observer = new MutationObserver(function () {
+          if (!splash.isConnected || splash.classList.contains('fade-out')) stop();
+        });
+        function stop() {
+          window.clearInterval(timer);
+          observer.disconnect();
+          window.removeEventListener('pagehide', stop);
+        }
+        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+        window.addEventListener('pagehide', stop, { once: true });
+      })();
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

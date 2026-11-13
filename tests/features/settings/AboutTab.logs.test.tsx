@@ -34,6 +34,15 @@ describe("AboutTab diagnostics", () => {
     });
   });
 
+  it("shows the AI disclosure without opening diagnostics or making an AI request", async () => {
+    render(<AboutTab />);
+    const notice = screen.getByRole("region", { name: "Privacy and AI use" });
+    expect(notice.textContent).toContain("sent to the AI service provider you configure");
+    expect(notice.textContent).toContain("organization's rules");
+    await screen.findByText(/1\.2\.3/);
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
   it("opens the diagnostic log after five quick app icon clicks", async () => {
     render(<AboutTab />);
 
@@ -51,7 +60,7 @@ describe("AboutTab diagnostics", () => {
       expect(mockInvoke).toHaveBeenCalledWith("read_app_log", { maxBytes: 65536 });
     });
     expect(screen.getByRole("dialog", { name: "Diagnostic log" })).toBeTruthy();
-    expect(screen.getByText(/latest line/)).toBeTruthy();
+    expect(await screen.findByText(/latest line/)).toBeTruthy();
     expect(screen.getByText(/pebble\.log$/)).toBeTruthy();
   });
 

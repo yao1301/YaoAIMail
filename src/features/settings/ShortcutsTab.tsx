@@ -1,3 +1,4 @@
+import { useWorkspaceState } from '@/lib/workspaceState';
 import { useCallback, useEffect, useState } from "react";
 import { Keyboard, RotateCcw } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -30,6 +31,25 @@ const SHORTCUT_GROUPS = [
   { categoryKey: "shortcuts.navigation", actions: ["next-message", "prev-message", "open-message", "open-search", "focus-search"] },
   { categoryKey: "shortcuts.mailActions", actions: ["compose-new", "reply", "reply-all", "forward", "toggle-star", "archive-message", "toggle-view-inbox"] },
   { categoryKey: "shortcuts.translate", actions: ["translate-selection", "toggle-bilingual"] },
+];
+
+// 固定快捷键（不可自定义，与 useGlobalShortcuts / ComposeView 的实现一一对应，只做展示）
+const FIXED_SHORTCUT_GROUPS = [
+  {
+    categoryKey: "shortcuts.globalGroup",
+    items: [
+      { keys: "Ctrl+N", labelKey: "shortcuts.globalNewCompose" },
+      { keys: "Ctrl+R", labelKey: "shortcuts.globalReply" },
+      { keys: "Ctrl+Shift+R", labelKey: "shortcuts.globalReplyAll" },
+      { keys: "Ctrl+F", labelKey: "shortcuts.globalForward" },
+      { keys: "Ctrl+K", labelKey: "shortcuts.globalFocusSearch" },
+      { keys: "Ctrl+,", labelKey: "shortcuts.globalOpenSettings" },
+    ],
+  },
+  {
+    categoryKey: "shortcuts.composeGroup",
+    items: [{ keys: "Ctrl+Enter", labelKey: "shortcuts.sendWithCtrlEnter" }],
+  },
 ];
 
 function ShortcutRow({ actionId }: { actionId: string }) {
@@ -176,7 +196,7 @@ function ShortcutRow({ actionId }: { actionId: string }) {
 export default function ShortcutsTab() {
   const { t } = useTranslation();
   const resetToDefaults = useShortcutStore((s) => s.resetToDefaults);
-  const [resetMessage, setResetMessage] = useState(false);
+  const [resetMessage, setResetMessage] = useWorkspaceState("src/features/settings/ShortcutsTab.tsx:ShortcutsTab:resetMessage", false);
 
   const handleReset = () => {
     resetToDefaults();
@@ -266,6 +286,71 @@ export default function ShortcutsTab() {
                 }}
               >
                 <ShortcutRow actionId={actionId} />
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+
+      {/* 固定快捷键：不参与自定义，只做展示（写信页 + 全局隐藏键） */}
+      {FIXED_SHORTCUT_GROUPS.map((group) => (
+        <div key={group.categoryKey} style={{ marginBottom: "24px" }}>
+          <h4
+            style={{
+              fontSize: "12px",
+              fontWeight: 600,
+              textTransform: "uppercase",
+              letterSpacing: "0.05em",
+              color: "var(--color-text-secondary)",
+              marginBottom: "10px",
+            }}
+          >
+            {t(group.categoryKey)}
+          </h4>
+          <div
+            style={{
+              borderRadius: "8px",
+              border: "1px solid var(--color-border)",
+              overflow: "hidden",
+            }}
+          >
+            {group.items.map((item, index) => (
+              <div
+                key={item.keys}
+                style={{
+                  borderTop: index > 0 ? "1px solid var(--color-border)" : "none",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    padding: "10px 16px",
+                    backgroundColor: "var(--color-bg)",
+                  }}
+                >
+                  <span style={{ fontSize: "13px", color: "var(--color-text-primary)" }}>
+                    {t(item.labelKey)}
+                  </span>
+                  <span
+                    title={t("shortcuts.fixedBinding")}
+                    style={{
+                      padding: "3px 8px",
+                      borderRadius: "4px",
+                      border: "1px solid var(--color-border)",
+                      backgroundColor: "var(--color-bg-secondary)",
+                      fontSize: "12px",
+                      fontFamily: "monospace",
+                      color: "var(--color-text-secondary)",
+                      minWidth: "60px",
+                      textAlign: "center",
+                      userSelect: "none",
+                    }}
+                  >
+                    {item.keys}
+                  </span>
+                </div>
               </div>
             ))}
           </div>

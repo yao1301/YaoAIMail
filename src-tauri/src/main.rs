@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    if std::env::args().any(|arg|arg=="--research-api") {
+        if let Err(error)=pebble_lib::research_server::run_from_environment(){eprintln!("{error}");std::process::exit(1);}
+        return;
+    }
     configure_linux_appimage_webkit_runtime();
     pebble_lib::run();
 }

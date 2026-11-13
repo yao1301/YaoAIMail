@@ -34,7 +34,7 @@ describe("KanbanStore", () => {
     await useKanbanStore.getState().fetchCards();
 
     expect(mockedInvoke).toHaveBeenCalledWith("list_kanban_cards", { column: undefined });
-    expect(mockedInvoke).toHaveBeenCalledWith("list_kanban_context_notes");
+    expect(mockedInvoke).toHaveBeenCalledWith("list_kanban_context_notes", undefined);
     expect(useKanbanStore.getState().cards).toHaveLength(2);
     expect(useKanbanStore.getState().loading).toBe(false);
   });

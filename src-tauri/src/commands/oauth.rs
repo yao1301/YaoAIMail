@@ -1,5 +1,5 @@
 use super::network::{
-    account_proxy_setting_from_parts, get_global_proxy_raw, normalize_account_proxy_setting,
+    account_proxy_setting_from_parts, get_mail_proxy_raw, normalize_account_proxy_setting,
     proxy_config_from_parts, resolve_effective_proxy, resolve_effective_proxy_setting,
     AccountProxyMode, AccountProxySetting,
 };
@@ -29,11 +29,11 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 }
 
 /// Fetch the user's email and display name from the OAuth provider's userinfo endpoint.
-async fn fetch_userinfo(
+pub(crate) async fn fetch_userinfo(
     provider: &str,
     access_token: &str,
     network: &OAuthNetworkConfig,
-) -> Result<(String, String), PebbleError> {
+) -> Result<(String, String, String), PebbleError> {
     let url = match provider.to_lowercase().as_str() {
         "gmail" => "https://www.googleapis.com/oauth2/v2/userinfo",
         "outlook" => "https://graph.microsoft.com/v1.0/me",
@@ -48,6 +48,7 @@ async fn fetch_userinfo(
         .send()
         .await
         .map_err(|e| PebbleError::Network(format!("Userinfo request failed: {e}")))?
+        .error_for_status().map_err(|_| PebbleError::OAuth("无法验证邮箱身份，请重新授权".into()))?
         .json()
         .await
         .map_err(|e| PebbleError::Network(format!("Userinfo parse failed: {e}")))?;
@@ -65,8 +66,12 @@ async fn fetch_userinfo(
         .unwrap_or("")
         .to_string();
 
+    let subject = resp["sub"].as_str().or_else(|| resp["id"].as_str()).unwrap_or("").to_owned();
+    if email.trim().is_empty() || subject.trim().is_empty() {
+        return Err(PebbleError::OAuth("服务商未返回完整的邮箱身份，请重新授权".into()));
+    }
     debug!("Fetched userinfo from OAuth provider");
-    Ok((email, name))
+    Ok((email, name, subject))
 }
 
 fn oauth_proxy_from_parts(
@@ -453,7 +458,7 @@ fn effective_oauth_proxy(
     store: &Store,
     stored: &StoredOAuthAuthData,
 ) -> Result<Option<HttpProxyConfig>, PebbleError> {
-    let global_proxy = get_global_proxy_raw(crypto, store)?;
+    let global_proxy = get_mail_proxy_raw(crypto, store)?;
     Ok(resolve_effective_proxy_setting(
         stored.proxy_mode,
         stored.proxy.clone(),
@@ -534,7 +539,7 @@ pub(crate) fn build_oauth_token_refresher(
                             )
                         }
                         None => {
-                            let effective_proxy = get_global_proxy_raw(&crypto, &store)?;
+                            let effective_proxy = get_mail_proxy_raw(&crypto, &store)?;
                             (
                                 initial_rt,
                                 OAuthNetworkConfig {
@@ -626,7 +631,7 @@ pub async fn complete_oauth_flow(
     let account_proxy = oauth_proxy_from_parts(proxy_host, proxy_port)?;
     let effective_proxy = resolve_effective_proxy(
         account_proxy.clone(),
-        super::network::get_global_proxy_raw(&state.crypto, &state.store)?,
+        super::network::get_mail_proxy_raw(&state.crypto, &state.store)?,
     );
     let network = OAuthNetworkConfig {
         proxy: effective_proxy,
@@ -668,9 +673,9 @@ pub async fn complete_oauth_flow(
         .map_err(|e| PebbleError::OAuth(token_exchange_error_message(&provider, &e)))?;
 
     // Fetch user info from Google/Microsoft to get actual email and display name
-    let (real_email, real_name) = fetch_userinfo(&provider, &token_pair.access_token, &network)
-        .await
-        .unwrap_or_else(|_| (email.clone(), display_name.clone()));
+    let (real_email, real_name, subject) = fetch_userinfo(&provider, &token_pair.access_token, &network)
+        .await?;
+    if real_email.trim().is_empty() { return Err(PebbleError::OAuth("服务商未返回可验证的邮箱地址，请重新授权".into())); }
 
     let final_email = if real_email.is_empty() {
         email
@@ -698,6 +703,10 @@ pub async fn complete_oauth_flow(
     };
 
     state.store.insert_account(&account)?;
+    if let Err(error) = state.store.bind_oauth_sender_identity(&account.id, &account.email, &subject) {
+        let _ = state.store.delete_account(&account.id);
+        return Err(error);
+    }
 
     // If any subsequent step fails, delete the account row to prevent half-creation
     if let Err(e) = (|| -> std::result::Result<(), PebbleError> {

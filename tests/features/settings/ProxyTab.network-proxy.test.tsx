@@ -4,9 +4,10 @@ import ProxyTab from "../../../src/features/settings/ProxyTab";
 import {
   getAccountProxySetting,
   getGlobalProxy,
+  getMailProxy,
   getOAuthAccountProxySetting,
   updateAccountProxySetting,
-  updateGlobalProxy,
+  saveSharedProxySettings,
   updateOAuthAccountProxySetting,
 } from "../../../src/lib/api";
 
@@ -76,9 +77,10 @@ vi.mock("../../../src/hooks/queries", () => ({
 vi.mock("../../../src/lib/api", () => ({
   getAccountProxySetting: vi.fn(),
   getGlobalProxy: vi.fn(),
+  getMailProxy: vi.fn(),
   getOAuthAccountProxySetting: vi.fn(),
   updateAccountProxySetting: vi.fn(),
-  updateGlobalProxy: vi.fn(),
+  saveSharedProxySettings: vi.fn(),
   updateOAuthAccountProxySetting: vi.fn(),
 }));
 
@@ -104,6 +106,7 @@ describe("ProxyTab global proxy", () => {
       },
     ];
     vi.mocked(getGlobalProxy).mockResolvedValue({ host: "127.0.0.1", port: 7890 });
+    vi.mocked(getMailProxy).mockResolvedValue(null);
     vi.mocked(getAccountProxySetting).mockResolvedValue({
       mode: "custom",
       proxy: { host: "192.168.0.2", port: 1080 },
@@ -113,7 +116,7 @@ describe("ProxyTab global proxy", () => {
       proxy: null,
     });
     vi.mocked(updateAccountProxySetting).mockResolvedValue(undefined);
-    vi.mocked(updateGlobalProxy).mockResolvedValue(undefined);
+    vi.mocked(saveSharedProxySettings).mockResolvedValue(undefined);
     vi.mocked(updateOAuthAccountProxySetting).mockResolvedValue(undefined);
   });
 
@@ -123,20 +126,20 @@ describe("ProxyTab global proxy", () => {
     await waitFor(() => {
       expect(getGlobalProxy).toHaveBeenCalled();
     });
-    const globalGroup = screen.getByRole("group", { name: "Global Proxy" });
-    expect((within(globalGroup).getByLabelText("SOCKS5 Proxy") as HTMLInputElement).value).toBe("127.0.0.1");
-    expect((within(globalGroup).getByLabelText("Port") as HTMLInputElement).value).toBe("7890");
+    const globalGroup = screen.getByRole("region", { name: "统一代理" });
+    await waitFor(() => expect((within(globalGroup).getByLabelText("代理地址") as HTMLInputElement).value).toBe("127.0.0.1"));
+    expect((within(globalGroup).getByLabelText("代理端口") as HTMLInputElement).value).toBe("7890");
 
-    fireEvent.change(within(globalGroup).getByLabelText("SOCKS5 Proxy"), {
+    fireEvent.change(within(globalGroup).getByLabelText("代理地址"), {
       target: { value: "10.0.0.2" },
     });
-    fireEvent.change(within(globalGroup).getByLabelText("Port"), {
+    fireEvent.change(within(globalGroup).getByLabelText("代理端口"), {
       target: { value: "1080" },
     });
-    fireEvent.click(within(globalGroup).getByRole("button", { name: "Save" }));
+    fireEvent.click(within(globalGroup).getByRole("button", { name: "保存代理设置" }));
 
     await waitFor(() => {
-      expect(updateGlobalProxy).toHaveBeenCalledWith("10.0.0.2", 1080);
+      expect(saveSharedProxySettings).toHaveBeenCalledWith("10.0.0.2", 1080, false);
     });
   });
 
@@ -148,15 +151,16 @@ describe("ProxyTab global proxy", () => {
     await waitFor(() => {
       expect(getGlobalProxy).toHaveBeenCalled();
     });
-    const globalGroup = screen.getByRole("group", { name: "Global Proxy" });
-    fireEvent.click(within(globalGroup).getByRole("button", { name: "Save" }));
+    const globalGroup = screen.getByRole("region", { name: "统一代理" });
+    await waitFor(() => expect((within(globalGroup).getByRole("button", { name: "保存代理设置" }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(within(globalGroup).getByRole("button", { name: "保存代理设置" }));
 
     await waitFor(() => {
-      expect(updateGlobalProxy).toHaveBeenCalledWith(undefined, undefined);
+      expect(saveSharedProxySettings).toHaveBeenCalledWith(undefined, undefined, false);
     });
   });
 
-  it("shows per-account proxy settings without a disclosure toggle", async () => {
+  it("keeps per-account overrides available behind the optional disclosure", async () => {
     render(<ProxyTab />);
 
     expect(screen.queryByRole("button", { name: "Account Proxies" })).toBeNull();
@@ -164,11 +168,15 @@ describe("ProxyTab global proxy", () => {
       expect(getAccountProxySetting).toHaveBeenCalledWith("imap-1");
       expect(getOAuthAccountProxySetting).toHaveBeenCalledWith("gmail-1");
     });
+    const disclosure = screen.getByText("个别邮箱单独设置（可选）").closest("details")!;
+    expect(disclosure.open).toBe(false);
+    disclosure.open = true;
     expect(screen.getByRole("group", { name: "imap@example.com Account Proxy" })).not.toBeNull();
   });
 
   it("loads and saves per-account proxy modes from the proxy tab", async () => {
     render(<ProxyTab />);
+    screen.getByText("个别邮箱单独设置（可选）").closest("details")!.open = true;
 
     await waitFor(() => {
       expect(getAccountProxySetting).toHaveBeenCalledWith("imap-1");

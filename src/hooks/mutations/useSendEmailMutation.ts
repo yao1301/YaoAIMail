@@ -31,6 +31,8 @@ export function useSendEmailMutation() {
       ),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["messages"] });
+      queryClient.invalidateQueries({ queryKey: ["folders"] });
+      queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
     },
   });
 }

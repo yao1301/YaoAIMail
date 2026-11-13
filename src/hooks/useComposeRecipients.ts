@@ -31,7 +31,7 @@ export function useComposeRecipients({
   // authored under that account, so restoring it under the active account
   // would silently misattribute the message.
   const [fromAccountId, setFromAccountId] = useState(
-    restoredDraft?.accountId || composeReplyTo?.account_id || activeAccountId || "",
+    restoredDraft?.accountId || composePrefill?.accountId || composeReplyTo?.account_id || activeAccountId || "",
   );
   const currentAccount = accounts.find((a) => a.id === fromAccountId);
   const myEmail = currentAccount?.email || "";

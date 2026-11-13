@@ -33,13 +33,15 @@ export function emailStrictlyMatchesCompany(input: {
   website: string;
   websiteStatus?: string;
   evidenceSource?: string;
+  evidenceSourceUrl?: string;
 }): boolean {
   const mailDomain = emailDomain(input.email);
   const siteDomain = websiteDomain(input.website);
-  if (!mailDomain) return false;
+  if (!mailDomain || input.websiteStatus === '身份不匹配') return false;
   if (siteDomain && (mailDomain === siteDomain || mailDomain.endsWith(`.${siteDomain}`))) return true;
-  if (hasDistinctiveCompanyToken(mailDomain, input.companyName)) return true;
-  return PUBLIC_EMAIL_DOMAINS.has(mailDomain)
-    && input.websiteStatus === "已核验"
-    && Boolean(input.evidenceSource?.includes("官网"));
+  const sourceDomain = websiteDomain(input.evidenceSourceUrl || '');
+  const firstParty = Boolean(siteDomain && sourceDomain && (sourceDomain === siteDomain || sourceDomain.endsWith(`.${siteDomain}`)))
+    && input.websiteStatus === '已核验' && Boolean(input.evidenceSource?.includes('官网'));
+  // A name shared by unrelated companies is not proof of mailbox ownership.
+  return firstParty && (hasDistinctiveCompanyToken(mailDomain, input.companyName) || PUBLIC_EMAIL_DOMAINS.has(mailDomain));
 }

@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useWorkspaceState, useWorkspaceIsTransferring, useWorkspaceInitEffect } from '@/lib/workspaceState';
+import { useEffect, useMemo } from "react";
 import { X, PenLine, Trash2, Mail, Sparkles, Copy } from "lucide-react";
 import ContextMenu from "@/components/ContextMenu";
 import {
-  autoClassifyContacts,
   deleteAddressBookContact,
   inferAllContactRoles,
   importMailContactsToAddressBook,
@@ -16,7 +16,6 @@ import {
   type AddressBookContact,
   type CompanyResearchReport,
   type ContactRole,
-  type ContactRoleEntry,
   type CustomerMemory,
 } from "@/lib/api";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
@@ -48,33 +47,33 @@ const emptyForm = {
   role: "unknown" as ContactRole, notes: "", tags: "", accountId: "" as string | null,
 };
 
-const ROLE_TAG: Record<ContactRole, string> = {
-  customer: "客户",
-  supplier: "供应商",
-  service: "服务商",
-  neutral: "内部联系人",
-  unknown: "未分类",
-};
+const FIXED_TYPE_TAGS = new Set(TYPE_TAG_FILTERS.map((item) => item.label));
+
+function customTagsOnly(tags: string[]): string[] {
+  return [...new Set(tags.map((tag) => tag.trim()).filter(Boolean))]
+    .filter((tag) => !FIXED_TYPE_TAGS.has(tag));
+}
 
 export default function AddressBookView() {
-  const [contacts, setContacts] = useState<AddressBookContact[]>([]);
-  const [query, setQuery] = useState("");
-  const [activeTag, setActiveTag] = useState("");
-  const [accountFilter, setAccountFilter] = useState("all");
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [form, setForm] = useState(emptyForm);
-  const [profiles, setProfiles] = useState<CustomerMemory[]>([]);
-  const [researchReports, setResearchReports] = useState<CompanyResearchReport[]>([]);
-  const [busy, setBusy] = useState(false);
+  const transferring = useWorkspaceIsTransferring();
+  const [contacts, setContacts] = useWorkspaceState<AddressBookContact[]>("src/features/contacts/AddressBookView.tsx:AddressBookView:contacts", []);
+  const [query, setQuery] = useWorkspaceState("src/features/contacts/AddressBookView.tsx:AddressBookView:query", "");
+  const [activeTag, setActiveTag] = useWorkspaceState("src/features/contacts/AddressBookView.tsx:AddressBookView:activeTag", "");
+  const [accountFilter, setAccountFilter] = useWorkspaceState("src/features/contacts/AddressBookView.tsx:AddressBookView:accountFilter", "all");
+  const [accounts, setAccounts] = useWorkspaceState<Account[]>("src/features/contacts/AddressBookView.tsx:AddressBookView:accounts", []);
+  const [form, setForm] = useWorkspaceState("src/features/contacts/AddressBookView.tsx:AddressBookView:form", emptyForm);
+  const [profiles, setProfiles] = useWorkspaceState<CustomerMemory[]>("src/features/contacts/AddressBookView.tsx:AddressBookView:profiles", []);
+  const [researchReports, setResearchReports] = useWorkspaceState<CompanyResearchReport[]>("src/features/contacts/AddressBookView.tsx:AddressBookView:researchReports", []);
+  const [busy, setBusy] = useWorkspaceState("src/features/contacts/AddressBookView.tsx:AddressBookView:busy", false);
   const taggingTask = useBackgroundTasksStore((state) => state.tasks.addressBookTagging);
   const startTask = useBackgroundTasksStore((state) => state.start);
   const clearTask = useBackgroundTasksStore((state) => state.clear);
   const taggingBusy = taggingTask?.status === "running";
 
   useEffect(() => {
-    if (taggingTask?.status !== "success") return;
+    if (transferring || taggingTask?.status !== "success") return;
     void refresh().then(() => clearTask("addressBookTagging"));
-  }, [taggingTask, clearTask]);
+  }, [transferring, taggingTask, clearTask]);
 
   async function refresh() {
     const [nextContacts, nextProfiles, nextResearch, nextAccounts] = await Promise.all([
@@ -89,7 +88,7 @@ export default function AddressBookView() {
     setAccounts(nextAccounts);
   }
 
-  useEffect(() => { void refresh().catch(() => {}); }, []);
+  useWorkspaceInitEffect('src/features/contacts/AddressBookView.tsx:', () => { void refresh().catch(() => {}); }, []);
 
   // 新建联系人时默认关联当前激活账号（全部账号只是汇总，联系人必须归属具体账号）
   useEffect(() => {
@@ -135,20 +134,27 @@ export default function AddressBookView() {
         contacts
           .flatMap((contact) => contact.tags.map((tag) => tag.trim()))
           .filter(Boolean)
-          .filter((tag) => !TYPE_TAG_FILTERS.some((item) => item.label === tag))
-          .filter((tag) => !TYPE_TAG_FILTERS.some((item) => tag.includes(item.label) || item.label.includes(tag))),
+          .filter((tag) => !TYPE_TAG_FILTERS.some((item) => item.label === tag)),
       ),
     ].sort((a, b) => a.localeCompare(b, "zh"));
   }, [contacts]);
 
-  const [tagMenu, setTagMenu] = useState<{ x: number; y: number; tag: string } | null>(null);
-  const [contactMenu, setContactMenu] = useState<{ x: number; y: number; contact: AddressBookContact } | null>(null);
-  // 批量操作
-  const [batchMode, setBatchMode] = useState(false);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [lastSelectedIndex, setLastSelectedIndex] = useState<number | null>(null);
-  const [batchAccountId, setBatchAccountId] = useState("");
-  const [batchRole, setBatchRole] = useState("");
+  const [tagMenu, setTagMenu] = useWorkspaceState<{ x: number; y: number; tag: string } | null>("src/features/contacts/AddressBookView.tsx:AddressBookView:tagMenu", null);
+  const [contactMenu, setContactMenu] = useWorkspaceState<{ x: number; y: number; contact: AddressBookContact } | null>("src/features/contacts/AddressBookView.tsx:AddressBookView:contactMenu", null);
+  // 联系人像邮件一样直接多选：单击单选，Ctrl 增减，Shift 连选。
+  const [selectedIds, setSelectedIds] = useWorkspaceState<Set<string>>("src/features/contacts/AddressBookView.tsx:AddressBookView:selectedIds", new Set());
+  const [lastSelectedIndex, setLastSelectedIndex] = useWorkspaceState<number | null>("src/features/contacts/AddressBookView.tsx:AddressBookView:lastSelectedIndex", null);
+  const [batchAccountId, setBatchAccountId] = useWorkspaceState("src/features/contacts/AddressBookView.tsx:AddressBookView:batchAccountId", "");
+  const [batchRole, setBatchRole] = useWorkspaceState("src/features/contacts/AddressBookView.tsx:AddressBookView:batchRole", "");
+
+  // 列表刷新或联系人被单独删除后，丢弃已不存在的选择，避免批量栏残留。
+  useEffect(() => {
+    const existingIds = new Set(contacts.map((contact) => contact.id));
+    setSelectedIds((previous) => {
+      const next = new Set([...previous].filter((id) => existingIds.has(id)));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [contacts]);
 
   // 删除自定义标签：从所有联系人身上移除该标签并保存。
   async function handleDeleteCustomTag(tag: string) {
@@ -213,12 +219,12 @@ export default function AddressBookView() {
   }
 
 
-  // 数据清洗：历史数据里可能有重复/带空格的标签（如"客户"和"客户 "），
-  // 加载后自动规范化并保存回，保证所有标签唯一，供发送防呆使用。
+  // 联系人类型是唯一分类依据；标签只保存用户自定义内容。加载旧数据时
+  // 自动删除“客户/供应商”等固定类型标签，杜绝分类与标签互相冲突。
   useEffect(() => {
     const dirty = contacts.filter((contact) => {
-      const normalized = [...new Set(contact.tags.map((tag) => tag.trim()).filter(Boolean))];
-      return normalized.length !== contact.tags.length || contact.tags.some((tag) => tag !== tag.trim());
+      const normalized = customTagsOnly(contact.tags);
+      return normalized.join("\u0000") !== contact.tags.join("\u0000");
     });
     if (dirty.length === 0) return;
     let cancelled = false;
@@ -234,7 +240,7 @@ export default function AddressBookView() {
             jobTitle: contact.jobTitle,
             role: contact.role as ContactRole,
             notes: contact.notes,
-            tags: [...new Set(contact.tags.map((tag) => tag.trim()).filter(Boolean))],
+            tags: customTagsOnly(contact.tags),
           });
         } catch {
           // 单条失败不阻塞整体
@@ -318,12 +324,12 @@ export default function AddressBookView() {
         jobTitle: form.jobTitle,
         role: form.role,
         notes: form.notes,
-        tags: [...new Set(form.tags.split(/[，,;；]/).map((tag) => tag.trim()).filter(Boolean))],
+        tags: customTagsOnly(form.tags.split(/[，,;；]/)),
         accountId,
       });
       setForm(emptyForm);
       await refresh();
-      useToastStore.getState().addToast({ message: "联系人已保存，发送防呆会直接使用这里的角色标签。", type: "success" });
+      useToastStore.getState().addToast({ message: "联系人已保存。联系人类型是唯一分类依据，自定义标签不会再与分类冲突。", type: "success" });
     } catch (error) {
       useToastStore.getState().addToast({ message: `保存失败：${extractErrorMessage(error)}`, type: "error" });
     } finally {
@@ -347,7 +353,7 @@ export default function AddressBookView() {
   }
 
   // ─── 批量操作 ──────────────────────────────────────────────────────────────
-  function toggleBatchSelect(id: string, index: number, event?: React.MouseEvent) {
+  function toggleContactSelection(id: string, index: number, event?: React.MouseEvent) {
     setSelectedIds((prev) => {
       if (event?.shiftKey && lastSelectedIndex !== null) {
         const start = Math.min(index, lastSelectedIndex);
@@ -361,14 +367,16 @@ export default function AddressBookView() {
     });
     setLastSelectedIndex(index);
   }
+  const allFilteredSelected = filtered.length > 0 && filtered.every((contact) => selectedIds.has(contact.id));
   function toggleSelectAll() {
-    setSelectedIds((prev) => (prev.size === filtered.length ? new Set() : new Set(filtered.map((c) => c.id))));
+    // “取消全选”必须清空所有已选项（包括切换筛选前留下的项），让批量栏立刻退出。
+    setSelectedIds(() => (allFilteredSelected ? new Set() : new Set(filtered.map((c) => c.id))));
     setLastSelectedIndex(null);
   }
   async function batchApplyAccount() {
     const target = contacts.filter((c) => selectedIds.has(c.id));
     if (!batchAccountId || target.length === 0) {
-      useToastStore.getState().addToast({ message: "请先选择账号并勾选联系人", type: "error" });
+      useToastStore.getState().addToast({ message: "请先选择账号和联系人", type: "error" });
       return;
     }
     setBusy(true);
@@ -384,7 +392,7 @@ export default function AddressBookView() {
             jobTitle: c.jobTitle,
             role: c.role as ContactRole,
             notes: c.notes,
-            tags: c.tags,
+            tags: customTagsOnly(c.tags),
             accountId: batchAccountId,
           });
         } catch {
@@ -411,7 +419,7 @@ export default function AddressBookView() {
   async function batchApplyRole() {
     const target = contacts.filter((c) => selectedIds.has(c.id));
     if (!batchRole || target.length === 0) {
-      useToastStore.getState().addToast({ message: "请先选择类型并勾选联系人", type: "error" });
+      useToastStore.getState().addToast({ message: "请先选择类型和联系人", type: "error" });
       return;
     }
     setBusy(true);
@@ -427,7 +435,7 @@ export default function AddressBookView() {
             jobTitle: c.jobTitle,
             role: batchRole as ContactRole,
             notes: c.notes,
-            tags: c.tags,
+            tags: customTagsOnly(c.tags),
             accountId: c.accountId ?? null,
           });
         } catch {
@@ -486,48 +494,20 @@ export default function AddressBookView() {
   async function autoTagContacts() {
     startTask("addressBookTagging", "联系人识别", async () => {
       const accounts = await listAccounts();
-      const roles = new Map<string, ContactRoleEntry>();
-      // 第一轮：快速规则识别（无需 AI），立即给大部分联系人打上标签。
+      const before = new Map((await listAddressBookContacts()).map((contact) => [contact.email.toLowerCase(), contact.role]));
+      // 只走完整往来判断。旧版先按域名速判、再保存为“手工结果”，
+      // 会让 .cn 等错误结论永久跳过复核，现已彻底取消。
       for (const account of accounts) {
-        const cheap = await autoClassifyContacts(account.id);
-        for (const entry of cheap) {
-          if (entry.role !== "unknown") roles.set(entry.email.toLowerCase(), entry);
-        }
+        await inferAllContactRoles(account.id);
       }
-      // 第二轮：结合邮件内容的 AI 识别（未配置 AI 时自动退回规则）。
-      for (const account of accounts) {
-        const ai = await inferAllContactRoles(account.id);
-        for (const entry of ai) {
-          if (entry.role !== "unknown") roles.set(entry.email.toLowerCase(), entry);
-        }
-      }
-      const current = await listAddressBookContacts();
-      let updated = 0;
-      for (const contact of current) {
-        const entry = roles.get(contact.email.toLowerCase());
-        if (!entry || entry.role === "unknown") continue;
-        const tag = ROLE_TAG[entry.role];
-        const tags = contact.tags.includes(tag) ? contact.tags : [...contact.tags, tag];
-        if (contact.role === entry.role && tags.join("|") === contact.tags.join("|")) continue;
-        await saveAddressBookContact({
-          id: contact.id,
-          email: contact.email,
-          name: contact.name,
-          company: contact.company,
-          jobTitle: contact.jobTitle,
-          role: entry.role,
-          notes: contact.notes,
-          tags,
-        });
-        updated += 1;
-      }
-      return updated;
+      const after = await listAddressBookContacts();
+      return after.filter((contact) => before.get(contact.email.toLowerCase()) !== contact.role).length;
     }, {
       successMessage: (result) => {
         const updated = typeof result === "number" ? result : 0;
         return updated > 0
-          ? `识别完成，已更新 ${updated} 个联系人的标签。识别结合了往来邮件内容分析；无邮件记录的联系人仅按地址规则判断（邮件同步完成后重试可提升精度）。识别结果仅供辅助，建议核对。`
-          : "识别完成，地址本联系人没有需要更新的标签。";
+          ? `识别完成，已更新 ${updated} 个联系人的分类。系统优先读取正常往来内容，垃圾/欺诈/系统邮件会排除；证据不足时保持未分类。`
+          : "识别完成，没有发现需要调整的联系人分类；证据不足的联系人会保持未分类。";
       },
     });
   }
@@ -554,46 +534,9 @@ export default function AddressBookView() {
           <button type="button" disabled={busy} onClick={() => void importFromMail()} style={{ padding: "8px 14px", border: 0, borderRadius: "6px", background: "color-mix(in srgb, var(--color-accent) 15%, transparent)", color: "var(--color-accent)" }}>
             从往来邮件补充
           </button>
-          <button
-            type="button"
-            onClick={() => { setBatchMode((v) => !v); setSelectedIds(new Set()); }}
-            style={{ padding: "8px 14px", border: "1px solid var(--color-border)", borderRadius: "6px", background: batchMode ? "var(--color-sidebar-active)" : "transparent", color: "var(--color-text-primary)" }}
-          >
-            {batchMode ? "退出批量操作" : "批量操作"}
-          </button>
         </div>
       </div>
 
-      {/* 批量操作栏 */}
-      {batchMode && (
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "8px 10px", border: "1px solid var(--color-accent)", borderRadius: 8, marginBottom: 10, background: "color-mix(in srgb, var(--color-accent) 6%, transparent)" }}>
-          <strong style={{ fontSize: 12 }}>已选 {selectedIds.size} 人</strong>
-          <button type="button" onClick={toggleSelectAll} style={{ fontSize: 12, padding: "4px 10px", border: "1px solid var(--color-border)", borderRadius: 6, background: "transparent", cursor: "pointer" }}>
-            {selectedIds.size === filtered.length && filtered.length > 0 ? "取消全选" : "全选"}
-          </button>
-          <select value={batchAccountId} onChange={(e) => setBatchAccountId(e.target.value)} style={{ ...fieldStyle, width: "auto", fontSize: 12 }} title="批量关联账号">
-            <option value="">批量关联账号…</option>
-            {accounts.map((account) => (
-              <option key={account.id} value={account.id}>
-                {account.display_name?.trim() || account.email.split("@")[0] || account.email}
-              </option>
-            ))}
-          </select>
-          <button type="button" disabled={busy} onClick={() => void batchApplyAccount()} style={{ fontSize: 12, padding: "4px 10px", border: 0, borderRadius: 6, background: "var(--color-accent)", color: "#fff", cursor: busy ? "not-allowed" : "pointer" }}>
-            应用
-          </button>
-          <select value={batchRole} onChange={(e) => setBatchRole(e.target.value)} style={{ ...fieldStyle, width: "auto", fontSize: 12 }} title="批量修改联系人类型">
-            <option value="">批量修改类型…</option>
-            {ROLES.map((role) => <option key={role.value} value={role.value}>{role.label}</option>)}
-          </select>
-          <button type="button" disabled={busy} onClick={() => void batchApplyRole()} style={{ fontSize: 12, padding: "4px 10px", border: 0, borderRadius: 6, background: "var(--color-accent)", color: "#fff", cursor: busy ? "not-allowed" : "pointer" }}>
-            应用
-          </button>
-          <button type="button" disabled={busy} onClick={() => void batchDelete()} style={{ fontSize: 12, padding: "4px 10px", border: 0, borderRadius: 6, background: "rgba(220,53,69,0.15)", color: "#dc3545", cursor: busy ? "not-allowed" : "pointer" }}>
-            删除选中
-          </button>
-        </div>
-      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "minmax(420px, 1.4fr) minmax(300px, 0.8fr)", gap: "18px" }}>
         <section>
@@ -615,6 +558,9 @@ export default function AddressBookView() {
               <option value="none">未关联账号（需修正）</option>
             </select>
           </div>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", margin: "-3px 0 8px" }}>
+            单击选择联系人；Ctrl 增减选择；Shift 连续选择；双击或点“编辑”修改联系人。
+          </div>
           {/* 固定类型标签（发送防呆用，不允许修改） */}
           <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "8px", alignItems: "center" }}>
             <button type="button" onClick={() => setActiveTag("")} style={tagButton(!activeTag)}>全部</button>
@@ -624,6 +570,24 @@ export default function AddressBookView() {
               </button>
             ))}
           </div>
+          {selectedIds.size > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", position: "sticky", top: 0, zIndex: 4, padding: "8px 0", marginBottom: "10px", background: "var(--color-bg-primary)", borderBottom: "1px solid var(--color-border)" }}>
+              <strong style={{ fontSize: 12 }}>已选 {selectedIds.size} 人</strong>
+              <button type="button" onClick={toggleSelectAll} style={{ fontSize: 11, padding: "5px 9px" }}>{allFilteredSelected ? "取消全选" : "全选"}</button>
+              <select value={batchAccountId} onChange={(e) => setBatchAccountId(e.target.value)} style={{ ...fieldStyle, width: "auto", fontSize: 11, padding: "5px 8px", marginBottom: 0 }} title="批量关联账号">
+                <option value="">关联账号</option>
+                {accounts.map((account) => <option key={account.id} value={account.id}>{account.display_name?.trim() || account.email.split("@")[0] || account.email}</option>)}
+              </select>
+              <button type="button" disabled={busy} onClick={() => void batchApplyAccount()} style={{ fontSize: 11, padding: "5px 9px" }}>应用</button>
+              <select value={batchRole} onChange={(e) => setBatchRole(e.target.value)} style={{ ...fieldStyle, width: "auto", fontSize: 11, padding: "5px 8px", marginBottom: 0 }} title="批量修改联系人类型">
+                <option value="">修改类型</option>
+                {ROLES.map((role) => <option key={role.value} value={role.value}>{role.label}</option>)}
+              </select>
+              <button type="button" disabled={busy} onClick={() => void batchApplyRole()} style={{ fontSize: 11, padding: "5px 9px" }}>应用</button>
+              <button type="button" disabled={busy} onClick={() => void batchDelete()} style={{ fontSize: 11, padding: "5px 9px", color: "#dc3545" }}>删除</button>
+              <button type="button" onClick={() => { setSelectedIds(new Set()); setLastSelectedIndex(null); }} style={{ fontSize: 11, padding: "5px 9px" }}>清除选择</button>
+            </div>
+          )}
           {/* 自定义标签（可删除 / 右键重命名） */}
           {customTags.length > 0 && (
             <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "10px", alignItems: "center" }}>
@@ -683,24 +647,24 @@ export default function AddressBookView() {
             {filtered.map((contact, index) => (
               <div
                 key={contact.id}
-                onClick={(event) => batchMode
-                  ? toggleBatchSelect(contact.id, index, event)
-                  : setForm({ ...contact, tags: contact.tags.join(", "), accountId: contact.accountId ?? null })}
+                onMouseDown={(event) => {
+                  if (event.button !== 0) return;
+                  // 在文字节点按下时就完成选择，并禁用浏览器默认的拖选文字行为。
+                  // 编辑/删除按钮仍由它们自己的点击逻辑处理。
+                  if ((event.target as HTMLElement).closest("button, input, select, textarea, a")) return;
+                  event.preventDefault();
+                  toggleContactSelection(contact.id, index, event);
+                }}
+                onDoubleClick={(event) => {
+                  event.preventDefault();
+                  setForm({ ...contact, tags: contact.tags.join(", "), accountId: contact.accountId ?? null });
+                }}
                 onContextMenu={(event) => {
                   event.preventDefault();
                   setContactMenu({ x: event.clientX, y: event.clientY, contact });
                 }}
-                style={{ display: "grid", gridTemplateColumns: batchMode ? "auto 1fr auto" : "1fr auto", gap: "10px", padding: "11px 12px", borderBottom: "1px solid var(--color-border)", cursor: "pointer", background: selectedIds.has(contact.id) ? "var(--color-sidebar-active)" : (form.id === contact.id ? "var(--color-sidebar-active)" : "transparent") }}
+                style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "10px", padding: "11px 12px", borderBottom: "1px solid var(--color-border)", cursor: "pointer", userSelect: "none", background: selectedIds.has(contact.id) ? "var(--color-sidebar-active)" : (form.id === contact.id ? "color-mix(in srgb, var(--color-accent) 7%, transparent)" : "transparent"), boxShadow: selectedIds.has(contact.id) ? "inset 3px 0 var(--color-accent)" : "none" }}
               >
-                {batchMode && (
-                  <input
-                    type="checkbox"
-                    checked={selectedIds.has(contact.id)}
-                    onChange={(event) => toggleBatchSelect(contact.id, index, event as unknown as React.MouseEvent)}
-                    onClick={(e) => e.stopPropagation()}
-                    style={{ alignSelf: "center", width: 15, height: 15, cursor: "pointer" }}
-                  />
-                )}
                 <div>
                   <div style={{ fontWeight: 600 }}>{contact.name || contact.email}</div>
                   <div style={{ fontSize: "12px", color: "var(--color-text-secondary)", marginTop: "2px" }}>
@@ -712,12 +676,10 @@ export default function AddressBookView() {
                     {!contact.accountId ? <span style={{ color: "#dc3545" }}> · 未关联账号</span> : ""}
                   </div>
                 </div>
-                {!batchMode && (
                 <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
                   <button type="button" onClick={(event) => { event.stopPropagation(); setForm({ ...contact, tags: contact.tags.join(", "), accountId: contact.accountId ?? null }); }}>编辑</button>
                   <button type="button" onClick={(event) => { event.stopPropagation(); void deleteAddressBookContact(contact.id).then(refresh); }} style={{ color: "#dc3545" }}>删除</button>
                 </div>
-                )}
               </div>
             ))}
           </div>
@@ -801,12 +763,20 @@ export default function AddressBookView() {
           </label>
           <label style={{ display: "block", fontSize: "12px", marginBottom: "10px" }}>
             <span style={{ display: "block", marginBottom: "4px", color: "var(--color-text-secondary)" }}>联系人类型（发送防呆使用）</span>
-            <select value={form.role} onChange={(event) => setForm((old) => ({ ...old, role: event.target.value as ContactRole }))} style={fieldStyle}>
+            <select
+              value={form.role}
+              onChange={(event) => setForm((old) => ({
+                ...old,
+                role: event.target.value as ContactRole,
+                tags: customTagsOnly(old.tags.split(/[，,;；]/)).join(", "),
+              }))}
+              style={fieldStyle}
+            >
               {ROLES.map((role) => <option key={role.value} value={role.value}>{role.label}</option>)}
             </select>
           </label>
           <label style={{ display: "block", fontSize: "12px", marginBottom: "10px" }}>
-            <span style={{ display: "block", marginBottom: "4px", color: "var(--color-text-secondary)" }}>标签（逗号分隔）</span>
+            <span style={{ display: "block", marginBottom: "4px", color: "var(--color-text-secondary)" }}>自定义标签（逗号分隔；不要重复填写客户/供应商分类）</span>
             <input value={form.tags} onChange={(event) => setForm((old) => ({ ...old, tags: event.target.value }))} style={fieldStyle} />
           </label>
           <label style={{ display: "block", fontSize: "12px", marginBottom: "12px" }}>

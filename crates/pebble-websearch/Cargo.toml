@@ -1,0 +1,16 @@
+[package]
+name = "pebble-websearch"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+pebble-translate = { path = "../pebble-translate" }
+# Readability-style main-content extraction (rust port of Mozilla Readability).
+# Kept in this crate so the extraction rules are testable without the desktop shell.
+dom_smoothie = "0.18.2"
+# Embedded public/private suffix list; no runtime service or user setup.
+psl = "2"

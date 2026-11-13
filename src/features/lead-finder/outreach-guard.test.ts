@@ -25,9 +25,9 @@ describe("outreach instruction guard", () => {
 
   it("separates the greeting and sign-off into normal email paragraphs", () => {
     expect(normalizeOutreachEmailFormat(
-      "Hi Bruce, I noticed your decorative lighting range.\nWould a six-item selection with price ranges be useful?\nBest regards, Jeremy",
+      "Hi Alex, I noticed your decorative lighting range.\nWould a six-item selection with price ranges be useful?\nBest regards, Sam",
     )).toBe(
-      "Hi Bruce,\n\nI noticed your decorative lighting range.\nWould a six-item selection with price ranges be useful?\nBest regards,\nJeremy",
+      "Hi Alex,\n\nI noticed your decorative lighting range.\nWould a six-item selection with price ranges be useful?\nBest regards,\nSam",
     );
   });
 });

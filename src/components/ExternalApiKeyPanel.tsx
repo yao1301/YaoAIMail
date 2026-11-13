@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { KeyRound, ExternalLink } from "lucide-react";
 import {
-  deleteExternalServiceApiKey,
   getExternalServiceUsage,
   getExternalServiceKeyStatus,
   saveExternalServiceApiKey,
@@ -11,6 +10,7 @@ import {
 } from "@/lib/api";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { useToastStore } from "@/stores/toast.store";
+import ExternalServiceKeyList from "./ExternalServiceKeyList";
 
 type Provider = "tavily" | "brave" | "firecrawl" | "hunter";
 
@@ -48,8 +48,8 @@ const PROVIDERS: Array<{
 
 /**
  * Optional API key configuration used by AI research features. Keys are
- * optional — the model's own knowledge works without them; search services
- * merely add live sources. Keys are encrypted by the backend and never shown.
+ * optional — built-in search still works without them. Saved keys are listed
+ * only as masked labels with opaque per-row deletion tokens.
  */
 export default function ExternalApiKeyPanel() {
   const [status, setStatus] = useState<ExternalServiceKeyStatus | null>(null);
@@ -81,28 +81,12 @@ export default function ExternalApiKeyPanel() {
       setUsage((old) => ({ ...old, [provider]: checked }));
       setValues((old) => ({ ...old, [provider]: "" }));
       useToastStore.getState().addToast({
-        message: "API Key 已加密保存，仅在本机使用。",
+        message: "API Key 已在本机加密保存。",
         type: "success",
       });
     } catch (error) {
       useToastStore.getState().addToast({
         message: `保存失败：${extractErrorMessage(error)}`,
-        type: "error",
-      });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function remove(provider: "tavily" | "brave" | "firecrawl" | "hunter") {
-    setBusy(true);
-    try {
-      setStatus(await deleteExternalServiceApiKey(provider));
-      setUsage((old) => { const next = { ...old }; delete next[provider]; return next; });
-      useToastStore.getState().addToast({ message: "已删除该 API Key。", type: "success" });
-    } catch (error) {
-      useToastStore.getState().addToast({
-        message: `删除失败：${extractErrorMessage(error)}`,
         type: "error",
       });
     } finally {
@@ -137,7 +121,7 @@ export default function ExternalApiKeyPanel() {
         <KeyRound size={15} />
         <strong style={{ fontSize: 13 }}>可选：补充联网搜索 / 邮箱验证</strong>
         <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
-          不填也能用（AI 先用自己的知识，这里的服务只是补充信源）
+          软件已内置联网搜索，这些服务可以补充信源和验证邮箱。
         </span>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 8 }}>
@@ -148,15 +132,15 @@ export default function ExternalApiKeyPanel() {
             <div key={provider.id} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}>
                 <span>{provider.label}</span>
-                <span style={{
+                {!configured && <span style={{
                   fontSize: 10,
                   padding: "1px 6px",
                   borderRadius: 8,
                   background: configured ? "rgba(34,197,94,0.15)" : "rgba(100,116,139,0.15)",
                   color: configured ? "#16a34a" : "var(--color-text-secondary)",
                 }}>
-                  {configured ? "已配置" : "未配置"}
-                </span>
+                  未配置
+                </span>}
                 <a href={provider.docs} target="_blank" rel="noreferrer" style={{ color: "var(--color-accent)", display: "flex", alignItems: "center", gap: 2 }}>
                   官方文档 <ExternalLink size={10} />
                 </a>
@@ -193,17 +177,12 @@ export default function ExternalApiKeyPanel() {
                 >
                   保存
                 </button>
-                {configured && (
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void remove(provider.id)}
-                    style={{ padding: "5px 10px", border: 0, borderRadius: 6, background: "transparent", color: "#dc3545", fontSize: 12, cursor: busy ? "default" : "pointer" }}
-                  >
-                    删除
-                  </button>
-                )}
               </div>
+              {configured && <ExternalServiceKeyList provider={provider.id} name={provider.label} status={status} busy={busy}
+                onBusyChange={setBusy} onStatusChange={next => {
+                  setStatus(next);
+                  setUsage(old => { const copy = { ...old }; delete copy[provider.id]; return copy; });
+                }} />}
             </div>
           );
         })}

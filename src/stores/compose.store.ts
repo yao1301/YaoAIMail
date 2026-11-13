@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { Message } from "@/lib/api";
 import { useUIStore, type ActiveView } from "./ui.store";
 import type { ComposeAttachment, ComposeDraftSnapshot } from "@/features/compose/compose-draft";
+import type { MailReference } from "@/lib/mailReferenceDrag";
 
 /** 是否处于独立写信窗口（?compose=1，遗留入口，不再主动创建）。 */
 export function isComposeWindow(): boolean {
@@ -11,6 +12,7 @@ export function isComposeWindow(): boolean {
 export type ComposeMode = "new" | "reply" | "reply-all" | "forward";
 
 export interface ComposePrefill {
+  accountId?: string;
   to?: string[];
   cc?: string[];
   bcc?: string[];
@@ -18,6 +20,9 @@ export interface ComposePrefill {
   body?: string;
   /** Pre-attached files (used by “reply all with attachments”). */
   attachments?: ComposeAttachment[];
+  /** AI 草稿需使用保存的签名原文，避免编辑器自动追加另一份默认签名。 */
+  aiGenerated?: boolean;
+  signature?: string;
 }
 
 export interface ComposeContext {
@@ -27,6 +32,7 @@ export interface ComposeContext {
   bcc: string[];
   subject: string;
   body: string;
+  bodyText?: string;
 }
 
 /** 一封独立的写信标签（主窗口标签栏中的一项）。 */
@@ -40,6 +46,10 @@ export interface ComposeTab {
   dirty: boolean;
   draftSnapshot: ComposeDraftSnapshot | null;
   pendingAiBody: string | null;
+  pendingAiSubject: string | null;
+  pendingAiSignature: string | null;
+  /** Explicit mail drops waiting for this tab's instruction box to mount/be idle. */
+  pendingAiReferences?: MailReference[];
   activeDraftContext: ComposeContext | null;
 }
 
@@ -57,6 +67,8 @@ interface ComposeState {
   activeDraftContext: ComposeContext | null;
   draftSnapshot: ComposeDraftSnapshot | null;
   pendingAiBody: string | null;
+  pendingAiSubject: string | null;
+  pendingAiSignature: string | null;
   /** 关闭确认对话框（针对 pendingCloseTabId 对应标签）。 */
   showComposeLeaveConfirm: boolean;
   pendingView: ActiveView | null;
@@ -64,12 +76,15 @@ interface ComposeState {
   setComposeDirty: (dirty: boolean, tabId?: string) => void;
   setActiveDraftContext: (context: ComposeContext | null, tabId?: string) => void;
   setDraftSnapshot: (snapshot: ComposeDraftSnapshot | null, tabId?: string) => void;
-  applyAiBody: (body: string, tabId?: string) => void;
+  applyAiBody: (body: string, tabId?: string) => boolean;
+  applyAiDraft: (draft: { body: string; subject?: string; signature?: string }, tabId?: string) => boolean;
   clearPendingAiBody: (tabId?: string) => void;
   openCompose: (mode: ComposeMode, replyTo?: Message | null, prefill?: ComposePrefill | null) => void;
   openDraft: (snapshot: ComposeDraftSnapshot) => void;
   /** 切换激活的写信标签并同步投影。 */
   activateComposeTab: (tabId: string) => void;
+  queueAiReference: (tabId: string, reference: MailReference) => void;
+  clearAiReferences: (tabId: string) => void;
   /** 关闭标签（默认激活标签）；有未保存修改时弹确认。 */
   closeCompose: (tabId?: string) => void;
   /** 强制关闭标签（右键批量操作），跳过未保存确认。 */
@@ -101,6 +116,8 @@ function projectTab(tab: ComposeTab | null) {
     activeDraftContext: tab?.activeDraftContext ?? null,
     draftSnapshot: tab?.draftSnapshot ?? null,
     pendingAiBody: tab?.pendingAiBody ?? null,
+    pendingAiSubject: tab?.pendingAiSubject ?? null,
+    pendingAiSignature: tab?.pendingAiSignature ?? null,
   };
 }
 
@@ -113,6 +130,8 @@ function getComposeResetState() {
     activeDraftContext: null as ComposeContext | null,
     draftSnapshot: null as ComposeDraftSnapshot | null,
     pendingAiBody: null as string | null,
+    pendingAiSubject: null as string | null,
+    pendingAiSignature: null as string | null,
   };
 }
 
@@ -135,13 +154,30 @@ export const useComposeStore = create<ComposeState>((set) => ({
   activeDraftContext: null,
   draftSnapshot: null,
   pendingAiBody: null,
+  pendingAiSubject: null,
+  pendingAiSignature: null,
   showComposeLeaveConfirm: false,
   pendingView: null,
   pendingCloseTabId: null,
+  queueAiReference: (tabId, reference) => set(state => {
+    const tab = state.tabsById[tabId];
+    if (!tab || !reference.id) return {};
+    const pending = tab.pendingAiReferences ?? [];
+    if (pending.some(item => item.id === reference.id)) return {};
+    const updated = { ...tab, pendingAiReferences: [...pending, reference] };
+    return { tabs: state.tabs.map(item => item.id === tabId ? updated : item), tabsById: { ...state.tabsById, [tabId]: updated } };
+  }),
+  clearAiReferences: tabId => set(state => {
+    const tab = state.tabsById[tabId];
+    if (!tab?.pendingAiReferences?.length) return {};
+    const updated = { ...tab, pendingAiReferences: [] };
+    return { tabs: state.tabs.map(item => item.id === tabId ? updated : item), tabsById: { ...state.tabsById, [tabId]: updated } };
+  }),
   setComposeDirty: (dirty, tabId) => {
     set((state) => {
       const id = tabId ?? state.activeTabId;
-      if (!id || !state.tabsById[id]) return {};
+      if (!id) return state.composeMode ? { composeDirty: dirty } : {};
+      if (!state.tabsById[id]) return {};
       const updated = { ...state.tabsById[id], dirty };
       return {
         tabs: state.tabs.map((tab) => (tab.id === id ? updated : tab)),
@@ -153,6 +189,7 @@ export const useComposeStore = create<ComposeState>((set) => ({
   setActiveDraftContext: (context, tabId) => {
     set((state) => {
       const id = tabId ?? state.activeTabId;
+      if (!id && isComposeWindow()) return { activeDraftContext: context };
       if (!id || !state.tabsById[id]) return {};
       const updated = { ...state.tabsById[id], activeDraftContext: context };
       return {
@@ -175,9 +212,15 @@ export const useComposeStore = create<ComposeState>((set) => ({
     });
   },
   applyAiBody: (body, tabId) => {
+    let accepted = false;
     set((state) => {
       const id = tabId ?? state.activeTabId;
+      if (!id && isComposeWindow() && state.composeMode) {
+        accepted = true;
+        return { pendingAiBody: body };
+      }
       if (!id || !state.tabsById[id]) return {};
+      accepted = true;
       const updated = { ...state.tabsById[id], pendingAiBody: body };
       return {
         tabs: state.tabs.map((tab) => (tab.id === id ? updated : tab)),
@@ -185,16 +228,37 @@ export const useComposeStore = create<ComposeState>((set) => ({
         ...(state.activeTabId === id ? { pendingAiBody: body } : {}),
       };
     });
+    return accepted;
+  },
+  applyAiDraft: (draft, tabId) => {
+    let accepted = false;
+    set((state) => {
+      const id = tabId ?? state.activeTabId;
+      if (!id && isComposeWindow() && state.composeMode) {
+        accepted = true;
+        return { pendingAiBody: draft.body, pendingAiSubject: draft.subject ?? null, pendingAiSignature: draft.signature ?? null };
+      }
+      if (!id || !state.tabsById[id]) return {};
+      accepted = true;
+      const updated = { ...state.tabsById[id], pendingAiBody: draft.body, pendingAiSubject: draft.subject ?? null, pendingAiSignature: draft.signature ?? null };
+      return {
+        tabs: state.tabs.map((tab) => (tab.id === id ? updated : tab)),
+        tabsById: { ...state.tabsById, [id]: updated },
+        ...(state.activeTabId === id ? { pendingAiBody: draft.body, pendingAiSubject: draft.subject ?? null, pendingAiSignature: draft.signature ?? null } : {}),
+      };
+    });
+    return accepted;
   },
   clearPendingAiBody: (tabId) => {
     set((state) => {
       const id = tabId ?? state.activeTabId;
+      if (!id && isComposeWindow()) return { pendingAiBody: null, pendingAiSubject: null, pendingAiSignature: null };
       if (!id || !state.tabsById[id]) return {};
-      const updated = { ...state.tabsById[id], pendingAiBody: null };
+      const updated = { ...state.tabsById[id], pendingAiBody: null, pendingAiSubject: null, pendingAiSignature: null };
       return {
         tabs: state.tabs.map((tab) => (tab.id === id ? updated : tab)),
         tabsById: { ...state.tabsById, [id]: updated },
-        ...(state.activeTabId === id ? { pendingAiBody: null } : {}),
+        ...(state.activeTabId === id ? { pendingAiBody: null, pendingAiSubject: null, pendingAiSignature: null } : {}),
       };
     });
   },
@@ -208,7 +272,7 @@ export const useComposeStore = create<ComposeState>((set) => ({
     const tab: ComposeTab = {
       id, mode, replyTo, prefill,
       key: nextKey(), dirty: false,
-      draftSnapshot: null, pendingAiBody: null, activeDraftContext: null,
+      draftSnapshot: null, pendingAiBody: null, pendingAiSubject: null, pendingAiSignature: null, activeDraftContext: null,
     };
     set((state) => ({
       tabs: [...state.tabs, tab],
@@ -252,7 +316,7 @@ export const useComposeStore = create<ComposeState>((set) => ({
     const tab: ComposeTab = {
       id, mode: "new", replyTo: null, prefill: null,
       key: nextKey(), dirty: false,
-      draftSnapshot: snapshot, pendingAiBody: null, activeDraftContext: null,
+      draftSnapshot: snapshot, pendingAiBody: null, pendingAiSubject: null, pendingAiSignature: null, activeDraftContext: null,
     };
     set((state) => ({
       tabs: [...state.tabs, tab],
@@ -285,7 +349,12 @@ export const useComposeStore = create<ComposeState>((set) => ({
   closeCompose: (tabId) => {
     const state = useComposeStore.getState();
     const targetId = tabId ?? state.activeTabId;
-    if (!targetId) return;
+    if (!targetId) {
+      if (!state.composeMode) return;
+      if (state.composeDirty) set({ showComposeLeaveConfirm: true, pendingCloseTabId: null, pendingView: null });
+      else closeEmbeddedCompose(set);
+      return;
+    }
     const tab = state.tabsById[targetId];
     if (!tab) return;
     if (tab.dirty) {
@@ -310,6 +379,7 @@ export const useComposeStore = create<ComposeState>((set) => ({
     const targetId = state.pendingCloseTabId ?? state.activeTabId;
     if (!targetId) {
       set({ showComposeLeaveConfirm: false, pendingCloseTabId: null, pendingView: null });
+      if (state.composeMode) closeEmbeddedCompose(set);
       return;
     }
     set({ showComposeLeaveConfirm: false, pendingCloseTabId: null, pendingView: null });
@@ -329,6 +399,12 @@ export const useComposeStore = create<ComposeState>((set) => ({
     });
   },
 }));
+
+function closeEmbeddedCompose(set: (partial: Partial<ComposeState>) => void) {
+  const ui = useUIStore.getState();
+  useUIStore.setState({ activeView: ui.previousView === 'compose' ? 'inbox' : ui.previousView });
+  set({ ...getComposeResetState(), showComposeLeaveConfirm: false, pendingCloseTabId: null, pendingView: null });
+}
 
 /** 从标签列表中移除指定标签，并修正激活标签与视图（不弹确认，内部用）。 */
 function removeComposeTabNow(

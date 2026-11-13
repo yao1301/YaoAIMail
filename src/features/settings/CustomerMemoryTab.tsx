@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
 import { useTranslation } from "react-i18next";
 import {
   listCustomerMemories,
@@ -13,19 +13,19 @@ import { extractErrorMessage } from "../../lib/extractErrorMessage";
 
 export default function CustomerMemoryTab() {
   const { t } = useTranslation();
-  const [memories, setMemories] = useState<CustomerMemory[]>([]);
-  const [email, setEmail] = useState("");
-  const [building, setBuilding] = useState(false);
+  const [memories, setMemories] = useWorkspaceState<CustomerMemory[]>("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:memories", []);
+  const [email, setEmail] = useWorkspaceState("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:email", "");
+  const [building, setBuilding] = useWorkspaceState("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:building", false);
 
-  const [editing, setEditing] = useState<CustomerMemory | null>(null);
-  const [editName, setEditName] = useState("");
-  const [editCompany, setEditCompany] = useState("");
-  const [editSummary, setEditSummary] = useState("");
-  const [editProfile, setEditProfile] = useState("");
-  const [saving, setSaving] = useState(false);
+  const [editing, setEditing] = useWorkspaceState<CustomerMemory | null>("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:editing", null);
+  const [editName, setEditName] = useWorkspaceState("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:editName", "");
+  const [editCompany, setEditCompany] = useWorkspaceState("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:editCompany", "");
+  const [editSummary, setEditSummary] = useWorkspaceState("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:editSummary", "");
+  const [editProfile, setEditProfile] = useWorkspaceState("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:editProfile", "");
+  const [saving, setSaving] = useWorkspaceState("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:saving", false);
 
-  const [statusMsg, setStatusMsg] = useState("");
-  const [statusType, setStatusType] = useState<"success" | "error" | "">("");
+  const [statusMsg, setStatusMsg] = useWorkspaceState("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:statusMsg", "");
+  const [statusType, setStatusType] = useWorkspaceState<"success" | "error" | "">("src/features/settings/CustomerMemoryTab.tsx:CustomerMemoryTab:statusType", "");
 
   function flash(msg: string, type: "success" | "error") {
     setStatusMsg(msg);
@@ -40,7 +40,7 @@ export default function CustomerMemoryTab() {
     }
   }
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/CustomerMemoryTab.tsx:", () => {
     refresh();
   }, []);
 

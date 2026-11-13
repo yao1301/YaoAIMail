@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessageSummary } from "../../../src/lib/api";
 
@@ -8,6 +8,9 @@ const setSelectedMessage = vi.fn((messageId: string | null) => {
 });
 const useStarredMessagesQuery = vi.fn();
 const listStarredMessages = vi.fn();
+const deleteMessage = vi.fn();
+const mockUi = vi.hoisted(() => ({setMessageDetailId:vi.fn(),setActiveView:vi.fn()}));
+vi.mock('../../../src/stores/ui.store',()=>({useUIStore:{getState:()=>mockUi}}));
 
 const mockMailState = {
   activeAccountId: "account-1",
@@ -40,6 +43,7 @@ vi.mock("../../../src/hooks/queries/useStarredMessagesQuery", () => ({
 
 vi.mock("../../../src/lib/api", () => ({
   listStarredMessages: (...args: unknown[]) => listStarredMessages(...args),
+  deleteMessage: (...args: unknown[]) => deleteMessage(...args),
 }));
 
 vi.mock("../../../src/stores/mail.store", () => ({
@@ -50,14 +54,19 @@ vi.mock("../../../src/components/MessageItem", () => ({
   default: ({
     message,
     onClick,
+    onDoubleClick,
+    onOpenFullscreen,
     onToggleStar,
   }: {
     message: MessageSummary;
     onClick: () => void;
+    onDoubleClick?: () => void;
+    onOpenFullscreen?: () => void;
     onToggleStar?: (messageId: string, newStarred: boolean) => void;
   }) => (
     <div data-testid={`message-${message.id}`}>
-      <button onClick={onClick}>{message.subject}</button>
+      <button onClick={onClick} onDoubleClick={onDoubleClick}>{message.subject}</button>
+      <button onClick={onOpenFullscreen}>open fullscreen {message.id}</button>
       <button onClick={() => onToggleStar?.(message.id, false)}>unstar</button>
     </div>
   ),
@@ -101,6 +110,17 @@ describe("StarredView", () => {
     mockMailState.activeAccountId = "account-1";
     mockMailState.selectedMessageId = null;
     mockMailState.setSelectedMessage = setSelectedMessage;
+    deleteMessage.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("Delete advances to the next starred message", async () => {
+    useStarredMessagesQuery.mockReturnValue({ data: [makeMessage("a"), makeMessage("b"), makeMessage("c")],
+      loading: false, error: null, hasNextPage: false, isFetchingNextPage: false, fetchNextPage });
+    render(<StarredView />);
+    fireEvent.click(screen.getByRole("button", { name: "Subject b" }));
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    await waitFor(() => expect(screen.getByTestId("message-detail").textContent).toBe("c"));
+    expect(deleteMessage).toHaveBeenCalledWith("b");
   });
 
   it("automatically fetches the next page when the end is visible", () => {
@@ -137,6 +157,7 @@ describe("StarredView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Subject m-1" }));
 
     expect(screen.getByTestId("message-detail").textContent).toBe("m-1");
+    expect(setSelectedMessage).toHaveBeenCalledWith("m-1");
 
     fireEvent.click(screen.getByRole("button", { name: "unstar" }));
 
@@ -158,6 +179,19 @@ describe("StarredView", () => {
     render(<StarredView />);
 
     expect(screen.queryByTestId("message-detail")).toBeNull();
+  });
+
+  it('registers a mail tab and opens exact detail on double-click or context open', () => {
+    useStarredMessagesQuery.mockReturnValue({data:[makeMessage('m-1')],loading:false,error:null,hasNextPage:false,isFetchingNextPage:false,fetchNextPage});
+    render(<StarredView/>);
+    fireEvent.doubleClick(screen.getByRole('button',{name:'Subject m-1'}));
+    expect(setSelectedMessage).toHaveBeenCalledWith('m-1');
+    expect(mockUi.setMessageDetailId).toHaveBeenCalledWith('m-1');
+    expect(mockUi.setActiveView).toHaveBeenCalledWith('messageDetail');
+    vi.clearAllMocks();
+    fireEvent.click(screen.getByRole('button',{name:'open fullscreen m-1'}));
+    expect(setSelectedMessage).toHaveBeenCalledWith('m-1');
+    expect(mockUi.setActiveView).toHaveBeenCalledWith('messageDetail');
   });
 
   it("continues automatic pagination when all loaded starred messages are unstarred", () => {

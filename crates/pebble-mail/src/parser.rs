@@ -136,14 +136,19 @@ pub fn parse_raw_email(raw: &[u8]) -> Result<ParsedMessage> {
                 .unwrap_or_else(|| "application/octet-stream".to_string());
             let size = part.len();
             let content_id = part.content_id().map(|s| s.to_string());
-            let is_inline = part
-                .content_disposition()
-                .map(|d| d.ctype() == "inline")
-                .unwrap_or(false)
-                // Many mail clients omit Content-Disposition on CID parts.
-                // Content-ID is the reliable signal that the MIME part is
-                // intended to be rendered inside the HTML body.
-                || content_id.is_some();
+            let is_image = mime_type.to_ascii_lowercase().starts_with("image/");
+            let is_inline = is_image
+                && (part
+                    .content_disposition()
+                    .map(|d| d.ctype() == "inline")
+                    .unwrap_or(false)
+                    // Many mail clients omit Content-Disposition on CID parts.
+                    // Content-ID is the reliable signal that the MIME part is
+                    // intended to be rendered inside the HTML body, but only an
+                    // image can be an inline body resource. Some clients attach
+                    // a Content-ID to PDFs/AI files even though they are real
+                    // downloadable attachments.
+                    || content_id.is_some());
             let data = part.contents().to_vec();
             AttachmentData {
                 meta: AttachmentMeta {
@@ -260,6 +265,34 @@ mod tests {
         assert_eq!(parsed.attachments[0].meta.content_id.as_deref(), Some("logo.png"));
         assert!(parsed.attachments[0].meta.is_inline);
         assert!(!parsed.has_attachments);
+    }
+
+    #[test]
+    fn test_inline_non_image_content_id_part_is_downloadable_attachment() {
+        let raw = b"From: Sender <sender@example.com>\r\n\
+                    To: Recipient <recv@example.com>\r\n\
+                    Subject: Project files\r\n\
+                    MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/mixed; boundary=mixed42\r\n\
+                    \r\n\
+                    --mixed42\r\n\
+                    Content-Type: text/html; charset=utf-8\r\n\
+                    \r\n\
+                    <p>See the project files.</p>\r\n\
+                    --mixed42\r\n\
+                    Content-Type: application/pdf; name=\"project.pdf\"\r\n\
+                    Content-ID: <file-pdf>\r\n\
+                    Content-Disposition: inline; filename=\"project.pdf\"\r\n\
+                    Content-Transfer-Encoding: base64\r\n\
+                    \r\n\
+                    JVBERi0xLjQ=\r\n\
+                    --mixed42--\r\n";
+
+        let parsed = parse_raw_email(raw).unwrap();
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].meta.filename, "project.pdf");
+        assert!(!parsed.attachments[0].meta.is_inline);
+        assert!(parsed.has_attachments);
     }
 
     #[test]

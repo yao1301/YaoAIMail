@@ -2,18 +2,23 @@ import { useRef, useMemo, useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Inbox, Archive, Trash2, MailOpen, MailCheck, Star, X } from "lucide-react";
+import { Inbox, Archive, Trash2, MailOpen, MailCheck, Star, X, Send } from "lucide-react";
 import { ArrowDown, ArrowUp, Paperclip } from "lucide-react";
 import type { MessageSummary } from "@/lib/api";
 import { getMessageLabelsBatch, batchArchive, batchMarkRead, batchStar, deleteMessage } from "@/lib/api";
 import { useAccountsQuery, useFoldersForAccountsQuery } from "@/hooks/queries";
 import { useMailStore } from "@/stores/mail.store";
+import { useMailSortStore } from "@/stores/mailSort.store";
 import { useToastStore } from "@/stores/toast.store";
 import { useConfirmStore } from "@/stores/confirm.store";
 import { roleForSelection } from "@/lib/folderAggregation";
 import { assignAccountColors, getAccountColor, getAccountLabel } from "@/lib/accountColors";
 import MessageItem from "./MessageItem";
 import { MessageListSkeleton } from "./Skeleton";
+import { useSendDrafts } from '@/hooks/useSendDrafts';
+import { usePrepareMessageDeletion } from "@/hooks/useMessageDeletionNavigation";
+import { sortMessages } from "@/lib/sortMessages";
+import { observeResizeFrame } from "@/lib/observeResizeFrame";
 
 interface Props {
   messages: MessageSummary[];
@@ -45,6 +50,8 @@ export default function MessageList({
 }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const prepareDeletion = usePrepareMessageDeletion();
+  const { sendDrafts, sending } = useSendDrafts();
   const addToast = useToastStore((s) => s.addToast);
   const parentRef = useRef<HTMLDivElement>(null);
   const batchMode = useMailStore((s) => s.batchMode);
@@ -82,6 +89,8 @@ export default function MessageList({
     () => messages.filter((message) => !optimisticallyDeletedIds.has(message.id)),
     [messages, optimisticallyDeletedIds],
   );
+  const selectedDraftIds = [...selectedMessageIds].filter(id => visibleMessages.some(message => message.id === id && message.is_draft));
+  const allSelectedAreDrafts = selectedMessageIds.size > 0 && selectedDraftIds.length === selectedMessageIds.size;
   const messageIds = useMemo(() => visibleMessages.map((m) => m.id), [visibleMessages]);
   const messageIdsKey = useMemo(() => messageIds.join(","), [messageIds]);
   const { data: labelsByMessage = {} } = useQuery({
@@ -91,40 +100,11 @@ export default function MessageList({
     enabled: messageIds.length > 0,
   });
 
-  type SortKey = "date" | "subject" | "starred" | "attachments";
-  const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>(() => {
-    try {
-      const stored = JSON.parse(localStorage.getItem("pebble-mail-sort") ?? "");
-      if (
-        stored
-        && ["date", "subject", "starred", "attachments"].includes(stored.key)
-        && (stored.dir === "asc" || stored.dir === "desc")
-      ) {
-        return stored as { key: SortKey; dir: "asc" | "desc" };
-      }
-    } catch {
-      // ignore corrupted value
-    }
-    return { key: "date", dir: "desc" };
-  });
+  const sort = useMailSortStore((s) => s.sort);
+  const toggleSort = useMailSortStore((s) => s.toggleSort);
 
   const sortedMessages = useMemo(() => {
-    const copy = [...visibleMessages];
-    const factor = sort.dir === "asc" ? 1 : -1;
-    copy.sort((left, right) => {
-      switch (sort.key) {
-        case "subject":
-          return (left.subject || "").localeCompare(right.subject || "", "zh") * factor;
-        case "starred":
-          return (Number(left.is_starred) - Number(right.is_starred)) * factor;
-        case "attachments":
-          return (Number(left.has_attachments) - Number(right.has_attachments)) * factor;
-        case "date":
-        default:
-          return (left.date - right.date) * factor;
-      }
-    });
-    return copy;
+    return sortMessages(visibleMessages, sort);
   }, [visibleMessages, sort]);
 
   useEffect(() => {
@@ -135,18 +115,8 @@ export default function MessageList({
     });
   }, [messages]);
 
-  function toggleSort(key: SortKey) {
-    setSort((previous) => {
-      const dir: "asc" | "desc" = key === "date" ? "desc" : "asc";
-      const next: { key: SortKey; dir: "asc" | "desc" } = previous.key === key
-        ? { key, dir: previous.dir === "asc" ? "desc" : "asc" }
-        : { key, dir };
-      localStorage.setItem("pebble-mail-sort", JSON.stringify(next));
-      return next;
-    });
-  }
-
   const virtualizer = useVirtualizer({
+    useAnimationFrameWithResizeObserver: true,
     count: sortedMessages.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => 76,
@@ -164,16 +134,7 @@ export default function MessageList({
   useEffect(() => {
     const element = parentRef.current;
     if (!element) return;
-    const measure = () => virtualizer.measure();
-    const frame = requestAnimationFrame(measure);
-    const observer = typeof ResizeObserver !== "undefined"
-      ? new ResizeObserver(measure)
-      : null;
-    observer?.observe(element);
-    return () => {
-      cancelAnimationFrame(frame);
-      observer?.disconnect();
-    };
+    return observeResizeFrame(element, () => virtualizer.measure());
   }, [virtualizer, sortedMessages.length]);
 
   useEffect(() => {
@@ -241,6 +202,7 @@ export default function MessageList({
       if (!ok) return;
     }
     setBatchLoading(true);
+    const completeDeletion = prepareDeletion(action === "delete" ? ids : undefined);
     if (action === "delete") {
       setOptimisticallyDeletedIds((current) => new Set([...current, ...ids]));
     }
@@ -262,6 +224,7 @@ export default function MessageList({
           }
         }
         if (failedIds.length > 0) {
+          addToast({ message: t("batch.failed"), type: "error" });
           setOptimisticallyDeletedIds((current) => {
             const next = new Set(current);
             failedIds.forEach((id) => next.delete(id));
@@ -269,6 +232,7 @@ export default function MessageList({
           });
         }
         count = ok;
+        completeDeletion(ids.filter(id => !failedIds.includes(id)));
       }
       else if (action === "markRead") count = await batchMarkRead(ids, true);
       else if (action === "markUnread") count = await batchMarkRead(ids, false);
@@ -278,9 +242,12 @@ export default function MessageList({
       if (batchActionChangesUnreadCounts(action)) {
         queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
       }
-      addToast({ message: t("batch.success", { count }), type: "success" });
+      if (action !== "delete" || count > 0) {
+        addToast({ message: t("batch.success", { count }), type: "success" });
+      }
       clearSelection();
     } catch {
+      if (action === "delete") completeDeletion([]);
       addToast({ message: t("batch.failed"), type: "error" });
     } finally {
       setBatchLoading(false);
@@ -381,7 +348,9 @@ export default function MessageList({
           ? [store.selectedMessageId]
           : [];
       if (ids.length === 0) return;
+      if (batchLoading) return;
       event.preventDefault();
+      const completeDeletion = prepareDeletion(ids);
       useMailStore.setState({
         selectedMessageIds: new Set(ids),
         batchMode: true,
@@ -401,6 +370,7 @@ export default function MessageList({
           }
         }
         if (failedIds.length > 0) {
+          addToast({ message: t("batch.failed"), type: "error" });
           setOptimisticallyDeletedIds((current) => {
             const next = new Set(current);
             failedIds.forEach((id) => next.delete(id));
@@ -408,17 +378,23 @@ export default function MessageList({
           });
         }
         invalidateMessageViews();
-        useMailStore.setState({ selectedMessageIds: new Set(), batchMode: false, selectedMessageId: null });
+        const handled = completeDeletion(ids.filter(id => !failedIds.includes(id)));
+        useMailStore.setState({ selectedMessageIds: new Set(), batchMode: false });
+        if (!handled && !failedIds.includes(store.selectedMessageId ?? "")
+          && ids.includes(store.selectedMessageId ?? "")
+          && useMailStore.getState().selectedMessageId === store.selectedMessageId) {
+          useMailStore.setState({ selectedMessageId: null });
+        }
         if (batchActionChangesUnreadCounts("delete")) {
           queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
         }
-        addToast({ message: t("batch.success", { count: ok }), type: ok > 0 ? "success" : "error" });
+        if (ok > 0) addToast({ message: t("batch.success", { count: ok }), type: "success" });
         setBatchLoading(false);
       })();
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [addToast, invalidateMessageViews, queryClient, t]);
+  }, [addToast, invalidateMessageViews, queryClient, t, prepareDeletion, batchLoading]);
 
   // 早期 return 必须放在所有 hooks 之后（React 规则：hooks 数量在每次渲染必须一致）
   if (loading) {
@@ -472,6 +448,7 @@ export default function MessageList({
           </label>
           {selectedMessageIds.size > 0 && (
             <>
+              {allSelectedAreDrafts && <BatchBtn icon={Send} label="发送选中的草稿" onClick={() => void sendDrafts(selectedDraftIds)} disabled={sending || batchLoading} />}
               <BatchBtn icon={Archive} label={t("messageActions.archive")} onClick={() => handleBatchAction("archive")} disabled={batchLoading} />
               <BatchBtn icon={Trash2} label={t("common.delete")} onClick={() => handleBatchAction("delete")} disabled={batchLoading} />
               <BatchBtn icon={MailOpen} label={t("batch.markRead")} onClick={() => handleBatchAction("markRead")} disabled={batchLoading} />
@@ -485,6 +462,7 @@ export default function MessageList({
       )}
       {visibleMessages.length > 0 && (
         <div
+          className="message-list-sortbar"
           style={{
             display: "flex",
             alignItems: "center",
@@ -509,6 +487,12 @@ export default function MessageList({
             active={sort.key === "starred"}
             dir={sort.key === "starred" ? sort.dir : null}
             onClick={() => toggleSort("starred")}
+          />
+          <SortButton
+            label={t("mailSort.sender", "发件人")}
+            active={sort.key === "sender"}
+            dir={sort.key === "sender" ? sort.dir : null}
+            onClick={() => toggleSort("sender")}
           />
           <SortButton
             label="主题"
@@ -565,6 +549,7 @@ export default function MessageList({
                   onToggleStar={onToggleStar}
                   batchMode={batchMode}
                   batchSelected={selectedMessageIds.has(message.id)}
+                  draftSendIds={batchMode && selectedMessageIds.has(message.id) ? (allSelectedAreDrafts ? selectedDraftIds : []) : undefined}
                   spamFolderId={spamFolderId}
                   folderRole={activeFolderRole}
                   activeFolderId={activeFolderId}
@@ -644,6 +629,7 @@ function SortButton({
       type="button"
       onClick={onClick}
       title={`按${label}排序`}
+      aria-pressed={active}
       style={{
         display: "flex",
         alignItems: "center",

@@ -11,10 +11,9 @@
 
 use crate::commands::ai::load_active_provider_config;
 use crate::commands::company_intel::gleif_matches;
-use crate::commands::external_services::get_external_service_api_keys;
 use crate::commands::network::get_global_proxy_raw;
 use crate::commands::web_research::{
-    build_research_client, safe_fetch, EvidenceStatus, FetchPolicy,
+    build_research_client, EvidenceStatus, FetchPolicy,
 };
 use crate::state::AppState;
 use pebble_core::{PebbleError, Result};
@@ -71,7 +70,7 @@ impl Default for AgentBudget {
     }
 }
 
-fn build_tools() -> Vec<Value> {
+pub(crate) fn build_tools() -> Vec<Value> {
     vec![
         function_tool(
             "web_search",
@@ -109,16 +108,14 @@ fn build_tools() -> Vec<Value> {
     ]
 }
 
-fn resolve_llm(
-    state: &AppState,
+pub(crate) fn resolve_llm_config(
+    cfg: &TranslateProviderConfig,
 ) -> Result<(String, String, String, String, pebble_translate::types::LLMMode)> {
-    let cfg = load_active_provider_config(state)?;
     match cfg {
         TranslateProviderConfig::LLM { providers, active_id } => {
             let provider = providers
                 .iter()
-                .find(|p| p.id == active_id)
-                .or_else(|| providers.first())
+                .find(|p| &p.id == active_id)
                 .ok_or_else(|| {
                     PebbleError::Translate("AI 模型未配置，请先在 设置 → AI 模型 中配置".to_string())
                 })?;
@@ -151,9 +148,14 @@ pub async fn run_agent_with_budget(
     user: &str,
     budget: AgentBudget,
 ) -> Result<AgentResult> {
-    let (base_url, chat_path, api_key, model, mode) = resolve_llm(state)?;
+    super::search_router::scoped(state,run_agent_with_budget_inner(state,system,user,budget)).await
+}
+
+async fn run_agent_with_budget_inner(state:&AppState,system:&str,user:&str,budget:AgentBudget)->Result<AgentResult> {
+    let cfg = load_active_provider_config(state)?;
+    let (base_url, chat_path, api_key, model, mode) = resolve_llm_config(&cfg)?;
     let proxy = get_global_proxy_raw(&state.crypto, &state.store)?;
-    let client = TranslateService::http_client_with_proxy(proxy.as_ref())?;
+    let client = TranslateService::http_client_for_config(&cfg, proxy.as_ref())?;
     // Tool-selected URLs are untrusted. Use a dedicated client that never
     // follows redirects before safe_fetch validates the next hop.
     let web_client = build_research_client(proxy.as_ref())?;
@@ -270,7 +272,7 @@ pub async fn run_agent_with_budget(
     // required final JSON).
     messages.push(json!({
         "role": "user",
-        "content": "你已收集足够信息。请立即停止使用任何工具，直接输出最终结果（严格按之前要求的格式，不要解释、不要多余文字）。",
+        "content": "已达到本次工具调用预算。停止使用工具，按原始任务要求的格式输出最终结果；证据不足时明确说明，不要声称已经收集足够信息。",
     }));
     // Do not replay the incomplete assistant tool-call message to the final
     // request. Several providers reject a transcript containing an assistant
@@ -283,7 +285,7 @@ pub async fn run_agent_with_budget(
         .collect::<Vec<_>>()
         .join("\n\n--- TOOL EVIDENCE ---\n\n");
     let final_user = format!(
-        "{user}\n\n已收集到以下公开信息。现在停止搜索，严格只输出之前要求的 JSON 数组，不要解释：\n{}",
+        "{user}\n\n已达到工具调用预算。以下是实际取得的工具证据。停止搜索，按原始任务要求的格式输出结果（原要求 JSON 则用 JSON，原要求 Markdown 则用 Markdown）。明确说明证据缺口，不要把预算耗尽当作核验成功：\n{}",
         evidence.chars().take(30_000).collect::<String>()
     );
     let turns = vec![
@@ -327,12 +329,12 @@ pub async fn run_agent_with_budget(
     })
 }
 
-struct ToolOutcome {
-    text: String,
-    sources: Vec<String>,
+pub(crate) struct ToolOutcome {
+    pub text: String,
+    pub sources: Vec<String>,
 }
 
-async fn execute_tool(
+pub(crate) async fn execute_tool(
     state: &AppState,
     client: &reqwest::Client,
     name: &str,
@@ -354,7 +356,7 @@ async fn execute_tool(
                 .and_then(|u| u.as_str())
                 .unwrap_or("")
                 .to_string();
-            fetch_url_tool(client, &url).await
+            fetch_url_tool(state, client, &url).await
         }
         "gleif_company" => {
             let company = args
@@ -375,44 +377,34 @@ async fn web_search_tool(state: &AppState, client: &reqwest::Client, query: &str
     if query.trim().is_empty() {
         return ToolOutcome { text: "缺少搜索关键词".to_string(), sources: Vec::new() };
     }
-    let tavily_keys = get_external_service_api_keys(state, "tavily").unwrap_or_default();
-    let brave_keys = get_external_service_api_keys(state, "brave").unwrap_or_default();
     let mut lines: Vec<String> = Vec::new();
     let mut sources: Vec<String> = Vec::new();
-    // Use one provider per tool call rather than charging two providers for
-    // the same query. With no key, fall back to a public RSS search endpoint.
-    let items = if !brave_keys.is_empty() {
-        crate::commands::company_intel::brave_search_with_keys(client, &brave_keys, query).await
-    } else if !tavily_keys.is_empty() {
-        crate::commands::company_intel::tavily_search_with_keys(client, &tavily_keys, query).await
-    } else {
-        crate::commands::company_intel::keyless_web_search(client, query).await
-    };
-    for (i, item) in items.iter().enumerate() {
+    let result = super::search_router::search(state,client,query).await;
+    for (i, item) in result.items.iter().enumerate() {
         lines.push(format!(
             "{}. {} — {}\n   {}\n   {}",
             i + 1,
             item.title,
             item.url,
-            item.description,
+            format!("来源：{}；{}", item.provider, item.description),
             item.url
         ));
         sources.push(item.url.clone());
     }
     if lines.is_empty() {
         return ToolOutcome {
-            text: "没有搜索到结果。请尝试换关键词，或改用 fetch_url 抓取已知官网。".to_string(),
+            text: format!("{}\n搜索记录：{}",result.warning,result.attempts.iter().map(|a|format!("{}：{}",a.provider,a.status)).collect::<Vec<_>>().join("；")),
             sources,
         };
     }
     ToolOutcome {
-        text: lines.join("\n\n"),
+        text: format!("{}\n\n搜索执行记录（{}）：{}", lines.join("\n\n"),if result.cache_hit {"命中缓存"}else{"实时查询"},result.attempts.iter().map(|a|format!("{}：{}",a.provider,a.status)).collect::<Vec<_>>().join("；")),
         sources,
     }
 }
 
-async fn fetch_url_tool(client: &reqwest::Client, url: &str) -> ToolOutcome {
-    let page = safe_fetch(client, url, "agent_fetch", FetchPolicy::default()).await;
+async fn fetch_url_tool(state: &AppState, client: &reqwest::Client, url: &str) -> ToolOutcome {
+    let page = super::search_router::fetch_with_optional_cloud(state,client,url,"agent_fetch",FetchPolicy::default()).await;
     if page.evidence.status != EvidenceStatus::Ok {
         let reason = if page.evidence.error.is_empty() {
             "没有取得可用正文".to_string()
@@ -424,13 +416,13 @@ async fn fetch_url_tool(client: &reqwest::Client, url: &str) -> ToolOutcome {
             sources: vec![page.final_url],
         };
     }
-    let text = html_to_text(&page.text);
+    let text = if page.evidence.content_type=="text/markdown" {page.text.clone()}else{html_to_text(&page.text)};
     let clipped: String = text.chars().take(6000).collect();
     if clipped.trim().is_empty() {
         return ToolOutcome { text: format!("页面内容为空（可能是 JS 渲染页面）：{}", page.final_url), sources: vec![page.final_url] };
     }
     ToolOutcome {
-        text: format!("【{}】\n{clipped}", page.final_url),
+        text: format!("【{} · {}】\n{clipped}", page.evidence.provider,page.final_url),
         sources: vec![page.final_url],
     }
 }

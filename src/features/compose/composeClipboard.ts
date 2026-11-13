@@ -54,12 +54,130 @@ function spreadsheetFragment(html: string): { fragment: string; styles: string }
   return { fragment, styles };
 }
 
+function positiveInteger(value: string | null): number | null {
+  if (!value || !/^\d+$/.test(value.trim())) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function cssLengthToPixels(value: string | null): number | null {
+  if (!value) return null;
+  const match = /^([0-9]+(?:\.[0-9]+)?)(px|pt)?$/i.exec(value.trim());
+  if (!match) return null;
+  const numeric = Number(match[1]);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return Math.max(1, Math.round(match[2]?.toLowerCase() === "pt" ? numeric * 96 / 72 : numeric));
+}
+
+function spreadsheetElementWidth(element: HTMLElement): number | null {
+  return cssLengthToPixels(element.getAttribute("width"))
+    ?? cssLengthToPixels(element.style.width);
+}
+
+/** Expand Excel's `<col span>` shorthand so every logical column has one node. */
+function expandSpreadsheetColumns(table: HTMLTableElement): number[] {
+  const widths: number[] = [];
+  const columns = Array.from(table.querySelectorAll<HTMLTableColElement>("col"))
+    .filter((column) => column.closest("table") === table);
+
+  for (const column of columns) {
+    const span = positiveInteger(column.getAttribute("span")) ?? 1;
+    const width = spreadsheetElementWidth(column);
+    const parent = column.parentNode;
+    const insertionPoint = column.nextSibling;
+    column.removeAttribute("span");
+    if (width) column.setAttribute("width", String(width));
+    widths.push(width ?? 0);
+
+    if (!parent) continue;
+    for (let index = 1; index < span; index += 1) {
+      const clone = column.cloneNode(true) as HTMLTableColElement;
+      clone.removeAttribute("span");
+      if (width) clone.setAttribute("width", String(width));
+      parent.insertBefore(clone, insertionPoint);
+      widths.push(width ?? 0);
+    }
+  }
+
+  return widths;
+}
+
 /**
- * WPS puts a styled HTML table on the Windows clipboard but, unlike Excel,
- * usually provides no bitmap preview. Render that original HTML to one PNG so
- * Tiptap cannot strip its cell colours, borders, fonts, widths, or alignment.
+ * Tiptap derives the rendered colgroup only from the first row. Supplying an
+ * explicit colwidth on every first-row cell avoids its col-index zero bug and
+ * keeps widths correct after Excel `<col span>` nodes have been expanded.
  */
-export async function renderSpreadsheetHtmlToPng(html: string): Promise<string | null> {
+function writeFirstRowColumnWidths(table: HTMLTableElement, columnWidths: number[]) {
+  const firstRow = Array.from(table.rows).find((row) => row.closest("table") === table);
+  if (!firstRow) return;
+
+  let columnIndex = 0;
+  for (const cell of Array.from(firstRow.cells)) {
+    const colspan = positiveInteger(cell.getAttribute("colspan")) ?? 1;
+    let widths = columnWidths.slice(columnIndex, columnIndex + colspan);
+
+    // Some spreadsheet producers omit colgroup. Preserve a source-authored
+    // cell width as a fallback, but never use hidden-preview measurements.
+    if (widths.length !== colspan || widths.some((width) => width <= 0)) {
+      const ownWidth = spreadsheetElementWidth(cell);
+      widths = ownWidth && colspan === 1 ? [ownWidth] : [];
+    }
+
+    if (widths.length === colspan) {
+      cell.setAttribute("colwidth", widths.join(","));
+    }
+    columnIndex += colspan;
+  }
+}
+
+/** Remove only whitespace that is illegal between table structure elements. */
+function removeTableStructureWhitespace(table: HTMLTableElement) {
+  const structuralParents: Element[] = [
+    table,
+    ...Array.from(table.querySelectorAll("colgroup, thead, tbody, tfoot, tr")),
+  ];
+  for (const parent of structuralParents) {
+    for (const child of Array.from(parent.childNodes)) {
+      if (child.nodeType === Node.TEXT_NODE && !(child.textContent ?? "").trim()) {
+        child.remove();
+      }
+    }
+  }
+}
+
+/** WPS may put style-only spacer rows with no cells on the clipboard. */
+function removeEmptySpreadsheetRows(table: HTMLTableElement) {
+  for (const row of Array.from(table.rows)) {
+    if (row.closest("table") === table && row.cells.length === 0) row.remove();
+  }
+}
+
+/** Tiptap table cells require at least one block node, even when Excel/WPS copied a blank cell. */
+function ensureSpreadsheetCellsHaveContent(table: HTMLTableElement) {
+  const cells = Array.from(table.querySelectorAll<HTMLTableCellElement>("td, th"))
+    .filter((cell) => cell.closest("table") === table);
+  for (const cell of cells) {
+    const hasMeaningfulContent = Array.from(cell.childNodes).some((child) => {
+      if (child.nodeType === Node.TEXT_NODE) return Boolean((child.textContent ?? "").trim());
+      return child.nodeType === Node.ELEMENT_NODE;
+    });
+    if (!hasMeaningfulContent) {
+      cell.replaceChildren(document.createElement("p"));
+    }
+  }
+}
+
+/**
+ * Convert spreadsheet clipboard HTML into an email-safe styled table.
+ *
+ * Excel/WPS often put the formatting in a mixture of inline styles and a
+ * `<style>` block with generated class names. Tiptap's table schema cannot
+ * retain those stylesheet rules by itself, so let the browser resolve the
+ * rules and copy the visual table properties back onto each table element.
+ * The result remains an editable HTML table and is safe to send to mail
+ * clients; it is not a local-only data URL image.
+ */
+export function prepareSpreadsheetTableHtml(html: string): string | null {
   const content = spreadsheetFragment(html);
   if (!content || typeof document === "undefined") return null;
 
@@ -70,46 +188,64 @@ export async function renderSpreadsheetHtmlToPng(html: string): Promise<string |
     "width:max-content", "max-width:none", "background:#fff", "color:#000", "padding:2px",
   ].join(";");
   const style = document.createElement("style");
-  style.textContent = `${content.styles}\n[data-spreadsheet-preview] { display:inline-block; background:#fff; }`;
+  style.textContent = content.styles;
   const preview = document.createElement("div");
-  preview.dataset.spreadsheetPreview = "true";
   preview.innerHTML = content.fragment;
   host.append(style, preview);
   document.body.appendChild(host);
 
   try {
-    await document.fonts?.ready;
-    const bounds = preview.getBoundingClientRect();
-    const naturalWidth = Math.max(1, Math.ceil(Math.max(bounds.width, preview.scrollWidth)));
-    const naturalHeight = Math.max(1, Math.ceil(Math.max(bounds.height, preview.scrollHeight)));
-    const maxWidth = 2400;
-    const maxHeight = 5000;
-    const maxPixels = 8_000_000;
-    const scale = Math.min(1, maxWidth / naturalWidth, maxHeight / naturalHeight, Math.sqrt(maxPixels / (naturalWidth * naturalHeight)));
-    const width = Math.max(1, Math.round(naturalWidth * scale));
-    const height = Math.max(1, Math.round(naturalHeight * scale));
-    const serialized = new XMLSerializer().serializeToString(preview);
-    const safeStyles = content.styles.replace(/<\/style/gi, "<\\/style");
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${naturalWidth} ${naturalHeight}"><foreignObject width="100%" height="100%"><div xmlns="http://www.w3.org/1999/xhtml" style="display:inline-block;background:#fff;color:#000;padding:2px"><style>${safeStyles}</style>${serialized}</div></foreignObject></svg>`;
-    // The desktop WebView deliberately blocks blob: images in its CSP. Using a
-    // blob URL here made WPS paste fail and silently fall back to Tiptap's
-    // simplified table. data: is already allowed for composed inline images.
-    const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error("Unable to render spreadsheet clipboard HTML"));
-      img.src = svgUrl;
-    });
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext("2d");
-    if (!context) return null;
-    context.fillStyle = "#fff";
-    context.fillRect(0, 0, width, height);
-    context.drawImage(image, 0, 0, width, height);
-    return canvas.toDataURL("image/png");
+    const table = preview.querySelector("table");
+    if (!table) return null;
+
+    const tables = Array.from(preview.querySelectorAll<HTMLTableElement>("table"));
+    for (const spreadsheetTable of tables) {
+      removeTableStructureWhitespace(spreadsheetTable);
+      removeEmptySpreadsheetRows(spreadsheetTable);
+      ensureSpreadsheetCellsHaveContent(spreadsheetTable);
+      const columnWidths = expandSpreadsheetColumns(spreadsheetTable);
+      writeFirstRowColumnWidths(spreadsheetTable, columnWidths);
+    }
+
+    // These properties are widely supported by mail clients and cover the
+    // formatting normally produced for a copied spreadsheet range. Deliberately
+    // omit URL-bearing properties such as background-image. Width and height
+    // are handled separately so hidden-preview measurements are never frozen
+    // onto cells and allowed to fight Excel's real column widths.
+    const visualProperties = [
+      "background-color", "color", "font-family", "font-size", "font-weight",
+      "font-style", "text-decoration", "text-align", "vertical-align", "white-space",
+      "line-height", "border-collapse", "border-spacing", "border-top", "border-right",
+      "border-bottom", "border-left", "padding-top", "padding-right", "padding-bottom",
+      "padding-left",
+    ];
+    preview.querySelectorAll<HTMLElement>("table, thead, tbody, tfoot, tr, th, td, col, colgroup")
+      .forEach((element) => {
+        const computed = getComputedStyle(element);
+        const elementProperties = [
+          ...visualProperties,
+          ...(element.tagName === "TABLE" ? ["table-layout"] : []),
+          ...(element.tagName === "TABLE" || element.tagName === "COL" || element.tagName === "COLGROUP"
+            ? ["width", "min-width"]
+            : []),
+          ...(element.tagName === "TR" ? ["height"] : []),
+        ];
+        const declarations = elementProperties
+          .map((property) => {
+            const value = computed.getPropertyValue(property).trim();
+            return value ? `${property}:${value}` : "";
+          })
+          .filter(Boolean)
+          .join(";");
+        if (declarations) element.setAttribute("style", declarations);
+        // The class names only point back to the clipboard stylesheet, which
+        // is not part of the outgoing message after the paste.
+        element.removeAttribute("class");
+      });
+
+    preview.querySelectorAll("style, script, iframe, object, embed, link, meta")
+      .forEach((node) => node.remove());
+    return preview.innerHTML.trim();
   } finally {
     host.remove();
   }

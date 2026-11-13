@@ -1,4 +1,6 @@
-import { profileLocalStorage } from "@/lib/profileStorage";
+import { useMemo, useSyncExternalStore } from "react";
+import { findMailLanguage } from "@/lib/mailLanguages";
+import { profileLocalStorage, subscribeProfileLocalStorage } from "@/lib/profileStorage";
 
 export interface WritingPreferences {
   language: string;
@@ -16,14 +18,21 @@ const defaults: WritingPreferences = {
   signatureId: "",
 };
 
-function readAll(): Record<string, WritingPreferences> {
+function readRaw() {
   try {
-    const raw = profileLocalStorage.getItem(STORAGE_KEY);
+    return profileLocalStorage.getItem(STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function readAll(raw = readRaw()): Record<string, WritingPreferences> {
+  try {
     if (!raw) return {};
     const parsed = JSON.parse(raw) as Record<string, Partial<WritingPreferences>>;
     return Object.fromEntries(Object.entries(parsed).map(([accountId, value]) => [
       accountId,
-      { ...defaults, ...value, includeKnowledge: Boolean(value.includeKnowledge) },
+      { ...defaults, ...value, language: findMailLanguage(value.language ?? "")?.value ?? "auto", includeKnowledge: Boolean(value.includeKnowledge) },
     ]));
   } catch {
     return {};
@@ -33,6 +42,17 @@ function readAll(): Record<string, WritingPreferences> {
 export function getWritingPreferences(accountId: string | null | undefined): WritingPreferences {
   if (!accountId) return { ...defaults };
   return { ...defaults, ...readAll()[accountId] };
+}
+
+function subscribeWritingPreferences(listener: () => void) {
+  return subscribeProfileLocalStorage((key) => {
+    if (key === null || key === STORAGE_KEY) listener();
+  }, true);
+}
+
+export function useWritingPreferences(accountId: string | null | undefined): WritingPreferences {
+  const raw = useSyncExternalStore(subscribeWritingPreferences, readRaw);
+  return useMemo(() => ({ ...defaults, ...(accountId ? readAll(raw)[accountId] : undefined) }), [accountId, raw]);
 }
 
 export function saveWritingPreferences(accountId: string | null | undefined, patch: Partial<WritingPreferences>): WritingPreferences {

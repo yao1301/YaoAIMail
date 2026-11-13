@@ -104,3 +104,18 @@ export function unreadCountForFolder(
   const matchingFolderIds = folderIdsForSelection(folderId, folders);
   return matchingFolderIds.reduce((sum, id) => sum + (countsByFolderId[id] ?? 0), 0);
 }
+
+/**
+ * The “All unread” entry represents every non-spam folder, matching the
+ * unread total shown beside each account. It must not be limited to Inbox:
+ * unread mail can live in Archive or user-created folders too.
+ */
+export function unreadCountForAllUnread(
+  folders: Folder[],
+  countsByFolderId: Record<string, number>,
+): number {
+  return folders.reduce(
+    (sum, folder) => sum + (folder.role === "spam" ? 0 : (countsByFolderId[folder.id] ?? 0)),
+    0,
+  );
+}

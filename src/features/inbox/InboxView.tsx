@@ -1,6 +1,6 @@
 import { useMailStore } from "@/stores/mail.store";
 import { useComposeStore } from "@/stores/compose.store";
-import { useAccountsQuery, useMessagesQuery, useThreadsQuery, useFoldersForAccountsQuery, useMessageQuery, patchMessagesCache } from "@/hooks/queries";
+import { useAccountsQuery, useMessagesQuery, useThreadsQuery, useFoldersForAccountsQuery, useMessageQuery, patchMessagesCache, snapshotMessagesCache, restoreMessagesCache } from "@/hooks/queries";
 import { useUIStore } from "@/stores/ui.store";
 import { useToastStore } from "@/stores/toast.store";
 import MessageList from "@/components/MessageList";
@@ -15,12 +15,19 @@ import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { listen } from "@tauri-apps/api/event";
-import { List, MessageSquare, Mail, Trash2, Inbox, CheckSquare, RefreshCw, PanelLeft, PanelTop, Reply, ReplyAll, Forward, Star, Archive, Sparkles, Search } from "lucide-react";
+import { List, MessageSquare, Mail, Trash2, Inbox, CheckSquare, RefreshCw, PanelLeft, PanelTop, Reply, ReplyAll, Forward, Star, Archive, Sparkles, Search, Send } from "lucide-react";
 import { MessageListSkeleton } from "@/components/Skeleton";
-import { emptyTrash, triggerSync, aiPrompt, getMessage, deleteMessage, listAttachments } from "@/lib/api";
+import { emptyTrash, triggerSync, aiPrompt, getMessage, deleteMessage } from "@/lib/api";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { folderIdsForSelection, roleForSelection, isAllAccountsFolderId } from "@/lib/folderAggregation";
 import type { ThreadSummary } from "@/lib/api";
+import { normalizeAiEmailDraft } from "@/features/compose/aiEmailDraft";
+import { loadMessageForEditing } from "@/features/compose/reopenMessage";
+import AccountOverview from "./AccountOverview";
+import { useSendDrafts } from '@/hooks/useSendDrafts';
+import { useMailSortStore } from "@/stores/mailSort.store";
+import { sortMessages } from "@/lib/sortMessages";
+import { MessageDeletionNavigationContext, useMessageDeletionNavigation } from "@/hooks/useMessageDeletionNavigation";
 
 const EMPTY_THREADS: ThreadSummary[] = [];
 
@@ -28,11 +35,12 @@ export default function InboxView() {
   const { t } = useTranslation();
   const setActiveView = useUIStore((s) => s.setActiveView);
   const activeFolderId = useMailStore((s) => s.activeFolderId);
+  const folderVisit = useMailStore((s) => s.folderVisit);
   const activeAccountId = useMailStore((s) => s.activeAccountId);
   const searchScope = useMailStore((s) => s.searchScope);
   const selectedMessageId = useMailStore((s) => s.selectedMessageId);
   const setSelectedMessage = useMailStore((s) => s.setSelectedMessage);
-  const threadView = useMailStore((s) => s.threadView);
+  const requestedThreadView = useMailStore((s) => s.threadView);
   const toggleThreadView = useMailStore((s) => s.toggleThreadView);
   const selectedThreadId = useMailStore((s) => s.selectedThreadId);
   const setSelectedThreadId = useMailStore((s) => s.setSelectedThreadId);
@@ -42,7 +50,14 @@ export default function InboxView() {
     [accounts, activeAccountId],
   );
   const { data: folders = [] } = useFoldersForAccountsQuery(folderAccountIds);
+  const activeFolderRole = roleForSelection(activeFolderId, folders);
+  const allUnread = isAllAccountsFolderId(activeFolderId) && activeFolderRole === "inbox";
+  // The unread collection shows individual unread messages across all folders.
+  const threadView = requestedThreadView && !allUnread && activeFolderRole !== 'drafts';
   const queryClient = useQueryClient();
+  const { sendDrafts, sending } = useSendDrafts();
+  const batchMode = useMailStore(state => state.batchMode);
+  const batchIds = useMailStore(state => state.selectedMessageIds);
   const addToast = useToastStore((s) => s.addToast);
   const openCompose = useComposeStore((s) => s.openCompose);
   const { data: selectedMessage } = useMessageQuery(selectedMessageId);
@@ -191,7 +206,6 @@ export default function InboxView() {
     });
   }
 
-  const activeFolderRole = roleForSelection(activeFolderId, folders);
   const isTrashFolder = activeFolderRole === "trash";
   const selectedFolderIds = folderIdsForSelection(activeFolderId, folders);
   const queryFolderId = selectedFolderIds[0] ?? null;
@@ -206,9 +220,12 @@ export default function InboxView() {
   } = useMessagesQuery(
     threadView ? null : queryFolderId,
     threadView ? undefined : queryFolderIds,
-    // "所有未读"视图：查全部账户未读
-    !threadView && isAllAccountsFolderId(activeFolderId) && activeFolderRole === "inbox",
+    allUnread,
+    allUnread ? folderVisit : undefined,
   );
+  const sort = useMailSortStore(s => s.sort);
+  const orderedMessages = useMemo(() => sortMessages(messages, sort), [messages, sort]);
+  const prepareDeletion = useMessageDeletionNavigation(orderedMessages.map(message => message.id));
   const { data: threads = EMPTY_THREADS, isLoading: loadingThreads } = useThreadsQuery(
     threadView ? queryFolderId : null,
     50,
@@ -218,6 +235,9 @@ export default function InboxView() {
   const handleLoadMore = useCallback(() => {
     if (hasNextPage && !isFetchingNextPage) fetchNextPage();
   }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
+  const draftSendIds = batchMode ? [...(batchIds ?? [])].filter(id => messages.some(message => message.id === id && message.is_draft))
+    : messages.some(message => message.id === selectedMessageId && message.is_draft) && selectedMessageId ? [selectedMessageId] : [];
+  const canSendSelectedDrafts = draftSendIds.length > 0 && (!batchMode || draftSendIds.length === batchIds?.size);
 
   /** AI 一键回复：基于当前选中邮件生成回复草稿并打开写信页。 */
   const handleAiReply = useCallback(async () => {
@@ -239,8 +259,8 @@ export default function InboxView() {
       const user =
         `【原始邮件】\n发件人：${sender}\n主题：${subject}\n\n${bodyText}\n\n` +
         `请生成回复草稿（直接输出正文，不需要主题行）。`;
-      const draft = await aiPrompt(system, user);
-      openCompose("reply", full as never, { body: draft.trim() });
+      const draft = normalizeAiEmailDraft(await aiPrompt(system, user), true);
+      openCompose("reply", full as never, { body: draft.body, aiGenerated: true });
       addToast({ message: "AI 已生成回复草稿，请检查后发送。", type: "success" });
     } catch (error) {
       addToast({ message: `AI 回复生成失败：${String(error)}`, type: "error" });
@@ -268,38 +288,7 @@ export default function InboxView() {
     }
 
     try {
-      const [draft, draftAttachments] = await Promise.all([
-        getMessage(messageId),
-        listAttachments(messageId),
-      ]);
-      if (!draft) throw new Error("草稿不存在或尚未同步完成");
-      const richTextHtml = draft.body_html_raw?.trim()
-        ? draft.body_html_raw
-        : draft.body_text
-          .split(/\r?\n/)
-          .map((line) => line
-            ? `<p>${line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>`
-            : "<p><br></p>")
-          .join("");
-      useComposeStore.getState().openDraft({
-        sourceDraftId: draft.id,
-        accountId: draft.account_id,
-        to: draft.to_list.map((address) => address.address).filter(Boolean),
-        cc: draft.cc_list.map((address) => address.address).filter(Boolean),
-        bcc: draft.bcc_list.map((address) => address.address).filter(Boolean),
-        subject: draft.subject,
-        rawSource: draft.body_text,
-        richTextHtml,
-        editorMode: "rich",
-        attachments: draftAttachments
-          .filter((attachment) => !attachment.is_inline && !!attachment.local_path)
-          .map((attachment) => ({
-            name: attachment.filename,
-            path: attachment.local_path as string,
-            size: attachment.size,
-          })),
-        savedAt: Date.now(),
-      });
+      useComposeStore.getState().openDraft(await loadMessageForEditing(messageId));
     } catch (error) {
       addToast({ message: `打开草稿失败：${extractErrorMessage(error)}`, type: "error" });
     }
@@ -314,9 +303,9 @@ export default function InboxView() {
     const account = accounts.find((item) => item.id === activeAccountId);
     const accountName = account?.display_name || account?.email || "当前账号";
     return (
-      <div className="fade-in" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: "16px", color: "var(--color-text-secondary)", padding: "24px" }}>
-        <Inbox size={42} strokeWidth={1.2} />
-        <strong style={{ color: "var(--color-text-primary)", fontSize: 16 }}>{accountName}</strong>
+      <div className="fade-in" style={{ display: "flex", flexDirection: "column", height: "100%", gap: "16px", overflowY: "auto", color: "var(--color-text-secondary)", padding: "24px", boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}><Inbox size={24} strokeWidth={1.4} />
+        <strong style={{ color: "var(--color-text-primary)", fontSize: 18 }}>{accountName}</strong></div>
         <form
           onSubmit={(event) => {
             event.preventDefault();
@@ -327,7 +316,7 @@ export default function InboxView() {
             useUIStore.getState().setActiveView("search");
           }}
           className="search-toolbar"
-          style={{ width: "min(480px, 100%)" }}
+          style={{ width: "100%", flexShrink: 0 }}
         >
           <div className="search-input-shell">
             <Search size={15} aria-hidden="true" />
@@ -355,9 +344,10 @@ export default function InboxView() {
             {t("search.searchButton", "Search")}
           </button>
         </form>
-        <span style={{ fontSize: 12, maxWidth: 460, textAlign: "center", lineHeight: 1.6 }}>
+        <span style={{ fontSize: 12, lineHeight: 1.6 }}>
           可搜索该账号全部文件夹的邮件（主题、发件人、正文）；也可以点击左侧文件夹浏览邮件
         </span>
+        <AccountOverview accountId={searchScope.accountId} />
       </div>
     );
   }
@@ -390,8 +380,10 @@ export default function InboxView() {
   }
 
   return (
+    <MessageDeletionNavigationContext.Provider value={prepareDeletion}>
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
       <div className="inbox-toolbar-row">
+        {(canSendSelectedDrafts || activeFolderRole === 'drafts') && <button type="button" className="inbox-toolbar-button" aria-label="发送草稿" title="发送选中的草稿" disabled={!canSendSelectedDrafts || sending} style={{ opacity: !canSendSelectedDrafts || sending ? 0.4 : 1 }} onClick={() => void sendDrafts(draftSendIds)}><Send size={16} /></button>}
         {/* Action buttons (left): disabled when no selection */}
         <button
           type="button"
@@ -483,13 +475,22 @@ export default function InboxView() {
           onClick={() => {
             if (!selectedMessage) return;
             const messageId = selectedMessage.id;
+            const completeDeletion = prepareDeletion([messageId]);
+            const previousLists = snapshotMessagesCache(queryClient);
             patchMessagesCache(queryClient, (page) => page.filter((item) => item.id !== messageId));
             void deleteMessage(messageId)
               .then(() => {
-                setSelectedMessage(null);
+                if (!completeDeletion([messageId]) && useMailStore.getState().selectedMessageId === messageId) {
+                  useMailStore.setState({ selectedMessageId: null });
+                }
+                queryClient.invalidateQueries({ queryKey: ["messages"] });
+                queryClient.invalidateQueries({ queryKey: ["threads"] });
+                queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
                 addToast({ message: t("messageActions.deleteSuccess", "Message deleted"), type: "success" });
               })
               .catch(() => {
+                restoreMessagesCache(queryClient, previousLists, [messageId]);
+                completeDeletion([]);
                 queryClient.invalidateQueries({ queryKey: ["messages"] });
                 addToast({ message: t("messageActions.deleteFailed", "Failed to delete message"), type: "error" });
               });
@@ -563,6 +564,7 @@ export default function InboxView() {
           type="button"
           onClick={toggleThreadView}
           aria-label={threadView ? t("inbox.messageView") : t("inbox.threadView")}
+          disabled={allUnread || activeFolderRole === 'drafts'}
           className="inbox-toolbar-button inbox-toolbar-button--end"
           title={threadView ? t("inbox.messageView") : t("inbox.threadView")}
         >
@@ -593,22 +595,12 @@ export default function InboxView() {
       >
         {/* List panel */}
         <div
+          className="mail-list-pane"
           style={{
             width: !stackedLayout && detailOpen ? `${listWidth}px` : undefined,
             height: stackedLayout && detailOpen ? `${listHeight}px` : undefined,
             flex: !detailOpen ? "1 1 auto" : "0 0 auto",
             flexShrink: 0,
-            borderRight: !stackedLayout && detailOpen
-              ? "1px solid color-mix(in srgb, var(--color-border) 100%, transparent)"
-              : "none",
-            borderBottom: stackedLayout && detailOpen
-              ? "1px solid color-mix(in srgb, var(--color-border) 100%, transparent)"
-              : "none",
-            boxShadow: detailOpen
-              ? stackedLayout
-                ? "0 2px 6px rgba(0,0,0,0.08)"
-                : "2px 0 6px rgba(0,0,0,0.08)"
-              : "none",
             background: "var(--color-bg-primary)",
             position: "relative",
             zIndex: 1,
@@ -654,22 +646,17 @@ export default function InboxView() {
         {detailOpen && (
           <div
             role="separator"
+            className={`mail-pane-divider mail-pane-divider--${stackedLayout ? "horizontal" : "vertical"}`}
+            aria-orientation={stackedLayout ? "horizontal" : "vertical"}
             aria-label={stackedLayout ? "调整邮件列表高度" : "调整邮件列表宽度"}
+            title={stackedLayout ? "拖动调整邮件列表与预览的高度" : "拖动调整邮件列表与预览的宽度"}
             onMouseDown={stackedLayout ? beginResizeHeight : beginResizeList}
-            style={{
-              [stackedLayout ? "height" : "width"]: "5px",
-              [stackedLayout ? "marginTop" : "marginLeft"]: "-3px",
-              [stackedLayout ? "marginBottom" : "marginRight"]: "-2px",
-              cursor: stackedLayout ? "row-resize" : "col-resize",
-              zIndex: 2,
-              flexShrink: 0,
-            }}
           />
         )}
 
         {/* Detail panel */}
         {detailOpen && (
-          <div style={{ flex: 1, overflow: "hidden", minHeight: 0, minWidth: 0 }}>
+          <div className="mail-preview-pane" style={{ flex: 1, overflow: "hidden", minHeight: 0, minWidth: 0 }}>
             {threadView && selectedThreadId ? (
               <ThreadView />
             ) : selectedMessageId ? (
@@ -683,6 +670,7 @@ export default function InboxView() {
         )}
       </div>
     </div>
+    </MessageDeletionNavigationContext.Provider>
   );
 }
 

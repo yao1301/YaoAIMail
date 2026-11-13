@@ -56,18 +56,15 @@ pub async fn check_for_changes(
     mailbox: &str,
     last_exists: &mut Option<MailboxUidState>,
 ) -> Result<IdleEvent> {
-    let status = match provider.get_mailbox_status(mailbox).await {
-        Ok(status) => status,
-        Err(e) => return Ok(IdleEvent::Error(e.to_string())),
-    };
-    match provider.fetch_all_uids(mailbox).await {
-        Ok(uids) => Ok(observe_uid_state(
+    match provider.fetch_uid_inventory(mailbox).await {
+        Ok((status, uids)) if super::sync::valid_imap_uid_inventory(status.uid_validity.map(u64::from), status, &uids) => Ok(observe_uid_state(
             last_exists,
             MailboxUidState {
                 uidvalidity: status.uid_validity.map(u64::from),
                 highest_uid: uids.into_iter().max().unwrap_or(0),
             },
         )),
+        Ok(_) => Ok(IdleEvent::Error("IMAP polling inventory incomplete; previous state kept".into())),
         Err(e) => Ok(IdleEvent::Error(e.to_string())),
     }
 }

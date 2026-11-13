@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "../.release-loader-1.1.43/WebView2Loader.dll": "WebView2Loader.dll"
+    }
+  }
+}

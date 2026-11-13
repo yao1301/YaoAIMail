@@ -1,4 +1,5 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import { useWorkspaceState } from '@/lib/workspaceState';
+import { useCallback, useEffect, useLayoutEffect, useRef, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useTranslation } from "react-i18next";
@@ -14,6 +15,7 @@ import MessageDetail from "@/components/MessageDetail";
 import { useMailStore } from "@/stores/mail.store";
 import SearchFilterDropdown from "@/components/SearchFilterDropdown";
 import SearchMessageContextMenu from "./SearchMessageContextMenu";
+import { MessageDeletionNavigationContext, useMessageDeletionNavigation } from "@/hooks/useMessageDeletionNavigation";
 
 type SearchSortKey = "date" | "subject" | "attachments";
 
@@ -32,23 +34,27 @@ function hasActiveFilters(filters: AdvancedSearchQuery): boolean {
   );
 }
 
-export default function SearchView() {
+function readSearchScope() {
+  const { activeAccountId, searchScope, searchRange } = useMailStore.getState();
+  return { activeAccountId, searchScope, searchRange };
+}
+
+export default function SearchView({ isActive = true }: { isActive?: boolean }) {
   const { t } = useTranslation();
-  const [query, setQuery] = useState("");
-  const activeAccountId = useMailStore((state) => state.activeAccountId);
-  const searchScope = useMailStore((state) => state.searchScope);
-  const searchRange = useMailStore((state) => state.searchRange);
+  const [query, setQuery] = useWorkspaceState("src/features/search/SearchView.tsx:SearchView:query", "");
+  const [scope, setScope] = useWorkspaceState("src/features/search/SearchView.tsx:SearchView:scope", readSearchScope);
+  const { activeAccountId, searchScope, searchRange } = scope;
   const pendingSearchFilters = useUIStore((s) => s.pendingSearchFilters);
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [folderNames, setFolderNames] = useState<Record<string, string>>({});
-  const [folderRoles, setFolderRoles] = useState<Record<string, Folder["role"]>>({});
-  const [filters, setFilters] = useState<AdvancedSearchQuery>(emptyFilters);
-  const [filterOpen, setFilterOpen] = useState(false);
-  const [searchFocused, setSearchFocused] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [messageMenu, setMessageMenu] = useState<{ x: number; y: number; hit: SearchHit } | null>(null);
-  const [hasSearched, setHasSearched] = useState(false);
-  const [sort, setSort] = useState<{ key: SearchSortKey; dir: "asc" | "desc" }>({ key: "date", dir: "desc" });
+  const [accounts, setAccounts] = useWorkspaceState<Account[]>("src/features/search/SearchView.tsx:SearchView:accounts", []);
+  const [folderNames, setFolderNames] = useWorkspaceState<Record<string, string>>("src/features/search/SearchView.tsx:SearchView:folderNames", {});
+  const [folderRoles, setFolderRoles] = useWorkspaceState<Record<string, Folder["role"]>>("src/features/search/SearchView.tsx:SearchView:folderRoles", {});
+  const [filters, setFilters] = useWorkspaceState<AdvancedSearchQuery>("src/features/search/SearchView.tsx:SearchView:filters", emptyFilters);
+  const [filterOpen, setFilterOpen] = useWorkspaceState("src/features/search/SearchView.tsx:SearchView:filterOpen", false);
+  const [searchFocused, setSearchFocused] = useWorkspaceState("src/features/search/SearchView.tsx:SearchView:searchFocused", false);
+  const [selectedId, setSelectedId] = useWorkspaceState<string | null>("src/features/search/SearchView.tsx:SearchView:selectedId", null);
+  const [messageMenu, setMessageMenu] = useWorkspaceState<{ x: number; y: number; hit: SearchHit } | null>("src/features/search/SearchView.tsx:SearchView:messageMenu", null);
+  const [hasSearched, setHasSearched] = useWorkspaceState("src/features/search/SearchView.tsx:SearchView:hasSearched", false);
+  const [sort, setSort] = useWorkspaceState<{ key: SearchSortKey; dir: "asc" | "desc" }>("src/features/search/SearchView.tsx:SearchView:sort", { key: "date", dir: "desc" });
   const storeSearchQuery = useUIStore((s) => s.searchQuery);
   const addToast = useToastStore((s) => s.addToast);
 
@@ -103,7 +109,7 @@ export default function SearchView() {
       }
       return searchMessages(trimmed, 100, selectedAccountId);
     },
-    enabled: searchEnabled,
+    enabled: searchEnabled && isActive,
     staleTime: 60_000,
     placeholderData: (prev: SearchHit[] | undefined) => prev,
   });
@@ -116,6 +122,9 @@ export default function SearchView() {
     if (comparison === 0) comparison = (a.subject ?? "").localeCompare(b.subject ?? "", undefined, { sensitivity: "base" });
     return sort.dir === "asc" ? comparison : -comparison;
   }), [results, sort]);
+  const prepareDeletion = useMessageDeletionNavigation(sortedResults.map(hit => hit.message_id), {
+    selectedId, scopeKey: JSON.stringify([trimmed, effectiveFilters, scopeKey]), onSelect: setSelectedId,
+  });
 
   function toggleSort(key: SearchSortKey) {
     setSort((current) => current.key === key
@@ -124,13 +133,20 @@ export default function SearchView() {
   }
 
   const resultsParentRef = useRef<HTMLDivElement>(null);
+  const scrollTop = useRef(0);
   const virtualizer = useVirtualizer({
+    useAnimationFrameWithResizeObserver: true,
     count: sortedResults.length,
     getScrollElement: () => resultsParentRef.current,
     estimateSize: () => 76,
     measureElement: (el) => el.getBoundingClientRect().height,
     overscan: 5,
   });
+  useLayoutEffect(() => {
+    if (!isActive) return;
+    if (resultsParentRef.current) resultsParentRef.current.scrollTop = scrollTop.current;
+    virtualizer.measure();
+  }, [isActive, virtualizer]);
 
   const doSearch = useCallback(() => {
     const t = query.trim();
@@ -152,21 +168,25 @@ export default function SearchView() {
   }, []);
 
   useEffect(() => {
-    if (!storeSearchQuery) return;
+    if (!isActive || !storeSearchQuery) return;
+    setScope(readSearchScope());
     setQuery(storeSearchQuery);
+    setFilters(pendingSearchFilters ?? emptyFilters);
     setSelectedId(null);
     setHasSearched(true);
     useUIStore.getState().setSearchQuery("");
-  }, [storeSearchQuery]);
+  }, [storeSearchQuery, isActive]);
 
   // 内联筛选下拉注入的筛选条件（收件箱/账户页的快捷条件跳转过来时消费）。
   useEffect(() => {
-    if (!pendingSearchFilters) return;
+    if (!isActive || !pendingSearchFilters) return;
+    setScope(readSearchScope());
+    setQuery(storeSearchQuery);
     setFilters(pendingSearchFilters);
     setSelectedId(null);
     setHasSearched(true);
     useUIStore.getState().setPendingSearchFilters(null);
-  }, [pendingSearchFilters]);
+  }, [pendingSearchFilters, isActive]);
 
   // Auto-search when filters change
   useEffect(() => {
@@ -182,7 +202,9 @@ export default function SearchView() {
     const trimmed = query.trim();
     if (!trimmed && !hasActiveFilters(filters)) return;
     debounceRef.current = setTimeout(() => {
-      doSearch();
+      // A submitted search may already have a selected result; a delayed
+      // type-ahead callback must not clear that preview again.
+      setHasSearched(true);
     }, 300);
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
   }, [query]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -201,27 +223,32 @@ export default function SearchView() {
     useMailStore.getState().setSelectedMessage(messageId);
     useUIStore.getState().setMessageDetailId(messageId);
     useUIStore.getState().navigateToView("messageDetail");
-    setSelectedId(null);
   }
 
   useEffect(() => {
+    if (!isActive) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Delete" || !selectedId) return;
       const target = event.target as HTMLElement | null;
       if (target?.closest("input, textarea, [contenteditable='true'], select")) return;
       event.preventDefault();
       const id = selectedId;
+      const completeDeletion = prepareDeletion([id]);
       void deleteMessage(id).then(() => {
-        setSelectedId(null);
+        completeDeletion([id]);
         void refetch();
         addToast({ message: "邮件已移到废纸篓", type: "success" });
-      }).catch((error) => addToast({ message: `删除失败：${extractErrorMessage(error)}`, type: "error" }));
+      }).catch((error) => {
+        completeDeletion([]);
+        addToast({ message: `删除失败：${extractErrorMessage(error)}`, type: "error" });
+      });
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [addToast, refetch, selectedId]);
+  }, [addToast, refetch, selectedId, prepareDeletion, isActive]);
 
   return (
+    <MessageDeletionNavigationContext.Provider value={prepareDeletion}>
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
       <div className="search-toolbar-wrap">
       <form onSubmit={handleSubmit} className="search-toolbar" style={{ flexWrap: "wrap" }}>
@@ -230,7 +257,7 @@ export default function SearchView() {
           <input
             type="text"
             value={query}
-            onChange={(e) => { setQuery(e.target.value); setHasSearched(false); setSearchFocused(true); }}
+            onChange={(e) => { setQuery(e.target.value); setHasSearched(false); setSelectedId(null); setSearchFocused(true); }}
             placeholder={t("inbox.searchPlaceholder")}
             aria-label={t("search.title", "Search")}
             autoFocus
@@ -248,6 +275,8 @@ export default function SearchView() {
         </button>
         <SearchFilterDropdown
           query={query}
+          scope={scope}
+          onRangeChange={searchRange => { setScope(current => ({ ...current, searchRange })); setSelectedId(null); }}
           onSearch={runLocalSearch}
           onAdvanced={() => setFilterOpen(true)}
         />
@@ -340,6 +369,7 @@ export default function SearchView() {
         {/* Results list */}
         <div
           ref={resultsParentRef}
+          onScroll={event => { if (isActive) scrollTop.current = event.currentTarget.scrollTop; }}
           className="scroll-region search-results-scroll"
           style={{
             width: selectedId ? "clamp(260px, 32%, 360px)" : "100%",
@@ -494,7 +524,7 @@ export default function SearchView() {
           </div>
         )}
       </div>
-      {messageMenu && (
+      {isActive && messageMenu && (
         <SearchMessageContextMenu
           x={messageMenu.x}
           y={messageMenu.y}
@@ -510,6 +540,7 @@ export default function SearchView() {
         />
       )}
     </div>
+    </MessageDeletionNavigationContext.Provider>
   );
 }
 

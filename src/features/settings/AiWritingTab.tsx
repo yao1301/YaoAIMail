@@ -1,4 +1,8 @@
-import { useState, useEffect, useRef } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect, useWorkspaceScope, useWorkspaceRestored } from '@/lib/workspaceState';
+import { useEffect, useRef } from "react";
+import { deliverAiDraft } from '@/features/compose/deliverAiDraft';
+import { aiInstructionPreview } from '@/features/compose/aiInstructionPreview';
+import { AI_REVISION_RULES, currentDraftForAi, readRevisionText } from '@/features/compose/aiRevisionContext';
 import { useTranslation } from "react-i18next";
 import {
   listStyleProfiles,
@@ -12,7 +16,6 @@ import {
   listAddressBookContacts,
   aiPrompt,
   getMessagesBatch,
-  readAttachmentFile,
   type Message,
   type StyleProfile,
   type StyleSample,
@@ -27,16 +30,20 @@ import { useMessageQuery } from "@/hooks/queries";
 import { useComposeStore } from "@/stores/compose.store";
 import { useUIStore } from "@/stores/ui.store";
 import { getSignature, listEmailSignatures, type EmailSignature } from "@/lib/signatures";
-import { extractDocumentText } from "@/lib/documentText";
-import { Maximize2, Undo2 } from "lucide-react";
+import { DOCUMENT_DRAFT_RULES, documentSectionsText, readReplyDraftText, DRAFT_FILE_ACCEPT } from '@/features/compose/documentDraft';
+import { useAiFileContext, filesFromTransfer } from '@/hooks/useAiFileContext';
+import { Maximize2, Undo2, Redo2 } from "lucide-react";
 import { getActiveWorkRole } from "./WorkRoleTab";
+import { SettingsFeedback, type SettingsNotice } from "./SettingsFeedback";
 import { resizeAutoGrowTextarea } from "@/lib/autoGrowTextarea";
 import { getWritingPreferences, saveWritingPreferences } from "@/lib/writingPreferences";
+import { findMailLanguage, MAIL_LANGUAGES, writingLanguageInstruction } from "@/lib/mailLanguages";
 import KnowledgePicker from "@/components/KnowledgePicker";
 import AccountScopePicker from "@/components/AccountScopePicker";
 import AccountScopeSelect from "@/components/AccountScopeSelect";
 import { useAccountsQuery } from "@/hooks/queries";
 import { accountLabel } from "@/lib/accountLabel";
+import { normalizeAiEmailDraft } from "@/features/compose/aiEmailDraft";
 
 interface WritingTurn {
   id: string;
@@ -44,12 +51,6 @@ interface WritingTurn {
   answer: string;
 }
 
-interface SelectedAiFile {
-  id: string;
-  file: File;
-}
-
-const MAX_AI_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_AI_CONTEXT_CHARS = 48_000;
 
 function compactMessageContext(message: Message): string {
@@ -85,9 +86,8 @@ function buildGenerateSystem(profile: string, hasDefaultSignature: boolean): str
 我的写作风格：
 ${profile}
 
-要求：只输出邮件正文（含合适的称呼与正文），不要解释，不要使用方括号占位符以外的说明。
+要求：只输出邮件正文（含合适的称呼与正文），使用普通邮件排版，不要使用 Markdown 标记（如 **、*、#、- 列表），不要输出主题/标题/Subject 行，不要解释，不要使用方括号占位符以外的说明。
 【硬性要求】每一轮都输出完整、可直接使用的邮件正文（称呼+正文+结尾），内容充分、表述专业；即使对话前文已有草稿，也不得省略、只输出修改片段或大幅精简成几句话。
-【硬性要求语言】整封邮件必须使用单一语言（中文或英文，二选一），禁止中英混杂。回复邮件时使用与原文相同的语言（英文客户用英文，中文客户用中文）；即使风格档案/工作角色/客户背景里出现另一种语言片段，也只能用作参考语境，不能复制到正文（不能用 "Your礼品店" "灯饰" 这类中英混写）。指令要求英文就全文英文、要求中文就全文中文。
 【硬性要求】${hasDefaultSignature
   ? "不要生成任何签名/落款/署名行（如 Best regards / Regards / Kind regards / Sincerely / Yours faithfully / 此致 / 敬礼 / 你的名字等）。正文在最后一句问候或内容后直接结束——账号的默认签名会由系统自动附加，重复落款会造成邮件出现两个签名。"
   : "你可以在正文结尾按你的写作风格写署名/落款（当前账号未设置默认签名，落款需要由正文自带）。"}`;
@@ -110,55 +110,66 @@ function redactStyleEvidence(text: string): string {
 export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
   const { t } = useTranslation();
   const { data: accounts = [] } = useAccountsQuery();
-  const [profiles, setProfiles] = useState<StyleProfile[]>([]);
-  const [activeId, setActiveId] = useState("");
+  const [profiles, setProfiles] = useWorkspaceState<StyleProfile[]>("src/features/settings/AiWritingTab.tsx:AiWritingTab:profiles", []);
+  const [activeId, setActiveId] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:activeId", "");
 
-  const [learnStatus, setLearnStatus] = useState("");
-  const [learning, setLearning] = useState(false);
-  const [allowStyleEvidenceUpload, setAllowStyleEvidenceUpload] = useState(false);
-  const [learningAccountId, setLearningAccountId] = useState("");
+  const [learnStatus, setLearnStatus] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:learnStatus", "");
+  const [learning, setLearning] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:learning", false);
+  const [allowStyleEvidenceUpload, setAllowStyleEvidenceUpload] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:allowStyleEvidenceUpload", false);
+  const [learningAccountId, setLearningAccountId] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:learningAccountId", "");
 
-  const [editing, setEditing] = useState<StyleProfile | null>(null);
-  const [editName, setEditName] = useState("");
-  const [editDesc, setEditDesc] = useState("");
-  const [editProfile, setEditProfile] = useState("");
-  const [editAccountIds, setEditAccountIds] = useState<string[] | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [scopeSavingId, setScopeSavingId] = useState<string | null>(null);
+  const [editing, setEditing] = useWorkspaceState<StyleProfile | null>("src/features/settings/AiWritingTab.tsx:AiWritingTab:editing", null);
+  const [editName, setEditName] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:editName", "");
+  const [editDesc, setEditDesc] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:editDesc", "");
+  const [editProfile, setEditProfile] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:editProfile", "");
+  const [editAccountIds, setEditAccountIds] = useWorkspaceState<string[] | null>("src/features/settings/AiWritingTab.tsx:AiWritingTab:editAccountIds", null);
+  const [saving, setSaving] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:saving", false);
+  const [scopeSavingId, setScopeSavingId] = useWorkspaceState<string | null>("src/features/settings/AiWritingTab.tsx:AiWritingTab:scopeSavingId", null);
 
-  const [instruction, setInstruction] = useState("");
-  const [genStyleId, setGenStyleId] = useState("");
-  const [styleAdjustText, setStyleAdjustText] = useState("");
-  const [styleAdjusting, setStyleAdjusting] = useState(false);
-  const [customerMemories, setCustomerMemories] = useState<CustomerMemory[]>([]);
-  const [addressBook, setAddressBook] = useState<AddressBookContact[]>([]);
-  const [genCustomerId, setGenCustomerId] = useState("");
+  const [instruction, setInstruction] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:instruction", "");
+  const [genStyleId, setGenStyleId] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:genStyleId", "");
+  const [styleAdjustText, setStyleAdjustText] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:styleAdjustText", "");
+  const [styleAdjusting, setStyleAdjusting] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:styleAdjusting", false);
+  const [customerMemories, setCustomerMemories] = useWorkspaceState<CustomerMemory[]>("src/features/settings/AiWritingTab.tsx:AiWritingTab:customerMemories", []);
+  const [addressBook, setAddressBook] = useWorkspaceState<AddressBookContact[]>("src/features/settings/AiWritingTab.tsx:AiWritingTab:addressBook", []);
+  const [genCustomerId, setGenCustomerId] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:genCustomerId", "");
 
-  const [conversation, setConversation] = useState<WritingTurn[]>([]);
-  const [generating, setGenerating] = useState(false);
-  const [language, setLanguage] = useState("auto");
-  const [includeCurrentEmail, setIncludeCurrentEmail] = useState(true);
-  const [includeKnowledge, setIncludeKnowledge] = useState(false);
-  const [selectedAiFiles, setSelectedAiFiles] = useState<SelectedAiFile[]>([]);
-  const [selectedAiMessageIds, setSelectedAiMessageIds] = useState<string[]>([]);
-  const [selectedAiMessageTitles, setSelectedAiMessageTitles] = useState<Record<string, string>>({});
-  const [selectedKnowledgeIds, setSelectedKnowledgeIds] = useState<string[]>([]);
-  const [signatures, setSignatures] = useState<EmailSignature[]>([]);
-  const [selectedSignatureId, setSelectedSignatureId] = useState("");
+  const [conversation, setConversation] = useWorkspaceState<WritingTurn[]>("src/features/settings/AiWritingTab.tsx:AiWritingTab:conversation", []);
+  const [panelRedo, setPanelRedo] = useWorkspaceState<WritingTurn[]>("src/features/settings/AiWritingTab.tsx:AiWritingTab:panelRedo", []);
+  const [generating, setGenerating] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:generating", false);
+  const [language, setLanguage] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:language", "auto");
+  const [includeCurrentEmail, setIncludeCurrentEmail] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:includeCurrentEmail", true);
+  const [includeKnowledge, setIncludeKnowledge] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:includeKnowledge", false);
+  const [selectedAiMessageIds, setSelectedAiMessageIds] = useWorkspaceState<string[]>("src/features/settings/AiWritingTab.tsx:AiWritingTab:selectedAiMessageIds", []);
+  const [selectedAiMessageTitles, setSelectedAiMessageTitles] = useWorkspaceState<Record<string, string>>("src/features/settings/AiWritingTab.tsx:AiWritingTab:selectedAiMessageTitles", {});
+  const [selectedKnowledgeIds, setSelectedKnowledgeIds] = useWorkspaceState<string[]>("src/features/settings/AiWritingTab.tsx:AiWritingTab:selectedKnowledgeIds", []);
+  const [signatures, setSignatures] = useWorkspaceState<EmailSignature[]>("src/features/settings/AiWritingTab.tsx:AiWritingTab:signatures", []);
+  const [selectedSignatureId, setSelectedSignatureId] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:selectedSignatureId", "");
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [recipientTo, setRecipientTo] = useState("");
-  const [recipientCc, setRecipientCc] = useState("");
-  const [recipientBcc, setRecipientBcc] = useState("");
+  const [recipientTo, setRecipientTo] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:recipientTo", "");
+  const [recipientCc, setRecipientCc] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:recipientCc", "");
+  const [recipientBcc, setRecipientBcc] = useWorkspaceState("src/features/settings/AiWritingTab.tsx:AiWritingTab:recipientBcc", "");
   const pendingAiWritingInstruction = useUIStore((s) => s.pendingAiWritingInstruction);
   const setPendingAiWritingInstruction = useUIStore((s) => s.setPendingAiWritingInstruction);
   const activeView = useUIStore((s) => s.activeView);
+  const detailMessageId = useUIStore((s) => s.messageDetailId);
   const selectedMessageId = useMailStore((s) => s.selectedMessageId);
   const activeAccountId = useMailStore((s) => s.activeAccountId);
-  const activeMessageId = activeView === "inbox" ? selectedMessageId : null;
+  const activeMessageId = activeView === 'messageDetail' ? detailMessageId : activeView === "inbox" ? selectedMessageId : null;
   const { data: currentMessage } = useMessageQuery(activeMessageId);
   const activeDraftContext = useComposeStore((s) => s.activeDraftContext);
+  const composeTabId = useComposeStore((s) => s.activeTabId);
   const activeCompose = activeView === "compose" && activeDraftContext !== null;
-  const currentWritingAccountId = activeDraftContext?.fromAccountId ?? currentMessage?.account_id ?? activeAccountId;
+  const currentWritingAccountId = (activeCompose ? activeDraftContext?.fromAccountId : currentMessage?.account_id) ?? activeAccountId;
+  const writingContextKey = `${currentWritingAccountId}:${activeCompose ? `compose:${composeTabId}` : `mail:${activeMessageId ?? ''}`}`;
+  const aiFiles = useAiFileContext(writingContextKey);
+  const selectedAiFiles = aiFiles.files;
+  const writingContextRef = useRef(writingContextKey);
+  writingContextRef.current = writingContextKey;
+  const generationRef = useRef(0);
+  const generatingRef = useRef(false);
+  const workspace = useWorkspaceScope();
+  useEffect(() => () => { if (!workspace?.moved) generationRef.current += 1; }, []);
   const selectedLearningAccount = accounts.find((account) => account.id === learningAccountId);
   const availableProfiles = profiles.filter((profile) => Boolean(currentWritingAccountId && profile.accountIds?.includes(currentWritingAccountId)));
   const setAiWritingFloating = useUIStore((s) => s.setAiWritingFloating);
@@ -190,26 +201,28 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
   }, [activeCompose, activeDraftContext]);
 
   // 切换邮件时隔离上下文：不同邮件的 AI 写作结果/指令/拖入内容互不串扰。
-  const lastContextKeyRef = useRef<string>("");
+  const restoredWorkspace = useWorkspaceRestored('src/features/settings/AiWritingTab.tsx:');
+  const lastContextKeyRef = useRef<string>(restoredWorkspace ? writingContextKey : '');
   useEffect(() => {
-    const key = activeCompose && activeDraftContext
-      ? `draft:${activeDraftContext.subject ?? ""}`
-      : activeMessageId
-        ? `mail:${activeMessageId}`
-        : "none";
+    const key = writingContextKey;
     if (lastContextKeyRef.current === "") {
       lastContextKeyRef.current = key;
+      generationRef.current += 1;
+      generatingRef.current = false;
+      setGenerating(false);
       return;
     }
     if (lastContextKeyRef.current !== key) {
       lastContextKeyRef.current = key;
 
       setConversation([]);
+      setPanelRedo([]);
       setInstruction("");
       setSelectedAiMessageIds([]);
       setSelectedAiMessageTitles({});
-      setSelectedAiFiles([]);
+      aiFiles.clear();
       setSelectedKnowledgeIds([]);
+      useUIStore.getState().setAiWritingTurns([]);
 
       if (!activeCompose) {
         setRecipientTo("");
@@ -217,25 +230,43 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
         setRecipientBcc("");
       }
     }
-  }, [activeMessageId, activeCompose, activeDraftContext]);
+  }, [writingContextKey, activeCompose]);
 
   function clearAllResult() {
 
     setConversation([]);
+    setPanelRedo([]);
     setInstruction("");
     setSelectedAiMessageIds([]);
     setSelectedAiMessageTitles({});
-    setSelectedAiFiles([]);
+    aiFiles.clear();
 
-    flash("已清空本次 AI 写作内容。", "success");
+    flash("generate", "已清空本次 AI 写作内容。", "success");
   }
 
   /** 撤销到上一步：把上一轮 AI 草稿恢复到写信页草稿栏。 */
   function handlePanelUndo() {
     if (conversation.length < 2) return;
-    const prev = conversation[conversation.length - 2].answer;
-    useComposeStore.getState().applyAiBody(prev);
-    flash("已恢复到上一版草稿。", "success");
+    const previous = conversation[conversation.length - 2];
+    restorePanelTurn(previous);
+    setPanelRedo(turns => [...turns, conversation[conversation.length - 1]]);
+    setConversation(turns => turns.slice(0, -1));
+    useUIStore.getState().setAiWritingTurns(conversation.slice(0, -1).flatMap(turn => [{ role: 'user' as const, content: turn.instruction }, { role: 'assistant' as const, content: turn.answer }]));
+  }
+
+  function handlePanelRedo() {
+    const next = panelRedo[panelRedo.length - 1];
+    if (!next) return;
+    restorePanelTurn(next);
+    setConversation(turns => [...turns, next]);
+    setPanelRedo(turns => turns.slice(0, -1));
+    useUIStore.getState().setAiWritingTurns([...conversation, next].flatMap(turn => [{ role: 'user' as const, content: turn.instruction }, { role: 'assistant' as const, content: turn.answer }]));
+  }
+
+  function restorePanelTurn(turn: WritingTurn) {
+    deliverAiDraft({ tabId: activeCompose ? composeTabId ?? undefined : undefined, embedded: activeCompose && !composeTabId,
+      accountId: currentWritingAccountId ?? undefined, replyTo: currentMessage }, { body: turn.answer, signature: '' });
+    setInstruction(turn.instruction);
   }
 
   // 消费右键菜单“发送到 AI 写作”进入的内容（邮件 / 附件）
@@ -264,15 +295,7 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
     if (aiContextAttachmentQueue.length === 0) return;
     clearAiContextQueue();
     for (const item of aiContextAttachmentQueue) {
-      void (async () => {
-        try {
-          const att = await readAttachmentFile(item.attachmentId);
-          const file = new File([new Uint8Array(att.bytes)], att.name, { type: att.mime_type || "" });
-          addAiFiles([file]);
-        } catch (err) {
-          flash(`读取附件失败：${extractErrorMessage(err)}`, "error");
-        }
-      })();
+      aiFiles.loadAttachment(item.attachmentId);
     }
   }, [aiContextAttachmentQueue, clearAiContextQueue]);
   useEffect(() => {
@@ -283,7 +306,7 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
   }, [knowledgeContextQueue, clearKnowledgeContextQueue]);
 
   // 加载当前账号的签名列表（默认选中默认签名），供“其他选项”选择落款签名
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/AiWritingTab.tsx:", () => {
     const accountId = currentWritingAccountId ?? activeAccountId;
     if (!accountId) {
       setSignatures([]);
@@ -306,7 +329,7 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
 
   // 语言、风格、资料库和签名是当前发件账号的默认写作设置；
   // 当前邮件/拖入文件仍然只属于本次任务，不写入这里。
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/AiWritingTab.tsx:", () => {
     const accountId = currentWritingAccountId ?? activeAccountId;
     if (!accountId) return;
     const preferences = getWritingPreferences(accountId);
@@ -320,12 +343,14 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
     saveWritingPreferences(currentWritingAccountId ?? activeAccountId, patch);
   }
 
-  const [statusMsg, setStatusMsg] = useState("");
-  const [statusType, setStatusType] = useState<"success" | "error" | "">("");
+  const [feedback, setFeedback] = useWorkspaceState<Record<string, SettingsNotice | undefined>>("src/features/settings/AiWritingTab.tsx:AiWritingTab:feedback", {});
 
-  function flash(msg: string, type: "success" | "error") {
-    setStatusMsg(msg);
-    setStatusType(type);
+  function flash(action: string, message: string, kind: SettingsNotice["kind"]) {
+    setFeedback((current) => ({ ...current, [action]: { message, kind } }));
+  }
+
+  function clearFeedback(action: string) {
+    setFeedback((current) => ({ ...current, [action]: undefined }));
   }
 
   async function refresh() {
@@ -351,21 +376,23 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
     }
   }
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/AiWritingTab.tsx:", () => {
     refresh();
   }, [currentWritingAccountId]);
 
   async function handleLearn() {
+    const action = `learn:${learningAccountId}`;
     if (!allowStyleEvidenceUpload) {
-      flash("请先确认允许将少量脱敏后的写作样本发送给你配置的 AI 服务商。", "error");
+      flash(action, "请先确认允许将少量脱敏后的写作样本发送给你配置的 AI 服务商。", "error");
       return;
     }
+    clearFeedback(action);
     setLearning(true);
     setLearnStatus(t("aiWriting.learning"));
     try {
       const samples: StyleSample[] = await getSentSamples(20, learningAccountId || null);
       if (samples.length === 0) {
-        flash(t("aiWriting.noSamples"), "error");
+        flash(action, t("aiWriting.noSamples"), "error");
         setLearnStatus("");
         return;
       }
@@ -391,15 +418,11 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
       await refresh();
       setGenStyleId(saved.id);
       saveWritingPreferences(learningAccountId || currentWritingAccountId, { styleProfileId: saved.id });
-      flash(t("aiWriting.learnDone", { name }), "success");
+      flash(action, t("aiWriting.learnDone", { name }), "success");
       setLearnStatus("");
     } catch (err: unknown) {
       const e = extractErrorMessage(err);
-      flash(t("aiWriting.learnFailed", { error: e }), "error");
-      useToastStore.getState().addToast({
-        message: t("aiWriting.learnFailed", { error: e }),
-        type: "error",
-      });
+      flash(action, t("aiWriting.learnFailed", { error: e }), "error");
       setLearnStatus("");
     } finally {
       setLearning(false);
@@ -411,6 +434,8 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
     const target = (targetId ? profiles.find((p) => p.id === targetId) : undefined)
       ?? availableProfiles.find((p) => p.id === (genStyleId || activeId));
     if (!styleAdjustText.trim() || styleAdjusting) return;
+    const action = `adjust:${target?.id ?? ""}`;
+    clearFeedback(action);
     setStyleAdjusting(true);
     try {
       const currentProfile = target?.profile ?? "（当前没有已保存的风格档案）";
@@ -428,7 +453,7 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
           isActive: false,
         });
         if (editing?.id === target.id) setEditProfile(updated);
-        flash("写作风格已更新。", "success");
+        flash(action, "写作风格已更新。", "success");
       } else {
         const saved = await saveStyleProfile({
           name: `我的风格 ${profiles.length + 1}`,
@@ -438,19 +463,21 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
         });
         setGenStyleId(saved.id);
         saveWritingPreferences(currentWritingAccountId, { styleProfileId: saved.id });
-        flash("已生成新的写作风格并设为当前账号默认。", "success");
+        flash(action, "已生成新的写作风格并设为当前账号默认。", "success");
       }
       await refresh();
       setStyleAdjustText("");
     } catch (err: unknown) {
       const e = extractErrorMessage(err);
-      flash(`调整风格失败：${e}`, "error");
+      flash(action, `调整风格失败：${e}`, "error");
     } finally {
       setStyleAdjusting(false);
     }
   }
 
   function startEdit(p: StyleProfile) {
+    clearFeedback(`save:${p.id}`);
+    clearFeedback(`adjust:${p.id}`);
     setEditing(p);
     setEditName(p.name);
     setEditDesc(p.description);
@@ -459,6 +486,7 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
   }
 
   function startCreate() {
+    clearFeedback("save:__new__");
     const now = Date.now();
     setEditing({ id: "__new__", name: "", description: "", profile: "", isActive: false, accountIds: null, createdAt: now, updatedAt: now });
     setEditName("");
@@ -478,6 +506,8 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
 
   async function handleSaveEdit() {
     if (!editing) return;
+    const action = `save:${editing.id}`;
+    clearFeedback(action);
     setSaving(true);
     try {
       const isNew = editing.id === "__new__";
@@ -501,20 +531,18 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
       if (currentWritingAccountId && selected.has(currentWritingAccountId)) setGenStyleId(saved.id);
       cancelEdit();
       await refresh();
-      flash(t("translate.configSaved"), "success");
+      flash(`save:${saved.id}`, t("translate.configSaved"), "success");
     } catch (err: unknown) {
       const e = extractErrorMessage(err);
-      flash(t("aiWriting.saveFailed", { error: e }), "error");
-      useToastStore.getState().addToast({
-        message: t("aiWriting.saveFailed", { error: e }),
-        type: "error",
-      });
+      flash(action, t("aiWriting.saveFailed", { error: e }), "error");
     } finally {
       setSaving(false);
     }
   }
 
   async function handleScopeChange(profile: StyleProfile, accountIds: string[] | null) {
+    const action = `accounts:${profile.id}`;
+    clearFeedback(action);
     setScopeSavingId(profile.id);
     try {
       const selectedIds = accountIds === null ? accounts.map((account) => account.id) : accountIds;
@@ -536,24 +564,27 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
       }
       if (currentWritingAccountId && selected.has(currentWritingAccountId)) setGenStyleId(profile.id);
       await refresh();
-      flash(`“${profile.name}”的适用账号已更新。`, "success");
+      flash(action, `“${profile.name}”的适用账号已更新。`, "success");
     } catch (err: unknown) {
-      flash(`保存适用账号失败：${extractErrorMessage(err)}`, "error");
+      flash(action, `保存适用账号失败：${extractErrorMessage(err)}`, "error");
     } finally {
       setScopeSavingId(null);
     }
   }
 
   async function handleDelete(p: StyleProfile) {
+    const action = `delete:${p.id}`;
+    clearFeedback(action);
+    clearFeedback("profiles");
     try {
       const remaining = await deleteStyleProfile(p.id);
       setProfiles(remaining);
       const active = remaining.find((x) => x.isActive) ?? remaining[0];
       setActiveId(active?.id ?? "");
-      flash(t("aiWriting.deleted", { name: p.name }), "success");
+      flash("profiles", t("aiWriting.deleted", { name: p.name }), "success");
     } catch (err: unknown) {
       const e = extractErrorMessage(err);
-      flash(t("aiWriting.saveFailed", { error: e }), "error");
+      flash(action, t("aiWriting.saveFailed", { error: e }), "error");
     }
   }
 
@@ -562,17 +593,34 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
   }
 
   async function handleGenerate() {
-    if (!instruction.trim()) {
-      flash(t("aiWriting.instructionRequired"), "error");
+    if (generatingRef.current) return;
+    if (aiFiles.pending || aiFiles.error) {
+      flash("generate", aiFiles.error || '文件正在加载，请稍后再生成。', 'error');
       return;
     }
+    if (!instruction.trim()) {
+      flash("generate", t("aiWriting.instructionRequired"), "error");
+      return;
+    }
+    clearFeedback("generate");
+    generatingRef.current = true;
+    setGenerating(true);
+    const generation = ++generationRef.current;
+    const context = writingContextRef.current;
+    const target = { tabId: activeCompose ? composeTabId ?? undefined : undefined,
+      embedded: activeCompose && !composeTabId, accountId: currentWritingAccountId ?? undefined,
+      replyTo: currentMessage,
+      prefill: { to: recipientTo.split(/[，,;；]/).map(value => value.trim()).filter(Boolean),
+        cc: recipientCc.split(/[，,;；]/).map(value => value.trim()).filter(Boolean),
+        bcc: recipientBcc.split(/[，,;；]/).map(value => value.trim()).filter(Boolean), subject: activeDraftContext?.subject } };
+    const isCurrent = () => generationRef.current === generation && writingContextRef.current === context;
     const style =
       availableProfiles.find((p) => p.id === (genStyleId || activeId))?.profile ??
       "（未设置风格，按通用专业外贸语气书写）";
     // 先确定是否有默认签名（有 → 禁止 AI 落款；无 → 允许 AI 自带署名结尾）
     let hasDefaultSignature = false;
     try {
-      const accountId = currentMessage?.account_id ?? useMailStore.getState().activeAccountId;
+      const accountId = currentWritingAccountId;
       if (accountId) {
         if (selectedSignatureId && signatures.some((s) => s.id === selectedSignatureId)) {
           hasDefaultSignature = Boolean((signatures.find((s) => s.id === selectedSignatureId)?.content ?? "").trim());
@@ -583,7 +631,9 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
     } catch {
       hasDefaultSignature = false;
     }
-    let system = `${buildGenerateSystem(style, hasDefaultSignature)}
+    if (!isCurrent()) return;
+    let system = `${buildGenerateSystem(style, hasDefaultSignature)}\n${DOCUMENT_DRAFT_RULES}
+${AI_REVISION_RULES}
 
 【生成优先级】
 1. 用户当前指令；
@@ -599,36 +649,30 @@ export default function AiWritingTab({ quick = false }: { quick?: boolean }) {
     if (customer && customer.profile.trim()) {
       system += `\n\n【客户背景，请据此个性化表达】\n${customer.profile}`;
     }
-    const languageInstruction = language === "auto"
-      ? "自动判断回复语言：优先沿用已授权提供的当前来信语言；没有当前来信时，国内联系人用中文，其他新联系人默认用英文。"
-      : `只使用${language}写邮件。`;
-    system += `\n\n【语言要求】${languageInstruction}`;
+    system += `\n\n${writingLanguageInstruction(language)}`;
     setGenerating(true);
 
     try {
       let currentContext = "【当前邮件内容】未提供。不得猜测缺失的客户、价格、交期或订单事实。";
+      const draftBase = includeCurrentEmail && activeCompose && activeDraftContext
+        ? currentDraftForAi(activeDraftContext.bodyText ?? readRevisionText(activeDraftContext.body, true), activeDraftContext.subject)
+        : "";
       // 带上用户在“其他选项”中选定的落款签名（默认选中账号默认签名）。
       let signature = "";
       try {
-        const accountId = currentMessage?.account_id ?? useMailStore.getState().activeAccountId;
+        const accountId = currentWritingAccountId;
         if (accountId) {
           if (selectedSignatureId && signatures.some((s) => s.id === selectedSignatureId)) {
-            signature = (signatures.find((s) => s.id === selectedSignatureId)?.content ?? "").trim();
+            signature = signatures.find((s) => s.id === selectedSignatureId)?.content ?? "";
           } else {
-            signature = (await getSignature(accountId)).trim();
+            signature = await getSignature(accountId);
           }
         }
       } catch {
         signature = "";
       }
-      if (includeCurrentEmail && activeCompose && activeDraftContext) {
-        currentContext = `【用户明确授权提供的当前写信草稿】
-主题：${activeDraftContext.subject || "（未填写）"}
-当前草稿正文：
-${activeDraftContext.body.slice(0, 12000)}
-
-收件人和抄送地址未提供给 AI。`;
-      } else if (includeCurrentEmail && currentMessage) {
+      if (includeCurrentEmail && currentMessage && !activeCompose) {
+        const fullOriginal = readReplyDraftText(currentMessage);
         const thread = currentMessage.thread_id
           ? await listThreadMessages(currentMessage.thread_id)
           : [currentMessage];
@@ -646,8 +690,7 @@ ${message.body_text.slice(0, 3500)}`;
           })
           .join("\n\n---\n\n")
           .slice(-14000);
-        currentContext = `【用户明确授权提供的当前邮件线程；按时间顺序，最新事实优先】
-${recent}`;
+        currentContext = `【正在回复的原邮件全文】\n${fullOriginal}\n\n【相关往来节选；不是完整线程；按时间顺序，最新事实优先】\n${recent}`;
       }
 
       if (selectedAiMessageIds.length > 0) {
@@ -661,18 +704,10 @@ ${recent}`;
         }
       }
 
-      if (selectedAiFiles.length > 0) {
-        const fileSections: string[] = [];
-        for (const selected of selectedAiFiles) {
-          if (selected.file.size > MAX_AI_FILE_BYTES) {
-            throw new Error(`文件 ${selected.file.name} 超过 20 MB，未发送。`);
-          }
-          const text = (await extractDocumentText(selected.file)).trim();
-          fileSections.push(`【用户明确拖入的本地文件：${selected.file.name}】\n${text.slice(0, 12_000) || "（文件中没有可提取的文字）"}`);
-        }
-        if (fileSections.length > 0) {
-          currentContext = appendContext(currentContext, fileSections.join("\n\n---\n\n"));
-        }
+      {
+        const files = documentSectionsText(await aiFiles.read());
+        // Explicitly selected documents must not vanish behind the legacy mail-context cap.
+        if (files) currentContext += `\n\n${files}`;
       }
 
       let knowledgeContext = "【本地资料库】本次未引用。";
@@ -695,18 +730,11 @@ ${snippets.map((item, index) => `资料 ${index + 1}：${item.name}\n${item.cont
       }
 
       system += signature
-        ? "\n\n请写完整回复正文和自然落款，但不要虚构或重复签名；客户端会在末尾附加用户已保存的账号签名。"
+        ? "\n\n只写完整邮件正文，不要生成任何落款或签名；客户端会原样插入用户已保存的签名。"
         : "\n\n请写完整回复正文，包含符合用户习惯的称呼、正文、结尾和落款。";
-      // 与写信页共用同一条对话历史：前文优先取共享历史（右侧/写信页无论从
-      // 哪边继续都能读到上一轮上下文），本面板自己的记录作为兜底。
-      const sharedTurns = useUIStore.getState().aiWritingTurns;
-      const sharedContext = sharedTurns.length > 0
-        ? `【本次写作对话的前文（写信页与右侧共用的连续对话）】
-${sharedTurns.slice(-6).map((turn, index) => `第${index + 1}轮${turn.role === "user" ? "用户要求" : "AI草稿"}：${turn.content}`).join("\n\n")}
-
-请在前文基础上继续修改或回答，不要把对话解释混入最终邮件正文。
-`
-        : conversation.length > 0
+      // A writing tab owns the live draft. Use panel history only if there is no
+      // writing tab; unchecking draft context never falls back to its old text.
+      const sharedContext = !activeCompose && conversation.length > 0
           ? `【本次写作对话的前文】
 ${conversation.slice(-6).map((turn, index) => `第${index + 1}轮用户要求：${turn.instruction}\n第${index + 1}轮AI草稿：${turn.answer}`).join("\n\n")}
 
@@ -716,26 +744,29 @@ ${conversation.slice(-6).map((turn, index) => `第${index + 1}轮用户要求：
       const userRequest = `【用户当前指令——最高优先级】
 ${instruction}
 
+${draftBase}
 ${sharedContext}
 ${currentContext}
 
 ${knowledgeContext}`;
       // 全局任务标记：右侧/悬浮生成时切走也不中断、不丢。
+      if (!isCurrent()) return;
       useUIStore.getState().setAiBgTask({ running: true, source: "panel", result: null });
       const result = await aiPrompt(system, userRequest);
       useUIStore.getState().setAiBgTask({ running: false, source: "panel", result: result.trim() });
       // ComposeView owns the account signature. Keeping generated content
       // signature-free prevents duplicate signatures and always applies the
       // correct identity for the sending account.
-      const answer = result.trim();
+      const normalized = normalizeAiEmailDraft(result, Boolean(currentMessage || /^\s*(?:re|回复|答复)\s*[:：]/i.test(activeDraftContext?.subject ?? "")));
+      const answer = normalized.body;
 
-      setConversation((turns) => [...turns, {
+      if (isCurrent()) setConversation((turns) => [...turns, {
         id: `${Date.now()}-${turns.length}`,
         instruction: instruction.trim(),
         answer,
       }]);
-      // 写回共享对话历史，写信页/右侧后续生成都能读到本次内容。
-      {
+      if (isCurrent()) setPanelRedo([]);
+      if (isCurrent()) {
         const ui = useUIStore.getState();
         ui.setAiWritingTurns([
           ...ui.aiWritingTurns,
@@ -743,57 +774,39 @@ ${knowledgeContext}`;
           { role: "assistant" as const, content: answer },
         ].slice(-16));
       }
-      setInstruction("");
+      if (isCurrent()) setInstruction("");
       // 生成结果直接写入草稿栏（整封邮件草稿），无需再点"放入当前草稿"。
-      try {
-        if (activeCompose) {
-          useComposeStore.getState().applyAiBody(answer);
-          flash("AI 草稿已写入正文，可继续编辑或再次输入指令调整。", "success");
-        } else if (currentMessage) {
-          useComposeStore.getState().openCompose("reply-all", currentMessage, { body: answer });
-          flash("AI 已生成回复草稿，已打开回复窗口。", "success");
-        } else {
-          useComposeStore.getState().openCompose("new", null, {
-            to: recipientTo.split(/[，,;；]/).map((value) => value.trim()).filter(Boolean),
-            cc: recipientCc.split(/[，,;；]/).map((value) => value.trim()).filter(Boolean),
-            bcc: recipientBcc.split(/[，,;；]/).map((value) => value.trim()).filter(Boolean),
-            body: answer,
-          });
-          flash("AI 已生成邮件草稿，已打开写信窗口。", "success");
-        }
-      } catch {
-        // fall through: output still rendered in the record below
-      }
+      const store = useComposeStore.getState();
+      const live = target.tabId ? store.tabsById?.[target.tabId]?.activeDraftContext : store.activeDraftContext;
+      const draftChanged = activeCompose && live && (live.body !== activeDraftContext.body || live.subject !== activeDraftContext.subject);
+      const delivery = deliverAiDraft(draftChanged ? { ...target, tabId: undefined, embedded: false } : target, { ...normalized, ...(draftChanged ? { subject: normalized.subject ?? target.prefill.subject } : {}), signature });
+      useToastStore.getState().addToast({ message: draftChanged ? "生成期间草稿有改动，AI 结果已放到新草稿，原稿保持不变。" : delivery === 'queued' ? "AI 草稿已生成，原草稿准备好后将自动填入。" : "AI 草稿已生成，已打开写信窗口。", type: 'info' });
     } catch (err: unknown) {
+      useUIStore.getState().setAiBgTask({ running: false, source: 'panel', result: null });
       const e = extractErrorMessage(err);
-      flash(t("aiWriting.generateFailed", { error: e }), "error");
+      flash("generate", t("aiWriting.generateFailed", { error: e }), "error");
       useToastStore.getState().addToast({
         message: t("aiWriting.generateFailed", { error: e }),
         type: "error",
       });
     } finally {
-      setGenerating(false);
+      setGenerating(false); generatingRef.current = false;
     }
   }
 
   function addAiFiles(files: FileList | File[]) {
-    const next = Array.from(files)
-      .filter((file) => file.size <= MAX_AI_FILE_BYTES)
-      .filter((file) => !selectedAiFiles.some((item) => item.file.name === file.name && item.file.size === file.size && item.file.lastModified === file.lastModified))
-      .map((file) => ({ id: `${file.name}-${file.size}-${file.lastModified}`, file }));
-    if (next.length > 0) {
-      setSelectedAiFiles((current) => [...current, ...next]);
-    }
-    if (Array.from(files).some((file) => file.size > MAX_AI_FILE_BYTES)) {
-      flash("超过 20 MB 的文件未加入 AI 上下文。", "error");
-    }
+    if (generating) return;
+    clearFeedback("generate");
+    aiFiles.add(files);
   }
 
   function handleAiContextDrop(event: React.DragEvent<HTMLDivElement>) {
     event.preventDefault();
+    event.stopPropagation();
+    if (generating) return;
     const messageId = event.dataTransfer.getData("application/x-pebble-message-id").trim();
     const attachmentId = event.dataTransfer.getData("application/x-pebble-attachment-id").trim();
-    const files = Array.from(event.dataTransfer.files ?? []);
+    const files = filesFromTransfer(event.dataTransfer);
     if (messageId) {
       setSelectedAiMessageIds((current) => current.includes(messageId) ? current : [...current, messageId]);
       const label = event.dataTransfer.getData("text/plain").trim();
@@ -801,23 +814,15 @@ ${knowledgeContext}`;
     }
     if (files.length > 0) addAiFiles(files);
     if (attachmentId && !messageId && files.length === 0) {
-      void (async () => {
-        try {
-          const att = await readAttachmentFile(attachmentId);
-          const file = new File([new Uint8Array(att.bytes)], att.name, { type: att.mime_type || "" });
-          addAiFiles([file]);
-        } catch (err) {
-          flash(`读取附件失败：${extractErrorMessage(err)}`, "error");
-        }
-      })();
+      aiFiles.loadAttachment(attachmentId);
     }
     if (!messageId && !attachmentId && files.length === 0) {
-      flash("请从邮件列表拖入邮件，或拖入邮件附件 / 本地文件。", "error");
+      aiFiles.fail("没有接收到文件，请重新拖入，或用“添加文件”选择文件。");
     }
   }
 
   function handleAiContextPaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
-    const files = Array.from(event.clipboardData.files ?? []);
+    const files = filesFromTransfer(event.clipboardData);
     if (files.length === 0) return;
     event.preventDefault();
     addAiFiles(files);
@@ -833,7 +838,9 @@ ${knowledgeContext}`;
   }
 
   function removeAiFile(fileId: string) {
-    setSelectedAiFiles((current) => current.filter((item) => item.id !== fileId));
+    if (generating) return;
+    clearFeedback("generate");
+    aiFiles.remove(fileId);
   }
 
   const labelStyle: React.CSSProperties = {
@@ -925,7 +932,7 @@ ${knowledgeContext}`;
           </div>
         </div>
         <label style={{ display: "flex", alignItems: "flex-start", gap: "8px", fontSize: "12px", color: "var(--color-text-secondary)", marginBottom: "12px" }}>
-          <input type="checkbox" checked={allowStyleEvidenceUpload} onChange={(e) => setAllowStyleEvidenceUpload(e.target.checked)} />
+          <input type="checkbox" checked={allowStyleEvidenceUpload} onChange={(e) => { setAllowStyleEvidenceUpload(e.target.checked); clearFeedback(`learn:${learningAccountId}`); }} />
           <span>允许把少量、已自动替换邮箱/网址/电话/价格/日期/订单号的样本发送给我配置的 AI 服务商，用于创建风格档案。原始邮箱不会整体上传。</span>
         </label>
         <button
@@ -939,6 +946,7 @@ ${knowledgeContext}`;
         {learnStatus && (
           <span style={{ marginLeft: "10px", fontSize: "12px", color: "var(--color-text-secondary)" }}>{learnStatus}</span>
         )}
+        <SettingsFeedback notice={feedback[`learn:${learningAccountId}`]} />
       </div>
 
       {/* Profiles */}
@@ -950,6 +958,7 @@ ${knowledgeContext}`;
         <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", margin: "0 0 12px", lineHeight: 1.55 }}>
           先选择一个邮箱学习风格；下面的模板用一个账号复选框统一完成“给谁使用”和“设为谁的默认风格”。每个账号只能有一个默认风格。
         </p>
+        <SettingsFeedback notice={feedback.profiles} />
         {profiles.length === 0 && (
           <div style={{ fontSize: "13px", color: "var(--color-text-secondary)" }}>{t("aiWriting.noProfiles")}</div>
         )}
@@ -973,6 +982,7 @@ ${knowledgeContext}`;
             <div style={{ fontSize: "12px", color: "var(--color-text-secondary)", marginBottom: "5px" }}>{p.description}</div>
             <div style={{ marginBottom: "8px", opacity: scopeSavingId === p.id ? 0.65 : 1 }}>
               <AccountScopeSelect value={defaultAccountsForStyle(p.id).map((account) => account.id)} onChange={(value) => void handleScopeChange(p, value)} label="勾选后设为这些邮箱账号的默认风格" />
+              <SettingsFeedback notice={feedback[`accounts:${p.id}`]} />
             </div>
             <div style={{
               background: "var(--color-bg-secondary)",
@@ -992,6 +1002,8 @@ ${knowledgeContext}`;
                 {t("aiWriting.delete")}
               </button>
             </div>
+            <SettingsFeedback notice={feedback[`delete:${p.id}`]} />
+            {editing?.id !== p.id && feedback[`save:${p.id}`]?.kind === "success" && <SettingsFeedback notice={feedback[`save:${p.id}`]} />}
             {editing?.id === p.id && <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--color-border)" }}>
               <h4 style={{ fontSize: 13, margin: "0 0 12px" }}>正在编辑：{p.name}</h4>
               <div style={{ display: "grid", gap: 10 }}>
@@ -1006,10 +1018,12 @@ ${knowledgeContext}`;
                     <input style={{ ...inputStyle, flex: 1 }} value={styleAdjustText} onChange={(e) => setStyleAdjustText(e.target.value)} placeholder="输入你想怎么调整" disabled={styleAdjusting} />
                     <button type="button" disabled={styleAdjusting || !styleAdjustText.trim()} onClick={() => void handleStyleAdjust(p.id)} style={{ ...buttonStyle, background: "var(--color-accent)", color: "#fff", opacity: styleAdjusting || !styleAdjustText.trim() ? 0.6 : 1 }}>{styleAdjusting ? "调整中…" : "调整这份风格"}</button>
                   </div>
+                  <SettingsFeedback notice={feedback[`adjust:${p.id}`]} />
                 </div>
                 <div style={{ display: "flex", gap: 8 }}>
                   <button type="button" disabled={saving} style={{ ...buttonStyle, background: "var(--color-accent)", color: "#fff" }} onClick={handleSaveEdit}>{saving ? t("common.saving") : t("aiWriting.save")}</button>
                 </div>
+                <SettingsFeedback notice={feedback[`save:${p.id}`]} />
               </div>
             </div>}
           </div>
@@ -1025,6 +1039,7 @@ ${knowledgeContext}`;
               <button type="button" disabled={saving || !editName.trim() || !editProfile.trim()} style={{ ...buttonStyle, background: "var(--color-accent)", color: "#fff", opacity: saving || !editName.trim() || !editProfile.trim() ? 0.6 : 1 }} onClick={handleSaveEdit}>{saving ? t("common.saving") : "创建模板"}</button>
               <button type="button" style={{ ...buttonStyle, background: "var(--color-bg-hover)", color: "var(--color-text-primary)" }} onClick={cancelEdit}>取消编辑</button>
             </div>
+            <SettingsFeedback notice={feedback["save:__new__"]} />
           </div>
         </div>}
       </div>
@@ -1067,6 +1082,7 @@ ${knowledgeContext}`;
           style={{ marginBottom: "10px", position: "relative" }}
         >
           <label style={labelStyle}>{t("aiWriting.instruction")}</label>
+          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 4 }}>AI 指令，不随邮件发送。之前的指令可在写作记录中再次编辑。</div>
           <textarea
             style={{
               ...inputStyle,
@@ -1091,10 +1107,10 @@ ${knowledgeContext}`;
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
               <span style={{ fontSize: "11px", color: "var(--color-text-secondary)" }}>可直接粘贴或拖入邮件、附件和多个文件作为上下文</span>
               <KnowledgePicker accountId={currentWritingAccountId} selectedIds={selectedKnowledgeIds} onChange={setSelectedKnowledgeIds} />
-              <button type="button" style={{ ...buttonStyle, padding: "4px 9px", background: "var(--color-bg-hover)", color: "var(--color-text-primary)", fontSize: "11px" }} onClick={() => fileInputRef.current?.click()}>
+              <button type="button" title="读取文件内容，供 AI 按你的指令写作。文件不会自动加入待发送邮件的附件。" style={{ ...buttonStyle, padding: "4px 9px", background: "var(--color-bg-hover)", color: "var(--color-text-primary)", fontSize: "11px" }} onClick={() => fileInputRef.current?.click()}>
                 添加文件
               </button>
-              <input ref={fileInputRef} type="file" multiple hidden onChange={(event) => { if (event.target.files) addAiFiles(event.target.files); event.currentTarget.value = ""; }} />
+              <input ref={fileInputRef} type="file" accept={DRAFT_FILE_ACCEPT} multiple hidden onChange={(event) => { if (event.target.files) addAiFiles(event.target.files); event.currentTarget.value = ""; }} />
             </div>
             {(selectedAiMessageIds.length > 0 || selectedAiFiles.length > 0) && (
               <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "8px" }}>
@@ -1113,6 +1129,8 @@ ${knowledgeContext}`;
               </div>
             )}
             {(selectedAiMessageIds.length > 0 || selectedAiFiles.length > 0) && <div style={{ marginTop: 8, fontSize: 11, color: "var(--color-text-secondary)" }}>已添加 {selectedAiMessageIds.length + selectedAiFiles.length} 项上下文；点击生成后会使用这些内容发送给当前配置的 AI 服务商。</div>}
+            {(aiFiles.pending || aiFiles.status) && <div role="status" style={{ marginTop: 7, fontSize: 11 }}>{aiFiles.pending ? '正在加载文件…' : aiFiles.status}</div>}
+            {aiFiles.error && <div role="alert" style={{ marginTop: 7, fontSize: 11, color: 'var(--color-error, #d33)' }}>{aiFiles.error}</div>}
           </div>
         </div>
         {/* 快捷调整提示：第一轮生成之后出现，点一下按该要求调整 */}
@@ -1147,20 +1165,21 @@ ${knowledgeContext}`;
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <button
           type="button"
-          disabled={generating}
+          disabled={generating || aiFiles.pending}
+          title="根据指令和参考内容生成邮件草稿，不会直接发送。已有草稿正在编辑时，生成结果会替换该草稿正文。"
           onClick={() => {
             // 点击生成 = 激活本处输入并生成（支持互相切换）
             setAiInputFocusOwner("panel");
             void handleGenerate();
           }}
-          style={{ ...buttonStyle, background: "var(--color-accent)", color: "#fff", opacity: generating ? 0.6 : 1 }}
+          style={{ ...buttonStyle, background: "var(--color-accent)", color: "#fff", opacity: generating || aiFiles.pending ? 0.6 : 1 }}
         >
           {generating ? t("aiWriting.generating") : t("aiWriting.generateButton")}
         </button>
-        {conversation.length > 0 && (
+        {conversation.length > 1 && (
           <button
             type="button"
-            title="回到上一版草稿（上一轮 AI 生成的内容）"
+            title={`撤销并带回指令：${conversation[conversation.length - 2]?.instruction ?? ''}`}
             onClick={handlePanelUndo}
             disabled={generating}
             style={{
@@ -1174,9 +1193,12 @@ ${knowledgeContext}`;
             }}
           >
             <Undo2 size={13} /> 撤销到上一步
+            <span style={{ maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{aiInstructionPreview(conversation[conversation.length - 2]?.instruction ?? '')}</span>
           </button>
         )}
+        {panelRedo.length > 0 && <button type="button" disabled={generating} onClick={handlePanelRedo} title={`恢复并带回指令：${panelRedo[panelRedo.length - 1]?.instruction ?? ''}`} style={{ ...buttonStyle, background: 'var(--color-bg-hover)', color: 'var(--color-text-primary)', display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12 }}><Redo2 size={13} /> 恢复到下一步<span style={{ maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{aiInstructionPreview(panelRedo[panelRedo.length - 1]?.instruction ?? '')}</span></button>}
         </div>
+        {!aiFiles.error && <SettingsFeedback notice={feedback.generate} />}
       </div>
         {conversation.length > 0 && (
           <div style={{ marginTop: "14px" }}>
@@ -1187,7 +1209,10 @@ ${knowledgeContext}`;
             <div style={{ maxHeight: "260px", overflow: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
               {conversation.map((turn) => (
                 <div key={turn.id} style={{ border: "1px solid var(--color-border)", borderRadius: "7px", overflow: "hidden" }}>
-                  <div style={{ padding: "7px 9px", background: "var(--color-bg-hover)", fontSize: "12px" }}>你：{turn.instruction}</div>
+                  <div style={{ padding: "7px 9px", background: "var(--color-bg-hover)", fontSize: "12px", display: 'flex', gap: 8 }}>
+                    <span style={{ flex: 1, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>你：{turn.instruction}</span>
+                    <button type="button" disabled={generating} onClick={() => setInstruction(turn.instruction)} style={{ border: 0, background: 'transparent', color: 'var(--color-accent)', cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap' }}>再次编辑</button>
+                  </div>
                   <div style={{ padding: "8px 9px", whiteSpace: "pre-wrap", fontSize: "12px", lineHeight: 1.55 }}>{turn.answer}</div>
                 </div>
               ))}
@@ -1206,7 +1231,7 @@ ${knowledgeContext}`;
           {activeCompose && activeDraftContext ? (
             <label style={{ display: "flex", gap: "8px", alignItems: "flex-start", cursor: "pointer" }}>
               <input type="checkbox" checked={includeCurrentEmail} onChange={(e) => setIncludeCurrentEmail(e.target.checked)} />
-              <span>读取当前写信标签“{activeDraftContext.subject || "未命名邮件"}”。勾选后，仅主题和草稿正文会发送给你配置的 AI 服务商，邮箱地址仍留在本地。</span>
+              <span>以当前草稿“{activeDraftContext.subject || "未命名邮件"}”为修改底稿。勾选后会将主题和正文提供给配置的 AI 服务，收件地址栏仍留在本地。</span>
             </label>
           ) : currentMessage ? (
             <label style={{ display: "flex", gap: "8px", alignItems: "flex-start", cursor: "pointer" }}>
@@ -1242,18 +1267,9 @@ ${knowledgeContext}`;
         </div>
         <div style={{ marginBottom: "14px" }}>
           <label style={labelStyle}>生成语言</label>
-          <select style={inputStyle} value={language} onChange={(e) => { setLanguage(e.target.value); updateWritingPreference({ language: e.target.value }); }}>
+          <select style={inputStyle} value={findMailLanguage(language)?.value ?? "auto"} onChange={(e) => { setLanguage(e.target.value); updateWritingPreference({ language: e.target.value }); }}>
             <option value="auto">自动判断（来信语言 / 联系人习惯）</option>
-            <option value="English">English</option>
-            <option value="简体中文">简体中文</option>
-            <option value="Español">Español</option>
-            <option value="Français">Français</option>
-            <option value="Deutsch">Deutsch</option>
-            <option value="Português">Português</option>
-            <option value="العربية">العربية</option>
-            <option value="Русский">Русский</option>
-            <option value="日本語">日本語</option>
-            <option value="한국어">한국어</option>
+            {MAIL_LANGUAGES.map(({ value, label }) => <option key={value} value={value}>{label}</option>)}
           </select>
         </div>
         <div style={{ marginBottom: "14px" }}>
@@ -1264,7 +1280,7 @@ ${knowledgeContext}`;
         </div>
         <div style={{ marginBottom: "14px" }}>
           <label style={labelStyle}>{t("aiWriting.customerSelect")}</label>
-          <select style={inputStyle} value={genCustomerId} onChange={(e) => setGenCustomerId(e.target.value)}>
+          <select title="将所选客户的画像作为写作参考，不会自动更改收件人。" style={inputStyle} value={genCustomerId} onChange={(e) => setGenCustomerId(e.target.value)}>
             <option value="">{t("aiWriting.noCustomer")}</option>
             {customerMemories.map((m) => (
               <option key={m.id} value={m.id}>
@@ -1278,23 +1294,6 @@ ${knowledgeContext}`;
       </>
       )}
 
-      {statusMsg && (
-        <div
-          role={statusType === "error" ? "alert" : "status"}
-          aria-live="polite"
-          style={{
-            marginTop: "14px",
-            padding: "10px 14px",
-            borderRadius: "6px",
-            fontSize: "13px",
-            background: statusType === "success" ? "var(--color-bg-hover)" : "rgba(220, 53, 69, 0.1)",
-            color: statusType === "success" ? "var(--color-text-primary)" : "#dc3545",
-            border: `1px solid ${statusType === "success" ? "var(--color-border)" : "rgba(220, 53, 69, 0.3)"}`,
-          }}
-        >
-          {statusMsg}
-        </div>
-      )}
     </div>
   );
 }

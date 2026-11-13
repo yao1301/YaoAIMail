@@ -1,9 +1,14 @@
-import { Component, type ErrorInfo, type ReactNode, useEffect } from "react";
+import { Component, type ErrorInfo, type ReactNode, useEffect, lazy, Suspense } from "react";
 import i18next from "i18next";
-import Layout from "./app/Layout";
 import OnboardingOverlay from "./components/OnboardingOverlay";
-import ComposeWindowApp from "./features/compose/ComposeWindowApp";
 import { logStartupTiming } from "@/lib/startupTiming";
+import AppErrorNotifications from "@/components/AppErrorNotifications";
+import { reportAppError } from "@/lib/appErrors";
+
+const WorkspaceWindowApp = lazy(() => import("./app/WorkspaceWindowApp"));
+const Layout = lazy(() => import("./app/Layout"));
+const ComposeWindowApp = lazy(() => import("./features/compose/ComposeWindowApp"));
+const MessageWindowApp = lazy(() => import("./features/inbox/MessageWindowApp"));
 
 class ErrorBoundary extends Component<
   { children: ReactNode },
@@ -16,6 +21,7 @@ class ErrorBoundary extends Component<
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
+    reportAppError(error, "界面加载失败");
     console.error("[ErrorBoundary]", error, info.componentStack);
   }
 
@@ -53,9 +59,11 @@ class ErrorBoundary extends Component<
 export default function App() {
   // 独立写信窗口（?compose=1）：只渲染写信界面，不加载主布局
   const isComposeWindow = new URLSearchParams(window.location.search).get("compose") === "1";
+  const isMailWindow = new URLSearchParams(window.location.search).get("mailWindow") === "1";
 
+  const isWorkspaceWindow = new URLSearchParams(window.location.search).get('workspaceWindow') === '1';
   useEffect(() => {
-    if (isComposeWindow) return; // 独立写信窗口不播放主界面启动动画
+    if (isComposeWindow || isMailWindow || isWorkspaceWindow) return; // 独立窗口不播放主界面启动动画
     logStartupTiming("react app mounted");
     const splash = document.getElementById("splash");
     if (!splash) return;
@@ -73,19 +81,24 @@ export default function App() {
         logStartupTiming("splash removed");
       }, 500);
     }, remaining);
-  }, [isComposeWindow]);
+  }, [isComposeWindow, isMailWindow, isWorkspaceWindow]);
+
+  if (isWorkspaceWindow) return <ErrorBoundary><AppErrorNotifications /><Suspense fallback={null}><WorkspaceWindowApp /></Suspense></ErrorBoundary>;
+  if (isMailWindow) return <ErrorBoundary><AppErrorNotifications /><Suspense fallback={null}><MessageWindowApp /></Suspense></ErrorBoundary>;
 
   if (isComposeWindow) {
     return (
       <ErrorBoundary>
-        <ComposeWindowApp />
+        <AppErrorNotifications />
+        <Suspense fallback={null}><ComposeWindowApp /></Suspense>
       </ErrorBoundary>
     );
   }
 
   return (
     <ErrorBoundary>
-      <Layout />
+      <AppErrorNotifications />
+      <Suspense fallback={null}><Layout /></Suspense>
       <OnboardingOverlay />
     </ErrorBoundary>
   );

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Archive, Bot, ChevronLeft, Filter, FolderInput, Forward, Mail, MailCheck, MailOpen, Reply, ReplyAll, Sparkles, Star, Trash2 } from "lucide-react";
+import { Archive, Bot, ChevronLeft, Filter, FolderInput, Forward, Mail, MailCheck, MailOpen, Reply, ReplyAll, Sparkles, Star, Trash2, Send } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { Folder, Message } from "@/lib/api";
 import { archiveMessage, deleteMessage, getMessage, listFolders, moveToFolder, updateMessageFlags } from "@/lib/api";
@@ -8,8 +8,10 @@ import { useComposeStore } from "@/stores/compose.store";
 import { useConfirmStore } from "@/stores/confirm.store";
 import { useToastStore } from "@/stores/toast.store";
 import { useUIStore } from "@/stores/ui.store";
-import { originalRecipientAddresses } from "@/lib/messageRecipients";
+import { originalRecipientFields } from "@/lib/messageRecipients";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
+import { useSendDrafts } from '@/hooks/useSendDrafts';
+import { usePrepareMessageDeletion } from "@/hooks/useMessageDeletionNavigation";
 
 type Props = {
   x: number;
@@ -25,6 +27,8 @@ type Props = {
 
 export default function SearchMessageContextMenu({ x, y, messageId, folderIds, folderRole, fallbackLabel, onOpen, onChanged, onClose }: Props) {
   const queryClient = useQueryClient();
+  const prepareDeletion = usePrepareMessageDeletion();
+  const { sendDrafts, sending } = useSendDrafts();
   const [message, setMessage] = useState<Message | null>(null);
   const [loadingError, setLoadingError] = useState("");
   const [folders, setFolders] = useState<Folder[]>([]);
@@ -68,11 +72,14 @@ export default function SearchMessageContextMenu({ x, y, messageId, folderIds, f
   async function handleDelete() {
     const ok = await useConfirmStore.getState().confirm({ title: "删除邮件", message: "将这封邮件移到废纸篓？", confirmLabel: "删除", destructive: true });
     if (!ok) return;
+    const completeDeletion = prepareDeletion([messageId]);
     try {
       await deleteMessage(messageId);
+      completeDeletion([messageId]);
       refresh(true);
       useToastStore.getState().addToast({ message: "邮件已移到废纸篓", type: "success" });
     } catch (error) {
+      completeDeletion([]);
       toastError("删除", error);
     }
   }
@@ -98,14 +105,18 @@ export default function SearchMessageContextMenu({ x, y, messageId, folderIds, f
     }
     return [
       { label: "打开", icon: <MailOpen size={14} />, onClick: onOpen },
+      ...(message.is_draft ? [{ label: '发送', icon: <Send size={14} />, disabled: sending, onClick: () => void sendDrafts([message.id]) }] : []),
       { label: "回复", icon: <Reply size={14} />, onClick: () => openCompose("reply") },
       { label: "回复全部", icon: <ReplyAll size={14} />, onClick: () => openCompose("reply-all") },
       { label: "转发", icon: <Forward size={14} />, onClick: () => openCompose("forward") },
       {
-        label: "发送新邮件给相同接收人", icon: <Mail size={14} />, disabled: message.to_list.length === 0,
+        label: "发送新邮件给相同接收人", icon: <Mail size={14} />,
+        disabled: message.to_list.length + message.cc_list.length + message.bcc_list.length === 0,
         onClick: () => {
-          const recipients = originalRecipientAddresses(message.to_list);
-          if (recipients.length) useComposeStore.getState().openCompose("new", null, { to: recipients });
+          const recipients = originalRecipientFields(message.to_list, message.cc_list, message.bcc_list);
+          if (recipients.to.length + recipients.cc.length + recipients.bcc.length > 0) {
+            useComposeStore.getState().openCompose("new", null, recipients);
+          }
         },
       },
       { separator: true },
@@ -147,8 +158,7 @@ export default function SearchMessageContextMenu({ x, y, messageId, folderIds, f
       { separator: true },
       { label: "删除", icon: <Trash2 size={14} />, danger: true, onClick: () => void handleDelete() },
     ];
-  }, [fallbackLabel, folderIds, folderRole, folders, loadingError, message, messageId, onClose, onOpen, queryClient, showMoveFolders]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [fallbackLabel, folderIds, folderRole, folders, loadingError, message, messageId, onClose, onOpen, queryClient, showMoveFolders,sending]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return <ContextMenu x={x} y={y} items={items} onClose={onClose} />;
 }
-

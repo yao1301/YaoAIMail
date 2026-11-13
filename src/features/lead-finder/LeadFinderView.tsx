@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useWorkspaceState, useWorkspaceRestored, useWorkspaceIsTransferring, useWorkspaceInitEffect, useWorkspaceScope } from '@/lib/workspaceState';
+import { useEffect, useRef } from "react";
+import type { EmailResearchEvidence } from "@/lib/researchEvidence";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, CheckSquare, ChevronDown, ChevronRight, ExternalLink, Globe2, History, Mail, Paperclip, Pause, Play, Plus, RefreshCw, Search, Send, Settings2, Tag, Trash2, UserPlus, Users, X } from "lucide-react";
-import { aiFindCompanyBatch, searchLeadCompanies, aiPrompt, enrichLeadCandidate, summarizeLeadCandidates, saveCustomerMemory, getMessagesBatch, getExternalServiceUsage, readAttachmentFile, listKnowledgeItems, listStyleProfiles, sendEmail, loadLeadFinderData, saveLeadFinderData, getSentSamples, type PublicCompanyMatch } from "@/lib/api";
+import { Check, CheckSquare, ChevronRight, Globe2, Mail, Paperclip, Pause, Play, Plus, RefreshCw, Search, Send, Settings2, Tag, Trash2, UserPlus, Users, X } from "lucide-react";
+import { discoverLeads, forgetLeadTask, aiPrompt, leadResearchPrompt, enrichLeadCandidate, saveCustomerMemory, getMessagesBatch, readAttachmentFile, listKnowledgeItems, listStyleProfiles, sendEmail, loadLeadFinderData, saveLeadFinderData, getSentSamples, type PublicCompanyMatch, type LeadQuality, type LeadDiscoveryResponse } from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
 import { useUIStore } from "@/stores/ui.store";
 import { useComposeStore } from "@/stores/compose.store";
@@ -22,24 +24,30 @@ import {
   type OutreachUserConstraints,
 } from "./outreach-guard";
 import { emailStrictlyMatchesCompany } from "./company-email-affinity";
-import TaskProgressSteps from "@/components/TaskProgressSteps";
-
-const LEAD_SEARCH_STEPS = ["理解产品与目标客户", "搜索公开公司来源", "整理公开依据", "AI 补充候选公司"];
-
-function leadSearchStageIndex(stage: string): number {
-  if (stage.includes("AI 正在补充")) return 3;
-  if (stage.includes("整理")) return 2;
-  if (stage.includes("搜索公开")) return 1;
-  return 0;
-}
+import LeadDeliveryCard from './LeadDeliveryCard';
+import { EmailVerificationScope } from '@/components/EmailVerificationPanel';
+import LeadProfiles from './LeadProfiles';
+import {orderByLeadSignals} from './leadSignalOrder';
+import {useEmailChecks,emailCheckKey} from '@/stores/emailChecks.store';
+import { checkResearchContactAllowed } from '@/lib/api';
+import LeadTaskHistory from './LeadTaskHistory';
+import LeadSearchStatus from './LeadSearchStatus';
+import { phaseForLeadReport, useLeadTaskProgress } from './leadTaskProgress';
+import { leadPage, leadTaskContext, leadFillStatus, leadPageDeficit, LEAD_PAGE_SIZE } from './leadDelivery';
+import { buildLeadDiscoveryRequest, qualityScore, fallbackProductBrief, interpretProductBrief, emptyLeadResultMessage, describeReviewIssues, describeLeadFailure, PRODUCT_BRIEF_VERSION, PRODUCT_RESEARCH_PROMPT, type ProductSearchBrief } from "./leadDiscovery";
+import { LeadContactQueue, mergeContactProgress, contactJobKey, shouldDiscoverContact } from "./leadContactQueue";
+import { writingLanguageInstruction } from "@/lib/mailLanguages";
 
 interface LeadCandidate {
+  quality?: LeadQuality;
   companyName?: string;
   website?: string;
   sourceUrl?: string;
   websiteStatus?: "已核验" | "待核验" | "无法访问" | "身份不匹配";
   websiteStatusReason?: string;
   country?: string;
+  city?: string;
+  address?: string;
   customerType?: string;
   description?: string;
   reason?: string;
@@ -47,7 +55,7 @@ interface LeadCandidate {
   fitSignals?: string[];
   unknowns?: string[];
   emails?: string[];
-  emailEvidence?: Array<{
+  emailEvidence?: Array<EmailResearchEvidence & {
     email: string;
     source: string;
     sourceUrl: string;
@@ -75,9 +83,13 @@ interface LeadCandidate {
   discoveryBasis?: string[];
   companyIntroduction?: string;
   contactStatus?: "可联系" | "待补全";
+  contacts?: PublicCompanyMatch['contacts'];
+  buyingSignals?: PublicCompanyMatch['buyingSignals'];
 }
 
-interface LeadProductBrief {
+interface LeadProductBrief extends ProductSearchBrief {
+  targetMarket?: string;
+  buyerRole?: string;
   coreCategory: string;
   mandatoryQualifiers: string[];
   useCases: string[];
@@ -89,6 +101,11 @@ interface LeadProductBrief {
 }
 
 interface LeadSearchSession {
+  nativeResultRound?: number;
+  accountId?: string;
+  failure?: "product_interpretation_failed" | "execution_failed";
+  failureDetail?: string;
+  discoveryReport?: LeadDiscoveryResponse["report"];
   id: string;
   title: string;
   summary?: string;
@@ -110,6 +127,7 @@ interface LeadSearchSession {
 }
 
 interface LeadFinderTaskResult {
+  discoveryReport?: LeadDiscoveryResponse["report"];
   sessionId: string;
   page: number;
   items: LeadCandidate[];
@@ -145,6 +163,9 @@ const isUsableLeadEmail = (value: string) => {
   return !new Set(["first", "last", "firstname", "lastname", "first.last", "firstlast", "first_last", "first-last", "f.last", "flast", "name", "yourname", "email", "user", "username", "example", "test"]).has(parts[0]);
 };
 const leadKey = (item: LeadCandidate) => {
+  if (item.quality && item.website) {
+    try { return `site:${new URL(item.website).hostname.toLowerCase().replace(/^www\./, "")}`; } catch { /* legacy URL */ }
+  }
   const email = normalizeLeadPart(item.emails?.[0] || "");
   const website = normalizeLeadPart(item.website || "");
   const company = normalizeLeadPart(item.companyName || "");
@@ -368,51 +389,12 @@ function cleanLeadResultField(value: unknown, max = 900): string {
   return /(这是第|不要重复|补充关键词|线索渠道|用户指令|参考邮件|上下文内容|查找跟|排除那些|给他们推销)/.test(cleaned) ? "" : cleaned;
 }
 
-function fallbackProductBrief(product: string, query: string): LeadProductBrief {
-  const source = [product, query].filter(Boolean).join(" ").trim();
-  const stopWords = new Set(["a", "an", "the", "and", "or", "for", "with", "of", "to", "find", "search", "company", "companies", "buyer", "buyers", "supplier", "suppliers", "product", "products", "寻找", "搜索", "公司", "客户", "买家", "供应商", "产品"]);
-  const terms = [...new Set(source.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((term) => term.length >= 2 && !stopWords.has(term)))].slice(0, 10);
-  return {
-    coreCategory: product.trim() || query.trim(),
-    mandatoryQualifiers: terms,
-    useCases: [],
-    adjacentBuyerChannels: [],
-    exclusionSignals: [],
-    searchAliases: [],
-  };
-}
-
-function normalizeProductBrief(value: unknown, fallback: LeadProductBrief): LeadProductBrief {
-  const data = value && typeof value === "object" ? value as Record<string, unknown> : {};
-  const strings = (key: string) => Array.isArray(data[key])
-    ? [...new Set((data[key] as unknown[]).map((item) => cleanLeadText(item, 100)).filter(Boolean))].slice(0, 12)
-    : [];
-  return {
-    coreCategory: cleanLeadText(data.coreCategory, 180) || fallback.coreCategory,
-    mandatoryQualifiers: strings("mandatoryQualifiers").length ? strings("mandatoryQualifiers") : fallback.mandatoryQualifiers,
-    useCases: strings("useCases"),
-    adjacentBuyerChannels: strings("adjacentBuyerChannels"),
-    exclusionSignals: strings("exclusionSignals"),
-    searchAliases: strings("searchAliases"),
-    taskTitle: cleanLeadText(data.taskTitle, 40),
-    taskSummary: cleanLeadText(data.taskSummary, 120),
-  };
-}
 
 async function createProductBrief(product: string, market: string, buyerType: string, query: string, context: string): Promise<LeadProductBrief> {
-  const fallback = fallbackProductBrief(product, query);
-  try {
-    const response = await aiPrompt(
-      "你是B2B客户开发的产品理解器。根据每位用户本次提供的信息动态理解产品，不能套用任何固定行业或示例。只输出一个JSON对象，字段严格为 coreCategory、mandatoryQualifiers、useCases、adjacentBuyerChannels、exclusionSignals、searchAliases、taskTitle、taskSummary；数组字段使用简短字符串数组。taskTitle用不超过24个汉字概括用户任务，taskSummary用一两句话、不超过80个汉字准确摘要目标产品、市场、客户和关键限制。mandatoryQualifiers是不能丢失、可用于验证候选是否真正相关的产品限定；adjacentBuyerChannels是虽不直接写该产品名但合理采购该产品的渠道；exclusionSignals是容易误搜且应排除的业务类型。不得编造用户未提供的参数。",
-      `产品/服务：${product}\n目标市场：${market}\n目标买家：${buyerType}\n用户要求：${query}\n${context ? `用户本次选择的参考内容：${context.slice(0, 6000)}` : ""}`,
-    );
-    const json = response.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-    const start = json.indexOf("{");
-    const end = json.lastIndexOf("}");
-    return normalizeProductBrief(JSON.parse(start >= 0 && end > start ? json.slice(start, end + 1) : json), fallback);
-  } catch {
-    return fallback;
-  }
+  return await interpretProductBrief({product,query,context},repair => leadResearchPrompt(
+    PRODUCT_RESEARCH_PROMPT + (repair ? "\n上次英文检索规划无效。只修正英文searchProduct和英文searchChannels、目标市场当地语言localQueries，禁止输出公司或拼接中文检索词。" : ""),
+    `产品/服务：${product}\n目标市场：${market}\n目标买家：${buyerType}\n用户要求：${query}\n用户本次选择的参考内容：${context.slice(0,6000)}`,
+  )) as LeadProductBrief;
 }
 
 function cleanLeadCandidate(item: LeadCandidate, productBrief?: LeadProductBrief | string): LeadCandidate {
@@ -426,12 +408,13 @@ function cleanLeadCandidate(item: LeadCandidate, productBrief?: LeadProductBrief
       website: item.website || "",
       websiteStatus: item.websiteStatus,
       evidenceSource: entry.source,
+      evidenceSourceUrl: entry.sourceUrl,
     })
   );
   const evidenceEmails = new Set(evidence.map((entry) => entry.email.toLowerCase()));
   const emails = [...new Set((item.emails || []).map((email) => email.trim().replace(/^mailto:/i, "").toLowerCase()).filter(isUsableLeadEmail))]
     .filter((email) => evidenceEmails.has(email));
-  const verifiedEmail = evidence.some((entry) => entry.verification && !entry.verification.includes("风险") && !entry.verification.includes("待验证"));
+  const verifiedEmail = evidence.some((entry) => entry.deliveryStatus === "valid");
   const rawWebLead = /公开搜索结果|公开公司网页线索/.test(item.source || "");
   const pendingAiLead = /AI.*待核验/.test(item.source || "");
   const unverifiedLead = rawWebLead || pendingAiLead;
@@ -451,7 +434,7 @@ function cleanLeadCandidate(item: LeadCandidate, productBrief?: LeadProductBrief
   const evidenceAdjustedScore = rawWebLead ? Math.min(initialScore, 29)
     : pendingAiLead ? Math.min(initialScore, 49)
     : initialScore;
-  const score = !effectiveBrief ? evidenceAdjustedScore
+  const score = item.quality ? qualityScore(item.quality) : !effectiveBrief ? evidenceAdjustedScore
     : exclusionMatches > 0 ? Math.min(evidenceAdjustedScore, 29)
     : directMatches > 0 || useCaseMatches > 0 ? evidenceAdjustedScore
     : adjacentMatches > 0 ? Math.min(evidenceAdjustedScore, 74)
@@ -466,6 +449,8 @@ function cleanLeadCandidate(item: LeadCandidate, productBrief?: LeadProductBrief
     websiteStatus: item.websiteStatus || "待核验",
     websiteStatusReason: cleanLeadText(item.websiteStatusReason, 300),
     country: cleanLeadText(item.country, 80),
+    city: cleanLeadText(item.city, 120),
+    address: cleanLeadText(item.address, 350),
     customerType: cleanLeadResultField(item.customerType, 100),
     description: cleanLeadResultField(item.description),
     background: cleanLeadResultField(item.background),
@@ -478,84 +463,59 @@ function cleanLeadCandidate(item: LeadCandidate, productBrief?: LeadProductBrief
     emailDiscoveryStatus: item.emailDiscoveryStatus || (evidence.length > 0 ? "completed" : "pending"),
     fitSummary: cleanLeadResultField(item.fitSummary),
     source: cleanLeadText(item.source, 300),
-    fitSignals: (item.fitSignals || []).map((value) => cleanLeadText(value, 240)).filter(Boolean).slice(0, 6),
-    unknowns: (item.unknowns || []).map((value) => cleanLeadText(value, 240)).filter(Boolean).slice(0, 6),
+    fitSignals: (item.quality ? item.quality.evidence.map(proof => proof.quote) : item.fitSignals || []).map((value) => cleanLeadText(value, 240)).filter(Boolean).slice(0, 6),
+    unknowns: (item.quality?.unknowns || item.unknowns || []).map((value) => cleanLeadText(value, 240)).filter(Boolean).slice(0, 6),
     contactRoles: (item.contactRoles || []).map((value) => cleanLeadText(value, 120)).filter(Boolean).slice(0, 6),
     fitScore: score,
     priorityTier: score >= 75 ? "T1" : score >= 50 ? "T2" : "T3",
     channelSources: [...new Set((item.channelSources || [item.source || "AI 联网搜索"]).map((value) => cleanLeadText(value, 100)).filter(Boolean))].slice(0, 8),
-    scoreBreakdown: [
+    scoreBreakdown: item.quality ? [`已读取 ${item.quality.checkedPages} 个网页`, "规则证据分，不是成交概率；邮箱数量不加分"] : [
       item.website ? (unverifiedLead ? "候选网址待核验，尚不能认定为官网" : "官网可核实") : "缺少官网",
       emails.length ? `发现 ${emails.length} 个有来源邮箱` : "暂未发现可确认邮箱",
-      verifiedEmail ? "邮箱有独立证据/验证" : "邮箱仍需验证",
+      verifiedEmail ? "邮箱验证服务通过，送达不保证" : "邮箱仍需验证",
       ...(item.fitSignals || []).slice(0, 3),
     ],
   };
 }
 
-async function warnExternalApiQuota(): Promise<void> {
-  const cacheKey = "yaoaimail-external-quota-check-at";
-  const lastChecked = Number(sessionStorage.getItem(cacheKey) || 0);
-  if (Date.now() - lastChecked < 10 * 60 * 1000) return;
-  sessionStorage.setItem(cacheKey, String(Date.now()));
-  const providers = ["tavily", "brave", "firecrawl", "hunter"] as const;
-  const usages = await Promise.all(providers.map((provider) => getExternalServiceUsage(provider).catch(() => null)));
-  const low = usages.filter((usage) => usage?.remaining != null && usage?.limit != null && usage.remaining <= Math.max(10, usage.limit * 0.1));
-  if (low.length > 0) {
-    useToastStore.getState().addToast({ message: "部分外部搜索/API额度较低，本次仍可继续，建议检查设置中的额度提示。", type: "info" });
-  }
-}
-
-function localizedSearchStrategies(market: string): Array<{ query: string; channel: string }> {
-  const value = market.toLowerCase();
-  const local = value.includes("german") || value.includes("德国") ? ["Händler Großhändler Importeur", "Branchenverband Mitglieder"]
-    : value.includes("france") || value.includes("法国") ? ["distributeur grossiste importateur", "annuaire professionnel"]
-    : value.includes("spain") || value.includes("西班牙") ? ["distribuidor mayorista importador", "directorio de empresas"]
-    : value.includes("ital") || value.includes("意大利") ? ["distributore grossista importatore", "associazione di categoria"]
-    : value.includes("brazil") || value.includes("巴西") || value.includes("portugal") ? ["distribuidor atacadista importador", "associação comercial"]
-    : value.includes("japan") || value.includes("日本") ? ["販売代理店 卸売業者 輸入業者", "業界団体 会員"]
-    : value.includes("korea") || value.includes("韩国") ? ["유통업체 도매업체 수입업체", "산업 협회 회원사"]
-    : value.includes("russia") || value.includes("俄罗斯") ? ["дистрибьютор оптовик импортёр", "отраслевая ассоциация"]
-    : value.includes("arab") || value.includes("中东") || value.includes("沙特") || value.includes("阿联酋") ? ["موزع تاجر جملة مستورد", "دليل الشركات"]
-    : [];
-  return [
-    { query: "distributor wholesaler importer", channel: "公司官网/本地搜索" },
-    { query: "industry association member directory", channel: "行业协会/会员名录" },
-    { query: "trade show exhibitor buyer", channel: "展会/参展商名录" },
-    { query: "import data buyer consignee", channel: "贸易/提单线索" },
-    ...local.map((query, index) => ({ query, channel: index === 0 ? "当地语言商业搜索" : "当地语言行业名录" })),
-  ];
-}
 
 export default function LeadFinderView() {
+  const transferring = useWorkspaceIsTransferring();
+  const workspace = useWorkspaceScope();
   const leadDraft = useUIStore((s) => s.leadFinderDraft);
   const setLeadDraft = useUIStore((s) => s.setLeadFinderDraft);
   const setActiveView = useUIStore((s) => s.setActiveView);
   const setSettingsTab = useUIStore((s) => s.setSettingsTab);
-  const [product, setProduct] = useState(() => leadDraft?.product ?? "");
-  const [market, setMarket] = useState(() => leadDraft?.market ?? "");
-  const [buyerType, setBuyerType] = useState(() => leadDraft?.buyerType ?? "");
-  const [query, setQuery] = useState(() => leadDraft?.query ?? "");
-  const [leadContextFiles, setLeadContextFiles] = useState<File[]>([]);
-  const [leadContextMessages, setLeadContextMessages] = useState<Array<{ id: string; title: string }>>([]);
-  const [selectedKnowledgeIds, setSelectedKnowledgeIds] = useState<string[]>([]);
-  const [leadContextBusy, setLeadContextBusy] = useState(false);
+  const [product, setProduct] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:product", () => leadDraft?.product ?? "");
+  const [market, setMarket] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:market", () => leadDraft?.market ?? "");
+  const [buyerType, setBuyerType] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:buyerType", () => leadDraft?.buyerType ?? "");
+  const [query, setQuery] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:query", () => leadDraft?.query ?? "");
+  const [leadContextFiles, setLeadContextFiles] = useWorkspaceState<File[]>("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:leadContextFiles", []);
+  const [leadContextMessages, setLeadContextMessages] = useWorkspaceState<Array<{ id: string; title: string }>>("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:leadContextMessages", []);
+  const [selectedKnowledgeIds, setSelectedKnowledgeIds] = useWorkspaceState<string[]>("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:selectedKnowledgeIds", []);
+  const [leadContextBusy, setLeadContextBusy] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:leadContextBusy", false);
   const leadFileInputRef = useRef<HTMLInputElement>(null);
-  const [results, setResults] = useState<LeadCandidate[]>([]);
-  const [searchStage, setSearchStage] = useState("");
-  const [searchSessions, setSearchSessions] = useState<LeadSearchSession[]>(() => readSearchSessions());
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [searchPage, setSearchPage] = useState(0);
-  const [savedLeads, setSavedLeads] = useState<LeadCandidate[]>(() => readSavedLeads());
-  const [selectedLeadKeys, setSelectedLeadKeys] = useState<Set<string>>(new Set());
-  const [batchMode, setBatchMode] = useState(true);
-  const [showSaved, setShowSaved] = useState(false);
-  const [filterText, setFilterText] = useState("");
-  const [tagText, setTagText] = useState("");
+  const [results, setResults] = useWorkspaceState<LeadCandidate[]>("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:results", []);
+  const [searchSessions, setSearchSessions] = useWorkspaceState<LeadSearchSession[]>("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:searchSessions", () => readSearchSessions());
+  const [activeSessionId, setActiveSessionId] = useWorkspaceState<string | null>("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:activeSessionId", null);
+  const activeSessionIdRef = useRef(activeSessionId);
+  const resultsSectionRef = useRef<HTMLElement>(null);
+  activeSessionIdRef.current = activeSessionId;
+  const currentDiscoveryReport=searchSessions.find(session=>session.id===activeSessionId)?.discoveryReport;
+  // 为什么这批结果少：后端一直统计着排除原因，之前没接到界面上。
+  const reviewIssueSummary=describeReviewIssues(currentDiscoveryReport||{});
+  const [searchPage, setSearchPage] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:searchPage", 0);
+  const [resultPage, setResultPage] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:resultPage", 1);
+  const [signalOrder,setSignalOrder]=useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:signalOrder", true);
+  const [savedLeads, setSavedLeads] = useWorkspaceState<LeadCandidate[]>("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:savedLeads", () => readSavedLeads());
+  const [selectedLeadKeys, setSelectedLeadKeys] = useWorkspaceState<Set<string>>("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:selectedLeadKeys", new Set());
+  const [showSaved, setShowSaved] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:showSaved", false);
+  const [filterText, setFilterText] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:filterText", "");
+  const [tagText, setTagText] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:tagText", "");
   // 打开旧会话时恢复的"当时搜索所用资料"备注（只读提示，避免用户误以为文件丢了）
-  const [restoredContextNote, setRestoredContextNote] = useState("");
+  const [restoredContextNote, setRestoredContextNote] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:restoredContextNote", "");
   // 生成开发信：邮箱勾选弹窗（点"生成开发信"先弹出复选框，用户勾选后再生成）
-  const [outreachPicker, setOutreachPicker] = useState<{
+  const [outreachPicker, setOutreachPicker] = useWorkspaceState<{
     candidate: LeadCandidate;
     index: number;
     checked: Set<string>;
@@ -565,13 +525,14 @@ export default function LeadFinderView() {
     useStyle: boolean;
     // 用户补充的调整指令（可选），随生成传给 AI
     instruction: string;
-  } | null>(null);
-  const [showDevRecords, setShowDevRecords] = useState(false);
+  } | null>("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:outreachPicker", null);
+  const [showDevRecords, setShowDevRecords] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:showDevRecords", false);
   const { records: devRecords, append: appendDevRecord, remove: removeDevRecord } = useLeadDevRecords();
   const findTask = useBackgroundTasksStore((state) => state.tasks.leadFinder);
   const startTask = useBackgroundTasksStore((state) => state.start);
   const clearTask = useBackgroundTasksStore((state) => state.clear);
   const busy = findTask?.status === "running";
+  const taskProgress = useLeadTaskProgress(state => state.active);
   const leadContextQueue = useUIStore((state) => state.leadContextQueue);
   const leadContextAttachmentQueue = useUIStore((state) => state.leadContextAttachmentQueue);
   const clearLeadContextQueue = useUIStore((state) => state.clearLeadContextQueue);
@@ -579,11 +540,15 @@ export default function LeadFinderView() {
   const clearKnowledgeContextQueue = useUIStore((state) => state.clearKnowledgeContextQueue);
   const activeAccountId = useMailStore((state) => state.activeAccountId);
   const { data: mailAccounts = [] } = useAccountsQuery();
-  const [autoDevSendAccountId, setAutoDevSendAccountId] = useState("");
-  const persistenceReady = useRef(false);
+  const [autoDevSendAccountId, setAutoDevSendAccountId] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:autoDevSendAccountId", "");
+  const restoredWorkspace = useWorkspaceRestored('src/features/lead-finder/LeadFinderView.tsx:');
+  const persistenceReady = useRef(restoredWorkspace);
+  const [historyLoaded, setHistoryLoaded] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:historyLoaded", false);
   const enrichingLeadKeysRef = useRef(new Set<string>());
+  const contactQueueRef = useRef(new LeadContactQueue(3));
 
   useEffect(() => {
+    if (restoredWorkspace) return;
     void loadLeadFinderData().then((stored) => {
       const localSessions = readSearchSessions();
       const localLeads = readSavedLeads();
@@ -598,8 +563,9 @@ export default function LeadFinderView() {
       setSearchSessions(revivedSessions.slice(0, 30));
       setSavedLeads(leads);
       persistenceReady.current = true;
+      setHistoryLoaded(true);
       if (!stored && (sessions.length || leads.length)) void saveLeadFinderData({ searchSessions: revivedSessions.slice(0, 30), savedLeads: leads });
-    }).catch(() => { persistenceReady.current = true; });
+    }).catch(() => { persistenceReady.current = true; setHistoryLoaded(true); });
   }, []);
 
   useEffect(() => {
@@ -734,7 +700,7 @@ export default function LeadFinderView() {
   }, [product, market, buyerType, query, setLeadDraft]);
 
   useEffect(() => {
-    if (findTask?.status !== "success") return;
+    if (transferring || !historyLoaded || findTask?.status !== "success") return;
     const payload = Array.isArray(findTask.result)
       ? { sessionId: activeSessionId || "", page: searchPage, items: findTask.result as LeadCandidate[] }
       : findTask.result as LeadFinderTaskResult;
@@ -744,58 +710,62 @@ export default function LeadFinderView() {
     const session = targetSessionId ? searchSessions.find((item) => item.id === targetSessionId) : null;
     const effectiveBrief = payload.productBrief || session?.productBrief;
     const merged = mergeLeadResults(session?.results || results, taskResult, effectiveBrief);
-    setResults(merged);
+    if (targetSessionId === activeSessionIdRef.current) setResults(merged);
     if (targetSessionId) {
       setSearchSessions((old) => old.map((item) => item.id === targetSessionId
-        ? { ...item, page: payload.page || searchPage, resultCount: merged.length, results: merged, productBrief: effectiveBrief, updatedAt: Date.now() }
+        ? { ...item, page: payload.page || searchPage, nativeResultRound:payload.page || searchPage, resultCount: merged.length, results: merged, productBrief: effectiveBrief, discoveryReport: payload.discoveryReport || item.discoveryReport, updatedAt: Date.now() }
         : item));
     }
     setSelectedLeadKeys(new Set());
     clearTask("leadFinder");
-    setSearchStage("");
     void enrichFirstVisibleLeads(taskResult, targetSessionId || "", effectiveBrief);
-  }, [findTask, clearTask, activeSessionId, searchPage, searchSessions, results]);
+  }, [transferring, historyLoaded, findTask, clearTask, activeSessionId, searchPage, searchSessions, results]);
 
   useEffect(() => {
-    if (findTask?.status !== "error") return;
+    if (transferring || findTask?.status !== "error") return;
     useToastStore.getState().addToast({
       message: `开发客户失败：${findTask.error || "AI 没有返回结果"}`,
       type: "error",
     });
     clearTask("leadFinder");
-    setSearchStage("");
-  }, [findTask, clearTask]);
+  }, [transferring, findTask, clearTask]);
 
   function mergeLeadResults(existing: LeadCandidate[], incoming: LeadCandidate[], productBrief?: LeadProductBrief): LeadCandidate[] {
     const map = new Map<string, LeadCandidate>();
     for (const item of [...existing, ...incoming]) {
       const key = leadKey(item);
       if (key === "|") continue;
-      map.set(key, cleanLeadCandidate({ ...map.get(key), ...item }, productBrief));
+      map.set(key, cleanLeadCandidate(mergeContactProgress(map.get(key), item), productBrief));
     }
+    // Keep established row order while contacts complete, so pagination cannot
+    // jump or move a company between pages as its score changes.
     return [...map.values()];
   }
 
-  async function enrichFirstVisibleLeads(items: LeadCandidate[], sessionId: string, productBrief?: LeadProductBrief, force = false) {
+  function enrichFirstVisibleLeads(items: LeadCandidate[], sessionId: string, productBrief?: LeadProductBrief, force = false) {
+    const work = () => enrichVisibleContacts(items, sessionId, productBrief, force);
+    return workspace ? workspace.run(work) : work();
+  }
+  async function enrichVisibleContacts(items: LeadCandidate[], sessionId: string, productBrief?: LeadProductBrief, force = false) {
     // force=true 时连已标 completed 的也重试（用户手动点"重新查找"）；否则只补未完成的
     const eligible = items
-      .filter((item) => item.website && (force || item.emailDiscoveryStatus !== "completed") && !enrichingLeadKeysRef.current.has(leadKey(item)));
-    for (const item of eligible) enrichingLeadKeysRef.current.add(leadKey(item));
+      .filter((item) => item.website && shouldDiscoverContact(item,force) && !enrichingLeadKeysRef.current.has(contactJobKey(sessionId, leadKey(item))));
+    for (const item of eligible) enrichingLeadKeysRef.current.add(contactJobKey(sessionId, leadKey(item)));
     for (let index = 0; index < eligible.length; index += 3) {
       const batch = eligible.slice(index, index + 3);
       const running = batch.map((item) => ({ ...item, emailDiscoveryStatus: "running" as const }));
-      setResults((old) => mergeLeadResults(old, running, productBrief));
+      setResults((old) => sessionId === activeSessionIdRef.current ? mergeLeadResults(old, running, productBrief) : old);
       if (sessionId) {
         setSearchSessions((old) => old.map((session) => session.id === sessionId
           ? { ...session, results: mergeLeadResults(session.results, running, productBrief), updatedAt: Date.now() }
           : session));
       }
-      const enriched = await Promise.all(batch.map(async (item) => {
+      const enriched = await Promise.all(batch.map((item) => contactQueueRef.current.run(async () => {
         const candidate: PublicCompanyMatch = {
           legalName: item.companyName || "",
           country: item.country || "",
-          city: "",
-          address: "",
+          city: item.city || "",
+          address: item.address || "",
           registrationStatus: "",
           lei: "",
           sourceUrl: item.sourceUrl || item.website || "",
@@ -817,9 +787,14 @@ export default function LeadFinderView() {
             sourceUrl: result.sourceUrl || item.sourceUrl,
             websiteStatus: result.websiteStatus as LeadCandidate["websiteStatus"],
             websiteStatusReason: result.websiteStatusReason,
+            country: result.country || item.country,
+            city: result.city || item.city,
+            address: result.address || item.address,
             description: result.description || item.description,
-            emails: result.publicEmails?.length ? result.publicEmails : item.emails,
-            emailEvidence: result.emailEvidence?.length ? result.emailEvidence : item.emailEvidence,
+            emails: result.publicEmails || [],
+            emailEvidence: result.emailEvidence || [],
+            contacts: result.contacts || [],
+            buyingSignals: result.buyingSignals || [],
             source: result.sourceName || item.source,
             recommendationReason: result.recommendationReason || item.recommendationReason,
             discoveryBasis: result.discoveryBasis?.length ? result.discoveryBasis : item.discoveryBasis,
@@ -830,14 +805,14 @@ export default function LeadFinderView() {
         } catch {
           return cleanLeadCandidate({ ...item, emailDiscoveryStatus: "failed" }, productBrief);
         }
-      }));
-      setResults((old) => mergeLeadResults(old, enriched, productBrief));
+      })));
+      setResults((old) => sessionId === activeSessionIdRef.current ? mergeLeadResults(old, enriched, productBrief) : old);
       if (sessionId) {
         setSearchSessions((old) => old.map((session) => session.id === sessionId
           ? { ...session, results: mergeLeadResults(session.results, enriched, productBrief), updatedAt: Date.now() }
           : session));
       }
-      for (const item of batch) enrichingLeadKeysRef.current.delete(leadKey(item));
+      for (const item of batch) enrichingLeadKeysRef.current.delete(contactJobKey(sessionId, leadKey(item)));
     }
   }
 
@@ -845,6 +820,7 @@ export default function LeadFinderView() {
     const now = Date.now();
     const session: LeadSearchSession = {
       id: crypto.randomUUID(),
+      accountId: activeAccountId || undefined,
       title: buildSearchSessionTitle(product, market, buyerType, query),
       summary: buildSearchSessionSummary(product, market, buyerType, query),
       product: product.trim(),
@@ -852,6 +828,7 @@ export default function LeadFinderView() {
       buyerType: buyerType.trim(),
       query: query.trim(),
       page: 0,
+      nativeResultRound: 0,
       resultCount: 0,
       results: [],
       createdAt: now,
@@ -868,117 +845,91 @@ export default function LeadFinderView() {
     if (!product.trim() && !query.trim() && !market.trim()) return;
     const session = sessionOverride || (page === 1 ? createSearchSession() : searchSessions.find((item) => item.id === activeSessionId));
     const sessionResults = session?.results || results;
-    const seenCompanies = sessionResults
-      .map((item) => item.companyName || item.website || item.emails?.[0])
-      .filter((value): value is string => typeof value === "string" && value.length > 0)
-      .slice(0, 80);
+    const seenWebsites = sessionResults.map(item => item.website || "").filter(Boolean).slice(0, 100);
     if (!session) return;
     setActiveSessionId(session.id);
     setSearchPage(page);
-    startTask("leadFinder", page > 1 ? `继续搜客（第 ${page} 页）` : (batchMode ? "批量搜客（AI 联网）" : "开发客户（AI 联网）"), async () => {
-      void warnExternalApiQuota().catch(() => undefined);
-      setSearchStage("正在理解产品与目标客户…");
-      const taskContext = await buildLeadContext(true);
-      // 把本次搜索所用的上下文（文件/邮件/资料库）固化进会话快照，
-      // 之后无论手动还是自动生成开发信，都能继续使用当时的资料。
-      // 继续搜下一页时：若已有快照，则合并追加，避免覆盖丢失首屏资料。
-      const existing = page > 1 ? (session.contextText || "") : "";
-      const mergedText = existing
-        ? [existing, taskContext].filter(Boolean).join("\n\n").slice(0, 36000)
-        : taskContext.slice(0, 36000);
-      const mergedFiles = [...new Set([...(session.contextFiles || []), ...leadContextFiles.map((file) => file.name)])];
-      const mergedKnowledgeIds = [...new Set([...(session.contextKnowledgeIds || []), ...selectedKnowledgeIds])];
-      const contextSnapshot = {
-        contextText: mergedText,
-        contextFiles: mergedFiles,
-        contextKnowledgeIds: mergedKnowledgeIds,
-        contextFilesNote: buildLeadContextNote(),
-      };
-      const productBrief = session.productBrief
-        || await createProductBrief(product.trim(), market.trim(), buyerType.trim(), query.trim(), taskContext);
+    useLeadTaskProgress.getState().update(session.id,'context');
+    startTask("leadFinder", page > 1 ? "继续查找客户" : "查找客户", async () => {
+      try {
+      const contextSnapshot = await leadTaskContext(page,session,async()=>({
+        contextText:(await buildLeadContext(true)).slice(0,36000),
+        contextFiles:leadContextFiles.map(file=>file.name),contextKnowledgeIds:[...selectedKnowledgeIds],contextFilesNote:buildLeadContextNote(),
+      }));
+      const cachedBrief = session.productBrief?.searchProduct && (page>1 || session.productBrief.version === PRODUCT_BRIEF_VERSION);
+      if (!cachedBrief) useLeadTaskProgress.getState().update(session.id,'understanding');
+      const productBrief = cachedBrief ? session.productBrief!
+        : await createProductBrief(session.product, session.market, session.buyerType, session.query, contextSnapshot.contextText);
       if (productBrief.taskTitle || productBrief.taskSummary) {
         setSearchSessions((old) => old.map((item) => item.id === session.id ? { ...item, title: productBrief.taskTitle || item.title, summary: productBrief.taskSummary || item.summary, productBrief, ...contextSnapshot, updatedAt: Date.now() } : item));
       } else {
         setSearchSessions((old) => old.map((item) => item.id === session.id ? { ...item, ...contextSnapshot, updatedAt: Date.now() } : item));
       }
-      const strategies = localizedSearchStrategies(market.trim());
-      const activeStrategies = batchMode ? strategies : strategies.slice(0, 3);
-      const compactSearchRequest = [
-        productBrief.coreCategory || product.trim() || query.trim(),
-        productBrief.searchAliases.slice(0, 5).join(" OR "),
-        productBrief.adjacentBuyerChannels.slice(0, 3).join(" OR "),
-        productBrief.exclusionSignals.length ? `exclude ${productBrief.exclusionSignals.slice(0, 5).join(" OR ")}` : "",
-        buyerType.trim(),
-        market.trim(),
-        activeStrategies.map((item) => item.query).join("；"),
-      ].filter(Boolean).join("\n").slice(0, 1200);
-      const toRecords = (found: PublicCompanyMatch[], channel: string) => found.map((item) => cleanLeadCandidate({
-          companyName: item.legalName,
-          website: item.website || item.sourceUrl,
-          sourceUrl: item.sourceUrl,
+      const discoveryRequest = buildLeadDiscoveryRequest({
+        product: session.product, query: session.query, market: session.market, buyerType: session.buyerType,
+        brief: productBrief, websites: seenWebsites, page, batchMode:true, sessionId:session.id, scopeId:session.accountId || '',
+      });
+      const toRecords = (found: Array<{ company: PublicCompanyMatch; quality: LeadQuality }>) => found.map(({ company: item, quality }) => cleanLeadCandidate({
+          quality,
+          companyName: item.legalName, website: item.website || item.sourceUrl, sourceUrl: item.sourceUrl,
           websiteStatus: (item.websiteStatus || "待核验") as LeadCandidate["websiteStatus"],
-          websiteStatusReason: item.websiteStatusReason,
-          country: item.country,
-          customerType: buyerType,
-          description: item.description,
-          reason: item.description,
-          emails: item.publicEmails,
-          emailEvidence: item.emailEvidence,
-          source: item.sourceName,
-          recommendationReason: item.recommendationReason,
-          discoveryBasis: item.discoveryBasis,
+          websiteStatusReason: item.websiteStatusReason, country: item.country, city: item.city, address: item.address, customerType: session.buyerType,
+          description: item.description, reason: item.recommendationReason,
+          emails: item.publicEmails, emailEvidence: item.emailEvidence, source: item.sourceName,
+          recommendationReason: item.recommendationReason, discoveryBasis: item.discoveryBasis,
           companyIntroduction: item.companyIntroduction,
           contactStatus: item.contactStatus === "可联系" ? "可联系" : "待补全",
-          channelSources: [channel],
+          channelSources: [item.sourceName || "公开来源"],
         }, productBrief) as unknown as Record<string, unknown>);
+      discoveryRequest.pageSize=page>1 ? leadPageDeficit(session.results.length) : LEAD_PAGE_SIZE;
       const byKey = new Map<string, Record<string, unknown>>();
-      const append = (items: Array<Record<string, unknown>>) => {
+      const append = (items: Array<Record<string, unknown>>, discoveryReport?: LeadDiscoveryResponse["report"]) => {
+        // Native messages are full snapshots. A rejected provisional company
+        // must disappear, not remain in an append-only map forever.
+        byKey.clear();
         for (const item of items) {
           const key = normalizeLeadPart(String(item.website || item.companyName || ""))
             || normalizeLeadPart(String((item.emails as string[] | undefined)?.[0] || ""));
           if (key) byKey.set(key, item);
         }
         const partial = [...byKey.values()] as unknown as LeadCandidate[];
-        const merged = mergeLeadResults(session.results || [], partial, productBrief);
-        setResults(merged);
+        if (session.id === activeSessionIdRef.current) setResults(old => mergeLeadResults(old, partial, productBrief));
         setSearchSessions((old) => old.map((item) => item.id === session.id
-          ? { ...item, page, resultCount: merged.length, results: merged, productBrief, updatedAt: Date.now() }
+          ? { ...item, page, resultCount: mergeLeadResults(item.results, partial, productBrief).length, results: mergeLeadResults(item.results, partial, productBrief), productBrief, discoveryReport: discoveryReport || item.discoveryReport, updatedAt: Date.now() }
           : item));
-        // Contact completion starts as soon as a candidate appears; it no
-        // longer waits for every AI company batch to finish.
+        // Only evidence-admitted companies are published. Keep contacting each
+        // as soon as it arrives; mergeContactProgress protects late snapshots.
         void enrichFirstVisibleLeads(partial, session.id, productBrief);
       };
 
-      // Render deterministic public-search results first. Slow/reasoning AI
-      // batches append later and can fail independently without blanking UI.
-      setSearchStage("正在搜索公开公司来源…");
-      const publicFound = await searchLeadCompanies(compactSearchRequest, market.trim(), buyerType.trim(), batchMode);
-      append(toRecords(publicFound, "公开搜索首屏"));
-      setSearchStage("正在用中文整理公开依据…");
-      const summarizedPublic = await summarizeLeadCandidates(publicFound).catch(() => publicFound);
-      append(toRecords(summarizedPublic, "公开搜索首屏"));
-      const focuses = batchMode
-        ? ["进口商、批发商、区域分销商、礼品/家居品牌", "独立礼品精品店、花艺品牌、小型电商及相邻采购渠道"]
-        : ["最匹配的进口商、批发商、分销商和品牌商"];
-      for (const [focusIndex, focus] of focuses.entries()) {
-        setSearchStage(`已显示 ${byKey.size} 家，AI 正在补充第 ${focusIndex + 1} 批…`);
-        const exclusions = [
-          ...seenCompanies,
-          ...[...byKey.values()].map((item) => String(item.companyName || "")).filter(Boolean),
-        ].slice(0, 50);
-        const modelFound = await aiFindCompanyBatch(compactSearchRequest, market.trim(), buyerType.trim(), focus, exclusions);
-        append(toRecords(modelFound, "AI 公司候选"));
-        if (byKey.size >= 30) break;
-      }
+      useLeadTaskProgress.getState().update(session.id,'searching');
+      const discovery = await discoverLeads(discoveryRequest, partial => {
+        useLeadTaskProgress.getState().update(session.id,phaseForLeadReport(partial.report));
+        append(toRecords(partial.items),partial.report);
+      });
+      useLeadTaskProgress.getState().update(session.id,'finishing');
+      append(toRecords(discovery.items),discovery.report);
+      const report = discovery.report;
       const next = [...byKey.values()];
       if (next.length === 0) {
         useToastStore.getState().addToast({
-          message: page > 1 ? "这一页没有发现新的公司，可以换补充关键词继续。" : "没有找到候选公司。请换一组产品/市场关键词后重试。",
+          message: emptyLeadResultMessage(report),
           type: page > 1 ? "info" : "error",
         });
       }
-      return { sessionId: session.id, page, items: next, productBrief } satisfies LeadFinderTaskResult;
-    });
+      return { sessionId: session.id, page, items: next, productBrief, discoveryReport: report } satisfies LeadFinderTaskResult;
+      } catch(error) {
+        const failure=String(error).includes("识别产品名称") ? "product_interpretation_failed" : "execution_failed";
+        const failureDetail=describeLeadFailure(error);
+        setSearchSessions(old=>old.map(item=>item.id===session.id ? {...item,failure,failureDetail,updatedAt:Date.now()} : item));
+        throw new Error(failureDetail);
+      } finally {
+        useLeadTaskProgress.getState().finish(session.id);
+      }
+    }, { successMessage: result => {
+      const found=(result as LeadFinderTaskResult).items.length;
+      return found ? `找到 ${found} 条公司候选，请结合来源及待核实项判断。` : null;
+    } });
     // “本次”授权只对这一次点击有效；下一次搜索必须重新确认。
   }
 
@@ -1002,10 +953,13 @@ export default function LeadFinderView() {
     setResults((session.results || []).map((item) => item.emailDiscoveryStatus === "running" ? { ...item, emailDiscoveryStatus: "pending" } : item));
     setShowSaved(false);
     setSelectedLeadKeys(new Set());
+    requestAnimationFrame(() => resultsSectionRef.current?.scrollIntoView?.({ block:'start', behavior:'instant' }));
   }
 
-  function deleteSearchSession(id: string) {
+  async function deleteSearchSession(id: string) {
     if (!window.confirm("删除这条搜索会话及其结果快照？已保存的线索不会被删除。")) return;
+    try {await forgetLeadTask(id,searchSessions.find(s=>s.id===id)?.accountId || '');}
+    catch {useToastStore.getState().addToast({message:'未能删除搜索记录，请重试。',type:'error'});return;}
     setSearchSessions((old) => old.filter((item) => item.id !== id));
     if (activeSessionId === id) {
       setActiveSessionId(null);
@@ -1063,10 +1017,22 @@ export default function LeadFinderView() {
     if (selected.length) setSelectedLeadKeys(new Set());
   }
 
-  const visibleResults = (showSaved ? savedLeads : results).filter((item) => {
+  const filteredMatches = (showSaved ? savedLeads : results).filter((item) => {
     const text = [item.companyName, item.country, item.customerType, item.description, ...(item.tags || [])].join(" ").toLowerCase();
     return !filterText.trim() || text.includes(filterText.trim().toLowerCase());
   });
+  const feedbackRecords=useEmailChecks(s=>s.records);
+  const filteredResults=signalOrder ? orderByLeadSignals(filteredMatches,e=>feedbackRecords[emailCheckKey(e)]?.feedback?.kind) : filteredMatches;
+  const deliveryPage=leadPage(filteredResults,resultPage);
+  const visibleResults=deliveryPage.items;
+  useWorkspaceInitEffect('src/features/lead-finder/LeadFinderView.tsx:', ()=>{setResultPage(1);},[activeSessionId,showSaved,filterText]);
+  function nextResultPage() {
+    if(deliveryPage.page<deliveryPage.pages) {setResultPage(deliveryPage.page+1);return;}
+    if(!showSaved && activeSessionId && !busy) {
+      if(filteredResults.length>0 && filteredResults.length%LEAD_PAGE_SIZE===0) setResultPage(deliveryPage.page+1);
+      void run(searchPage+1);
+    }
+  }
 
   async function addToCustomers(candidate: LeadCandidate) {    const email = candidate.emails?.[0];
     if (!email) {
@@ -1142,6 +1108,7 @@ export default function LeadFinderView() {
   }
 
   async function generateOutreachContent(candidate: LeadCandidate, email: string, useStyle: boolean, signatureAccountId?: string, adjustmentInstruction = "", recentDrafts: string[] = [], contextOverride = ""): Promise<OutreachContent> {
+    await checkResearchContactAllowed(email);
     // 生成前收集产品资料上下文：
     // 1. 优先带"本次搜索会话"保存的快照（保证不脱离当时搜索用的资料，切页/重启后依然有效）；
     // 2. 再追加当前输入框里实时拖入/勾选的补充资料（两者合并，取前 36000 字符）。
@@ -1161,7 +1128,7 @@ export default function LeadFinderView() {
     const adjustment = normalizeOutreachAdjustment(adjustmentInstruction);
     const strategy = chooseOutreachStrategy(candidate, email, leadContext);
     const system = `你是一位资深外贸 B2B 开发信撰写专家，精通针对特定公司的冷邮件（cold outreach）策略。请严格遵循 2026 年经数据验证的高回复率写法：
-0. 【优先级】用户在“调整指令”中明确写出的要求或禁令优先于写作风格档案和默认策略；只有真实性、单一语言和安全限制优先级更高。不得忽略“不问联系人/邮箱”“不要某种说法”等否定指令。
+0. 【优先级】用户在“调整指令”中明确写出的要求或禁令优先于写作风格档案和默认策略。不得忽略“不问联系人/邮箱”“不要某种说法”等否定指令，保持真实性和安全限制。
 1. ${adjustment.lengthRule}。用户对长短的要求优先于默认长度。根据内容自然使用 3-4 个核心句子、2-4 个短段落，不得机械套用固定三段式或固定“观察→痛点→产品→问题”顺序；纯文本风格（不要 HTML 格式）。
 2. 主题行控制在 1-4 个词，使用客户自己的品类/经营语境，具体、口语化、像真人随手写的；不要固定套用 quick question，不要问句、数字、夸张词、营销词或感叹号。
 3. 本封采用【${strategy.title}】：${strategy.instruction}
@@ -1169,12 +1136,12 @@ export default function LeadFinderView() {
 5. 全文只围绕一个角度。CTA 只放一个低门槛动作，优先提供具体价值（例如 4-6 张适配产品图片、一页选品单、真实案例或报价范围），让对方容易回复“可以/感兴趣”。不要把寻找联系人这项工作推给收件人；绝不要直接索要会议、demo 或电话。
 6. 语气专业但不生硬，使用客户能理解的普通语言。不要堆产品功能、公司历史、ROI 承诺、行业黑话或模板腔；不要用 "I am writing to"、"just wanted to"、"hope you're well" 等陈词滥调。
 7. 只输出严格 JSON 对象：{"subject":"主题","body":"正文"}。body 必须只含收件人真正会看到的开发信，不得输出分析、思路、标签、检查清单、Markdown 标题或代码块。
-8. 【硬性要求语言】整封邮件必须使用单一语言（与目标客户所在国家/收件人地区一致：英文客户用英文，中文客户用中文）。**严格禁止中英混杂**——不能用 "serving 精品 retailers"、"night 灯饰"、"melrose's décor 买家" 这类把中文名词硬塞进英文句子的写法。客户资料/工作角色里若含另一种语言片段，只能用作参考语境，不能复制到正文。如果无法确定语言，按收件邮箱后缀判断：欧美域名用英文，中文域名用中文。
+8. ${writingLanguageInstruction("auto")} 新客户可参考有证据的官网语言或已有沟通语言。
 9. 【硬性要求格式】使用常规邮件格式：称呼必须单独占第一段，称呼后空一行；正文每个短段落之间空一行；落款与姓名分行。段落数量由内容决定，不得为了凑结构重复信息。
 10. 【硬性要求破折号】避免过度使用破折号（—/--），同一封邮件中最多出现一次；多用句号和逗号自然断句。
 11. 不要自行生成落款或签名，程序会在正文后附加用户的真实签名。
 ${contactRequestConstraintPrompt(adjustment.userConstraints)}
-${styleProfile ? `【我的写作风格档案】（在不违反用户本次调整指令、真实性、单一语言和格式硬规则的前提下遵守）\n${styleProfile}` : ""}`;
+${styleProfile ? `【我的写作风格档案】（在不违反用户本次调整指令、真实性和格式硬规则的前提下遵守）\n${styleProfile}` : ""}`;
     const user = [
       `我的产品：${product || "（未填写，请用通用措辞）"}`,
       `目标市场：${market || "（未填写）"}`,
@@ -1193,7 +1160,7 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
       `【本封写作决策】${strategy.title}；原因：${strategy.reason}；证据强度：${strategy.evidenceLevel}`,
       strategy.evidenceUsed.length > 0 && `【允许使用的客户依据】${strategy.evidenceUsed.join("；")}`,
       strategy.warnings.length > 0 && `【事实风险提示】${strategy.warnings.join("；")}`,
-      adjustment.instruction && `【用户对本批开发信的调整要求】${adjustment.instruction}。这是硬性要求，在不违反真实性、单一语言和纯正文要求的前提下优先执行。`,
+      adjustment.instruction && `【用户对本批开发信的调整要求】${adjustment.instruction}。这是硬性要求，在不违反真实性和纯正文要求的前提下优先执行。`,
     ].filter(Boolean).join("\n");
 
     let draft = parseOutreachDraft(await aiPrompt(system, user));
@@ -1287,10 +1254,10 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
 
   // ─── 自动开发：Zustand 全局队列，切换页面后任务与控制状态仍保留 ───
   const autoDev = useAutoDevStore();
-  const [autoDevConfirmOpen, setAutoDevConfirmOpen] = useState(false);
-  const [autoDevPreview, setAutoDevPreview] = useState<(OutreachContent & { candidate: LeadCandidate; email: string }) | null>(null);
-  const [autoDevPreviewBusy, setAutoDevPreviewBusy] = useState(false);
-  const [autoDevInstruction, setAutoDevInstruction] = useState("");
+  const [autoDevConfirmOpen, setAutoDevConfirmOpen] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:autoDevConfirmOpen", false);
+  const [autoDevPreview, setAutoDevPreview] = useWorkspaceState<(OutreachContent & { candidate: LeadCandidate; email: string }) | null>("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:autoDevPreview", null);
+  const [autoDevPreviewBusy, setAutoDevPreviewBusy] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:autoDevPreviewBusy", false);
+  const [autoDevInstruction, setAutoDevInstruction] = useWorkspaceState("src/features/lead-finder/LeadFinderView.tsx:LeadFinderView:autoDevInstruction", "");
 
   useEffect(() => {
     if (!autoDevConfirmOpen) return;
@@ -1413,7 +1380,10 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
           if (recentDrafts.length > 5) recentDrafts.shift();
           // Freeze the chosen account for the whole run. Sidebar account
           // changes must never redirect a running campaign mid-queue.
-          await sendEmail(sendAccountId, [target], [], [], content.subject, content.body);
+          await checkResearchContactAllowed(target);
+          const result = await sendEmail(sendAccountId, [target], [], [], content.subject, content.body);
+          if (result.status !== "sent") throw new Error(result.warning || "发送未完成，邮件保留在发件箱，自动重试已暂停");
+          if (result.warning) useToastStore.getState().addToast({ type: "error", duration: 0, message: result.warning });
           sent += 1;
           report.push({ company, email: target, person: evidence?.person, status: "sent", subject: content.subject, timestamp: Date.now() });
           appendDevRecord({ email: target, companyName: company, action: "自动开发已提交", note: `主题：${content.subject}` });
@@ -1460,20 +1430,13 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
     return { count: sentRecords.length, lastAt: Math.max(...sentRecords.map((record) => record.timestamp)) };
   }
 
-  const searchText = [product, buyerType, market].filter(Boolean).join(" ");
-  const links = [
-    ["Google 公司与官网", `https://www.google.com/search?q=${encodeURIComponent(searchText + " company contact")}`],
-    ["LinkedIn 公司与决策人", `https://www.google.com/search?q=${encodeURIComponent("site:linkedin.com/company " + searchText)}`],
-    ["UN Comtrade 市场贸易数据", "https://comtradeplus.un.org/"],
-    ["ImportYeti 美国提单数据", `https://www.importyeti.com/search?q=${encodeURIComponent(product)}`],
-  ];
-
   return (
     <div className="scroll-region" style={{ height: "100%", overflow: "auto", padding: "24px 28px" }}>
       <div style={{ maxWidth: 1020, margin: "0 auto" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap:12, flexWrap:'wrap', marginBottom: 4 }}>
           <h1 style={{ margin: 0, fontSize: 22 }}>开发客户</h1>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap:'wrap' }}>
+          <LeadTaskHistory tasks={searchSessions} activeId={activeSessionId} onSelect={openSearchSession} onDelete={id=>void deleteSearchSession(id)} />
           <button type="button" onClick={() => { setSettingsTab("externalServices"); setActiveView("settings"); }} style={{ ...secondaryButton, marginTop: 0 }}>
             <Settings2 size={13} />搜索服务设置
           </button>
@@ -1502,7 +1465,11 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
           </button>
           </div>
         </div>
-        <p style={{ ...hint, margin: "6px 0 14px" }}>描述你要开发的产品和目标客户，AI 会联网查找公司、官网和公开联系方式。外部搜索服务为可选增强。</p>
+        <p style={{ ...hint, margin: "6px 0 14px" }}>提供公司介绍、匹配情况、公开邮箱及联系建议。支持中文、English 和混合产品词。</p>
+        <LeadSearchStatus phase={busy ? taskProgress?.phase || 'searching' : undefined}
+          contactsRunning={showSaved ? 0 : results.filter(item=>item.emailDiscoveryStatus==='running').length}
+          background={busy && !!taskProgress && taskProgress.sessionId!==activeSessionId}
+          onShowTask={()=>{const session=searchSessions.find(s=>s.id===taskProgress?.sessionId);if(session)openSearchSession(session);}} />
         {showDevRecords && (
           <section style={card}>
             <h2 style={title}><Users size={16} />开发记录（最近 50 条）</h2>
@@ -1551,7 +1518,7 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
         )}
         <section style={card}>
           <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr", gap: 9, marginBottom: 10 }}>
-            <input style={input} value={product} onChange={(e) => setProduct(e.target.value)} placeholder="产品或服务（可选）" />
+            <input style={input} value={product} onChange={(e) => setProduct(e.target.value)} placeholder="产品或服务（支持中文 / English，可选）" />
             <input style={input} value={market} onChange={(e) => setMarket(e.target.value)} placeholder="目标市场（可选）" />
             <select style={input} value={buyerType} onChange={(e) => setBuyerType(e.target.value)}>
               <option value="">不限（所有客户类型）</option>
@@ -1589,77 +1556,31 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
               <button type="button" onClick={() => leadFileInputRef.current?.click()} disabled={busy} style={leadFileButton}>{leadContextBusy ? <RefreshCw size={14} className="spinner" /> : <Paperclip size={14} />}{leadContextBusy ? "正在读取…" : "添加文件"}</button>
               <span style={{ flex: 1, color: "var(--color-text-secondary)", fontSize: 11 }}>拖入或粘贴的内容仅用于本次搜索</span>
               <button type="button" disabled={busy} onClick={() => startNewSearch()} style={{ ...primary, marginTop: 0 }}>
-                {busy ? <RefreshCw size={15} className="spinner" /> : <Search size={15} />}{busy ? (searchStage || (searchPage > 1 ? `正在搜索第 ${searchPage} 页…` : "正在开发客户…")) : "开始搜索"}
+                {busy ? <RefreshCw size={15} className="spinner" /> : <Search size={15} />}{busy ? '正在查找客户…' : "开始搜索"}
               </button>
             </div>
           </div>
-          {busy && (
-            <TaskProgressSteps
-              steps={LEAD_SEARCH_STEPS}
-              activeIndex={leadSearchStageIndex(searchStage)}
-              detail={searchStage || (searchPage > 1 ? `正在搜索第 ${searchPage} 页…` : "正在开发客户…")}
-            />
-          )}
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 10, flexWrap: "wrap" }}>
-            <label style={{ ...hint, display: "inline-flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
-              <input type="checkbox" checked={batchMode} onChange={(e) => setBatchMode(e.target.checked)} /> 批量搜客
-            </label>
-            {activeSessionId && results.length > 0 && (
+            <LeadProfiles scopeId={activeAccountId||''} current={{product,market,buyerType,requirements:query}} apply={p=>{resetToNewTask();setProduct(p.product);setMarket(p.market);setBuyerType(p.buyerType);setQuery(p.requirements);}}/>
+            {activeSessionId && (
               <button
                 type="button"
                 disabled={busy}
                 onClick={() => void run(searchPage + 1)}
+                title="沿用当前任务的搜索条件，继续查找尚未展示的客户。需要更改产品、市场或要求时，请新建任务。"
                 style={{ ...secondaryButton, opacity: busy ? 0.6 : 1 }}
               >
-                <ChevronRight size={15} />继续搜索第 {searchPage + 1} 页
+                <ChevronRight size={15} />继续查找客户
               </button>
             )}
           </div>
         </section>
-        <section style={{ ...card, marginTop: 14 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-            <h2 style={title}><History size={16} />搜索会话（{searchSessions.length}）</h2>
-            <span style={hint}>每次搜索都会自动保存，打开后可以继续搜索下一页</span>
-          </div>
-          {searchSessions.length === 0 ? (
-            <p style={{ ...hint, marginBottom: 0 }}>还没有搜索记录。开始一轮搜索后，这里会像 AI 聊天记录一样保存标题和结果数量。</p>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {searchSessions.map((session) => (
-                <div
-                  key={session.id}
-                  style={{
-                    display: "flex", alignItems: "center", gap: 9, width: "100%",
-                    padding: "9px 10px", border: "1px solid var(--color-border)", borderRadius: 7,
-                    background: activeSessionId === session.id ? "color-mix(in srgb, var(--color-accent) 10%, transparent)" : "var(--color-bg-secondary)",
-                  }}
-                >
-                  <button type="button" onClick={() => openSearchSession(session)} style={{ display: "flex", alignItems: "center", gap: 9, flex: 1, minWidth: 0, padding: 0, border: 0, background: "transparent", color: "var(--color-text-primary)", cursor: "pointer", textAlign: "left" }}>
-                    {activeSessionId === session.id ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                    <span style={{ flex: 1, minWidth: 0 }}>
-                      <strong style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {session.title}
-                        {session.contextFilesNote && (
-                          <span title={`该会话搜索时使用过：${session.contextFilesNote}（生成开发信时自动继承）`} style={{ marginLeft: 6, fontSize: 10.5, fontWeight: 400, padding: "1px 6px", borderRadius: 8, background: "color-mix(in srgb, var(--color-accent) 12%, transparent)", color: "var(--color-accent)", whiteSpace: "nowrap" }}>
-                            <Paperclip size={10} style={{ verticalAlign: -1 }} />含资料
-                          </span>
-                        )}
-                      </strong>
-                      {session.summary && <span style={{ ...hint, display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 }}>{session.summary}</span>}
-                      <span style={hint}>{session.market || "未指定市场"} · 第 {session.page || 1} 页 · {session.resultCount} 个结果 · {new Date(session.updatedAt).toLocaleString()}</span>
-                    </span>
-                  </button>
-                  <button type="button" title="删除搜索会话" onClick={() => deleteSearchSession(session.id)} style={iconButton}><Trash2 size={14} /></button>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
-        <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1.4fr) minmax(280px,.7fr)", gap: 14, marginTop: 14 }}>
-          <section style={card}>
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr)", gap: 14, marginTop: 14 }}>
+          <section ref={resultsSectionRef} style={{scrollMarginTop:64}} aria-label="当前客户结果">
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-              <h2 style={title}><Users size={16} />{showSaved ? "已保存线索" : "公司候选"}（{visibleResults.length} 家）</h2>
+              <h2 style={title}><Users size={16} />{showSaved ? "已保存线索" : "客户公司"}（{filteredResults.length} 家）</h2>
               <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                <label style={hint}>排序 <select aria-label="客户结果排序" value={signalOrder?'signals':'discovery'} onChange={e=>setSignalOrder(e.target.value==='signals')}><option value="signals">匹配优先，再看公开业务信号</option><option value="discovery">发现顺序</option></select></label>
                 <button type="button" onClick={() => setShowSaved(false)} style={{ ...linkButton, fontWeight: !showSaved ? 700 : 400 }}>本次结果</button>
                 <button type="button" onClick={() => setShowSaved(true)} style={{ ...linkButton, fontWeight: showSaved ? 700 : 400 }}>已保存（{savedLeads.length}）</button>
                 {!showSaved && results.length > 0 && (
@@ -1667,15 +1588,15 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
                     type="button"
                     onClick={() => { setAutoDevPreview(null); setAutoDevConfirmOpen(true); }}
                     style={{ ...linkButton, color: "var(--color-accent)", fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 4 }}
-                    title="自动给当前结果逐封生成并发送开发信（随机间隔、可随时终止、完成后有报告）"
+                    title="给本页客户逐封生成并发送开发信（需确认，可随时终止）"
                   >
-                    <Send size={13} />自动开发
+                    <Send size={13} />自动开发本页
                   </button>
                 )}
                 {!showSaved && results.some((item) => item.website && item.emailDiscoveryStatus !== "completed") && (
                   <button
                     type="button"
-                    onClick={() => void enrichFirstVisibleLeads(results, activeSessionId || "", searchSessions.find((session) => session.id === activeSessionId)?.productBrief)}
+                    onClick={() => void enrichFirstVisibleLeads(results.filter(item=>item.emailDiscoveryStatus!=="completed"), activeSessionId || "", searchSessions.find((session) => session.id === activeSessionId)?.productBrief, true)}
                     style={{ ...linkButton, display: "inline-flex", alignItems: "center", gap: 4 }}
                     title="对尚未完成邮箱补全的客户（含失败/中断的）重新查找公开邮箱"
                   >
@@ -1684,12 +1605,13 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
                 )}
               </div>
             </div>
+            {!showSaved && activeSessionId && <p className="lead-current-task" title={searchSessions.find(s=>s.id===activeSessionId)?.title}>当前任务 · {searchSessions.find(s=>s.id===activeSessionId)?.title}</p>}
             {(autoDev.running || autoDev.report.length > 0) && (
               <div style={{ margin: "0 0 10px", padding: "10px 12px", borderRadius: 8, border: "1px solid color-mix(in srgb, var(--color-accent) 35%, var(--color-border))", background: "color-mix(in srgb, var(--color-accent) 6%, transparent)" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
                   <strong style={{ fontSize: 13 }}>
                     {autoDev.running
-                      ? <><RefreshCw size={12} style={{ animation: "pebble-sidebar-spin 1s linear infinite", verticalAlign: -2, marginRight: 5 }} />自动开发中… {autoDev.current}</>
+                      ? <><RefreshCw size={12} className="app-spin" style={{ verticalAlign: -2, marginRight: 5 }} />自动开发中… {autoDev.current}</>
                       : "自动开发已结束"}
                   </strong>
                   {autoDev.running && <div style={{ display: "flex", gap: 6 }}>
@@ -1724,7 +1646,10 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
                 )}
               </div>
             )}
-            {(results.length === 0 && !showSaved) && <p style={hint}>尚无结果。批量搜客会用多组买家关键词搜索并自动合并去重。</p>}
+            {!showSaved && searchSessions.find(s=>s.id===activeSessionId)?.failure && <p role="alert" style={hint}>{searchSessions.find(s=>s.id===activeSessionId)?.failureDetail || '此任务执行未完成，不能把空列表当作没有目标客户。'}</p>}
+            {!showSaved && results.length===0 && currentDiscoveryReport?.outcome==='research_incomplete' && <p style={hint}>{emptyLeadResultMessage(currentDiscoveryReport)}</p>}
+            {!showSaved && reviewIssueSummary && <p style={{ ...hint, marginTop: 2 }}>{reviewIssueSummary}</p>}
+            {(results.length === 0 && !showSaved && !busy && !searchSessions.find(s=>s.id===activeSessionId)?.failure) && <p style={hint}>{activeSessionId?'暂未找到可交付的客户公司，可继续查找。':'开始搜索，或从右上角历史任务查看已有结果。'}</p>}
             {showSaved && savedLeads.length > 0 && (
               <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
                 <input value={filterText} onChange={(e) => setFilterText(e.target.value)} placeholder="筛选公司、国家、标签…" style={{ ...input, flex: 1, minWidth: 160, padding: "6px 8px" }} />
@@ -1739,124 +1664,23 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
               <div style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
                 <button type="button" onClick={() => saveLeads(results)} style={linkButton}><CheckSquare size={13} />保存本次全部结果</button>
                 <span style={hint}>已自动去重 · 结果可在“已保存”中继续筛选、打标签和跟进</span>
-                {activeSessionId && <button type="button" disabled={busy} onClick={() => void run(searchPage + 1)} style={{ ...linkButton, marginLeft: "auto", opacity: busy ? 0.6 : 1 }}><ChevronRight size={13} />下一页</button>}
               </div>
             )}
-            {visibleResults.map((item, index) => (
-              <div key={`${item.companyName}-${index}`} style={{ padding: "10px 0", borderBottom: "1px solid var(--color-border)" }}>
-                <div style={{ display: "flex", alignItems: "flex-start", gap: 7 }}>
-                  {showSaved && <input type="checkbox" checked={selectedLeadKeys.has(leadKey(item))} onChange={() => toggleLead(item)} aria-label={`选择 ${item.companyName || "客户"}`} />}
-                  <strong>{item.companyName || "未知名公司"}</strong>
-                  {(() => {
+            {filteredResults.length>0 && <nav aria-label="客户结果分页" style={{display:'flex',gap:12,alignItems:'center',margin:'10px 0',flexWrap:'wrap'}}>
+              <button type="button" disabled={deliveryPage.page<=1} onClick={()=>setResultPage(deliveryPage.page-1)} style={linkButton}>上一页</button>
+              <span style={hint}>第 {deliveryPage.page} / {deliveryPage.pages} 页 · 每页目标 {LEAD_PAGE_SIZE} 家 · 共 {deliveryPage.total} 家</span>
+              <button type="button" disabled={deliveryPage.page===deliveryPage.pages && (showSaved || busy || !activeSessionId)} onClick={nextResultPage} style={linkButton}>{deliveryPage.page<deliveryPage.pages?'下一页':showSaved?'下一页':filteredResults.length%LEAD_PAGE_SIZE===0?'查找下一页':'继续补充客户'}</button>
+            </nav>}
+            {!showSaved && (activeSessionId || busy) && <p aria-label="本页交付数量" style={hint}>{leadFillStatus(filteredResults.length,busy,currentDiscoveryReport?.stopReason)}</p>}
+            <EmailVerificationScope emails={visibleResults.flatMap(item=>item.emails||[])}>
+            <div className="lead-company-list">{visibleResults.map((item, index) => (
+                <LeadDeliveryCard key={leadKey(item)} item={item} openUrl={url=>void openLeadUrl(url)} retryContact={item.website ? ()=>void enrichFirstVisibleLeads([item],activeSessionId || '',searchSessions.find(s=>s.id===activeSessionId)?.productBrief,true) : undefined}
+                  selection={showSaved && <input type="checkbox" checked={selectedLeadKeys.has(leadKey(item))} onChange={() => toggleLead(item)} aria-label={`选择 ${item.companyName || "客户"}`} />}
+                  statusExtra={(() => {
                     const contacted = leadContactSummary(item);
                     return contacted ? <span title="仅作重复联系提醒，不限制再次发送" style={{ fontSize: 10.5, padding: "2px 7px", borderRadius: 999, background: "color-mix(in srgb, #2f855a 13%, transparent)", color: "#2f855a", whiteSpace: "nowrap" }}>已联系 {contacted.count} 次 · {new Date(contacted.lastAt).toLocaleDateString()}</span> : null;
                   })()}
-                </div>
-                <div style={hint}>
-                  <span style={{ display: "inline-block", marginRight: 6, padding: "1px 6px", borderRadius: 8, fontWeight: 700, color: "#fff", background: item.priorityTier === "T1" ? "#2f855a" : item.priorityTier === "T2" ? "#d97706" : "#6b7280" }}>{item.priorityTier || "T3"}</span>
-                  {(item.country) && `${item.country} · `}
-                  {item.customerType && `${item.customerType} · `}
-                  来源：{item.source || "未标注"} · {item.contactStatus === "可联系" ? "可联系客户" : "待补全联系方式"}
-                </div>
-                {item.contactStatus !== "可联系" && (
-                  <div style={{ ...hint, marginTop: 3, color: item.emailDiscoveryStatus === "failed" ? "#b42318" : "#9a6700", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                    <span>
-                      {item.emailDiscoveryStatus === "running" ? "正在从官网、公开搜索和同站页面查找邮箱…"
-                        : item.emailDiscoveryStatus === "completed" ? "本轮公开来源未找到可确认邮箱"
-                        : item.emailDiscoveryStatus === "failed" ? "邮箱补全失败"
-                        : "排队等待补全邮箱…"}
-                    </span>
-                    {item.website && (
-                      <button
-                        type="button"
-                        onClick={() => void enrichFirstVisibleLeads([item], activeSessionId || "", searchSessions.find((session) => session.id === activeSessionId)?.productBrief, true)}
-                        style={{ ...linkButton, display: "inline-flex", alignItems: "center", gap: 3, fontSize: 11 }}
-                        title="重新查找这家公司的公开邮箱"
-                      >
-                        <RefreshCw size={11} />重新查找
-                      </button>
-                    )}
-                  </div>
-                )}
-                {item.companyIntroduction && <div style={{ ...hint, marginTop: 2 }}><strong>公司介绍：</strong>{item.companyIntroduction}</div>}
-                {item.products && <div style={{ ...hint, marginTop: 2 }}><strong>主营/产品：</strong>{item.products}</div>}
-                {item.recommendationReason && <div style={{ ...hint, marginTop: 2 }}><strong>推荐理由：</strong>{item.recommendationReason}</div>}
-                {item.discoveryBasis && item.discoveryBasis.length > 0 && <div style={{ ...hint, marginTop: 2 }}><strong>找到依据：</strong>{item.discoveryBasis.join("；")}</div>}
-                {item.fitSummary && <div style={{ ...hint, marginTop: 2 }}><strong>契合度说明：</strong>{item.fitSummary}</div>}
-                {Number.isFinite(item.fitScore) && <div style={{ ...hint, marginTop: 2 }}><strong>AI 匹配度：</strong>{item.fitScore}/100</div>}
-                {item.channelSources && item.channelSources.length > 0 && <div style={{ ...hint, marginTop: 2 }}><strong>发现渠道：</strong>{item.channelSources.join("；")}</div>}
-                {item.scoreBreakdown && item.scoreBreakdown.length > 0 && <div style={{ ...hint, marginTop: 2 }}><strong>分级依据：</strong>{item.scoreBreakdown.join("；")}</div>}
-                {item.fitSignals && item.fitSignals.length > 0 && <div style={{ ...hint, marginTop: 2 }}><strong>匹配依据：</strong>{item.fitSignals.join("；")}</div>}
-                {item.unknowns && item.unknowns.length > 0 && <div style={{ ...hint, marginTop: 2, color: "#9a6700" }}><strong>仍需核实：</strong>{item.unknowns.join("；")}</div>}
-                {item.contactRoles && item.contactRoles.length > 0 && <div style={{ ...hint, marginTop: 2 }}><strong>可找联系人：</strong>{item.contactRoles.join("；")}</div>}
-                {item.tags && item.tags.length > 0 && <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 4 }}>{item.tags.map((tag) => <span key={tag} style={{ fontSize: 10, padding: "2px 6px", borderRadius: 8, background: "var(--color-bg-hover)" }}>#{tag}</span>)}</div>}
-                {item.emails && item.emails.length > 0 && (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
-                    {item.emails.slice(0, 6).map((email) => {
-                      const ev = item.emailEvidence?.find((e) => e.email === email);
-                      return (
-                        <span key={email} title={`${ev?.source ?? "公开渠道发现"}${ev?.emailType ? ` · ${ev.emailType}` : ""}${ev?.person ? `\n${ev.person}` : ""}`} style={{
-                          fontSize: 11,
-                          padding: "3px 8px",
-                          borderRadius: 10,
-                          background: "color-mix(in srgb, var(--color-accent) 10%, transparent)",
-                          color: "var(--color-accent)",
-                          display: "inline-flex",
-                          flexDirection: "column",
-                          alignItems: "flex-start",
-                          gap: 1,
-                          cursor: "help",
-                        }}>
-                          <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
-                            {email}
-                            {ev?.emailType && (
-                              <span style={{
-                                fontSize: 9,
-                                padding: "0 4px",
-                                borderRadius: 8,
-                                background: ev.emailType.includes("通用") ? "#3b82f6" : ev.emailType.includes("个人") ? "#8b5cf6" : "#64748b",
-                                color: "#fff",
-                                whiteSpace: "nowrap",
-                              }}>
-                                {ev.emailType}
-                              </span>
-                            )}
-                          </span>
-                          {ev?.person && (
-                            <span style={{ fontSize: 10, color: "var(--color-text-secondary)", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              {ev.person}
-                            </span>
-                          )}
-                          {ev?.suitability && <span style={{ fontSize: 9, color: ev.suitability.startsWith("不建议") ? "#b42318" : "var(--color-text-secondary)" }}>{ev.suitability}</span>}
-                        </span>
-                      );
-                    })}
-                    {item.emails.length > 6 && <span style={{ fontSize: 10, color: "var(--color-text-secondary)", alignSelf: "center" }}>+{item.emails.length - 6} 个</span>}
-                  </div>
-                )}
-                {item.emailEvidence && item.emailEvidence.length > 0 && (
-                  <details style={{ marginTop: 6 }}>
-                    <summary style={{ ...hint, cursor: "pointer", color: "var(--color-accent)" }}>
-                      邮箱证据与验证状态（{item.emailEvidence.length}）
-                    </summary>
-                    <div style={{ display: "grid", gap: 5, marginTop: 6 }}>
-                      {item.emailEvidence.slice(0, 10).map((evidence) => (
-                        <div key={`${evidence.email}-${evidence.sourceUrl}`} style={{ padding: "6px 8px", borderRadius: 6, background: "var(--color-bg-secondary)", fontSize: 11 }}>
-                          <strong>{evidence.email}</strong>
-                          <span style={{ marginLeft: 7, color: evidence.verification.includes("风险") ? "#b42318" : "#2f855a" }}>{evidence.verification}</span>
-                          {Number.isFinite(evidence.confidence) && <span style={{ marginLeft: 7, color: "var(--color-text-secondary)" }}>置信度 {evidence.confidence}</span>}
-                          <div style={{ color: "var(--color-text-secondary)", marginTop: 2 }}>
-                            来源：{evidence.source}
-                            {evidence.sourceUrl && <button type="button" onClick={() => void openLeadUrl(evidence.sourceUrl)} style={{ ...linkButton, display: "inline-flex", marginLeft: 6 }}>查看证据</button>}
-                          </div>
-                          {evidence.person && <div style={{ marginTop: 2 }}>联系人/职位：{evidence.person}</div>}
-                          {evidence.suitability && <div style={{ marginTop: 2, color: evidence.suitability.startsWith("不建议") ? "#b42318" : "#2f855a" }}>开发建议：{evidence.suitability}</div>}
-                        </div>
-                      ))}
-                    </div>
-                  </details>
-                )}
-                <div style={{ display: "flex", gap: 12, marginTop: 5, alignItems: "center", flexWrap: "wrap" }}>
+                  actions={<>
                   {item.website && (
                     <button type="button" onClick={() => void openLeadUrl(item.website || "")} style={linkButton}>
                       <Globe2 size={12} />{item.websiteStatus === "已核验" ? "已核验官网" : item.websiteStatus === "无法访问" ? "网址无法访问" : item.websiteStatus === "身份不匹配" ? "网址身份不匹配" : "候选网址"}
@@ -1873,18 +1697,9 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
                       <Mail size={12} />生成开发信
                     </button>
                   ) : null}
-                </div>
-              </div>
-            ))}
-          </section>
-          <section style={card}>
-            <h2 style={title}>补充信源</h2>
-            {links.map(([label, url]) => (
-              <button key={label} type="button" onClick={() => void openLeadUrl(url)} style={sourceButton}>
-                {label}<ExternalLink size={13} />
-              </button>
-            ))}
-            <p style={hint}>提单和海关数据的公司级结果因国家与平台授权不同。后续可在设置中接入用户自己的搜索/海关数据 API，届时直接汇总联系人与采购证据。</p>
+                </>} />
+            ))}</div>
+            </EmailVerificationScope>
           </section>
         </div>
       </div>
@@ -1917,7 +1732,7 @@ ${styleProfile ? `【我的写作风格档案】（在不违反用户本次调�
               </button>
             </h3>
             <p style={{ fontSize: 12.5, lineHeight: 1.6, color: "var(--color-text-secondary)", margin: "0 0 12px" }}>
-              将给当前 <strong>{visibleResults.length}</strong> 家客户的可用邮箱分别生成开发信并发送。
+              将给本页 <strong>{visibleResults.length}</strong> 家客户的可用邮箱分别生成开发信并发送。
               <br />· 同一公司会发送到所有未被明确标记为“不建议开发”的邮箱；人事、招聘、媒体、法务等明显无关邮箱会排除
               <br />· 每封之间随机间隔 60-180 秒，模拟真人节奏；可随时终止，结束后显示完成报告
               <br />· “服务器已接受”不等于最终送达；延迟退信需等待邮箱同步后确认
@@ -2249,7 +2064,6 @@ const primary: React.CSSProperties = { marginTop: 10, display: "flex", alignItem
 const secondaryButton: React.CSSProperties = { marginTop: 10, display: "flex", alignItems: "center", gap: 5, border: "1px solid var(--color-border)", borderRadius: 7, padding: "8px 12px", background: "var(--color-bg-secondary)", color: "var(--color-text-primary)", cursor: "pointer" };
 const hint: React.CSSProperties = { color: "var(--color-text-secondary)", fontSize: 12, lineHeight: 1.6 };
 const title: React.CSSProperties = { display: "flex", alignItems: "center", gap: 7, margin: "0 0 8px", fontSize: 14 };
-const sourceButton: React.CSSProperties = { width: "100%", display: "flex", justifyContent: "space-between", marginBottom: 7, padding: 9, border: "1px solid var(--color-border)", borderRadius: 7, background: "var(--color-bg-secondary)", color: "var(--color-text-primary)", cursor: "pointer" };
 const linkButton: React.CSSProperties = { display: "flex", gap: 4, alignItems: "center", border: 0, padding: "4px 0", background: "transparent", color: "var(--color-accent)", cursor: "pointer", fontSize: 12 };
 const iconButton: React.CSSProperties = { display: "inline-flex", alignItems: "center", justifyContent: "center", border: 0, padding: 5, borderRadius: 5, background: "transparent", color: "#b42318", cursor: "pointer" };
 const leadComposer: React.CSSProperties = { display: "flex", flexWrap: "wrap", gap: 8, alignItems: "flex-end", border: "2px solid var(--color-accent)", borderRadius: 12, padding: 10, background: "color-mix(in srgb, var(--color-accent) 4%, var(--color-bg-primary))", boxShadow: "0 5px 18px color-mix(in srgb, var(--color-accent) 10%, transparent)" };

@@ -1,13 +1,15 @@
-import { useState, useEffect } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
 import { useTranslation } from "react-i18next";
 import { useMailStore } from "@/stores/mail.store";
 import { useToastStore } from "@/stores/toast.store";
+import { SettingsFeedback, type SettingsNotice } from "./SettingsFeedback";
 import { listTrustedSenders, removeTrustedSender } from "@/lib/api";
 import type { TrustedSender } from "@/lib/api";
 import { profileLocalStorage } from "@/lib/profileStorage";
+import { useSavedSettingsRevision } from "@/lib/settingsChangeSignal";
 import {
   PRIVACY_MODE_KEY,
-  readStoredPrivacyMode,
+  useStoredPrivacyMode,
   type StoredPrivacyMode,
 } from "@/lib/privacyMode";
 import { Trash2 } from "lucide-react";
@@ -15,12 +17,12 @@ import { Trash2 } from "lucide-react";
 export default function PrivacyTab() {
   const { t } = useTranslation();
   const activeAccountId = useMailStore((s) => s.activeAccountId);
-  const [trustedSenders, setTrustedSenders] = useState<TrustedSender[]>([]);
-  const [privacyMode, setPrivacyMode] = useState<StoredPrivacyMode>(() =>
-    readStoredPrivacyMode(),
-  );
+  const [trustedSenders, setTrustedSenders] = useWorkspaceState<TrustedSender[]>("src/features/settings/PrivacyTab.tsx:PrivacyTab:trustedSenders", []);
+  const [removeError, setRemoveError] = useWorkspaceState<(SettingsNotice & { accountId: string; email: string }) | null>("src/features/settings/PrivacyTab.tsx:PrivacyTab:removeError", null);
+  const privacyMode = useStoredPrivacyMode();
+  const trustedSendersRevision = useSavedSettingsRevision("trustedSenders");
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/PrivacyTab.tsx:", () => {
     if (!activeAccountId) {
       setTrustedSenders((prev) => prev.length === 0 ? prev : []);
       return;
@@ -41,23 +43,25 @@ export default function PrivacyTab() {
       });
 
     return () => { cancelled = true; };
-  }, [activeAccountId, t]);
+  }, [activeAccountId, t, trustedSendersRevision]);
 
   function handlePrivacyModeChange(mode: StoredPrivacyMode) {
-    setPrivacyMode(mode);
     profileLocalStorage.setItem(PRIVACY_MODE_KEY, mode);
   }
 
   async function handleRemoveTrust(email: string) {
     if (!activeAccountId) return;
+    setRemoveError(null);
     try {
       await removeTrustedSender(activeAccountId, email);
       setTrustedSenders((prev) => prev.filter((s) => s.email !== email));
     } catch (err) {
       console.warn("Failed to remove trusted sender", err);
-      useToastStore.getState().addToast({
+      setRemoveError({
         message: t("privacy.removeTrustFailed", "Failed to remove trusted sender"),
-        type: "error",
+        kind: "error",
+        accountId: activeAccountId,
+        email,
       });
     }
   }
@@ -174,6 +178,7 @@ export default function PrivacyTab() {
                   alignItems: "center",
                   justifyContent: "space-between",
                   padding: "8px 12px",
+                  flexWrap: "wrap",
                   borderRadius: "6px",
                   border: "1px solid var(--color-border)",
                   fontSize: "13px",
@@ -207,6 +212,9 @@ export default function PrivacyTab() {
                 >
                   <Trash2 size={14} />
                 </button>
+                {removeError && removeError.accountId === activeAccountId && removeError.email === sender.email && (
+                  <div style={{ width: "100%" }}><SettingsFeedback notice={removeError} /></div>
+                )}
               </div>
             ))}
           </div>

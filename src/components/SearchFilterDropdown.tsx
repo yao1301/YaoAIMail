@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { SlidersHorizontal } from "lucide-react";
-import { useMailStore, type SearchRange } from "@/stores/mail.store";
+import { useMailStore, type SearchRange, type SearchScope } from "@/stores/mail.store";
 import type { AdvancedSearchQuery } from "@/lib/api";
 
 interface Props {
@@ -11,6 +11,9 @@ interface Props {
   onSearch: (params: { query: string; filters: AdvancedSearchQuery }) => void;
   /** 高级筛选入口（SearchView 里展开完整筛选面板）。 */
   onAdvanced?: () => void;
+  /** A search tab owns its range independently of later sidebar navigation. */
+  scope?: { activeAccountId: string | null; searchScope: SearchScope; searchRange: SearchRange };
+  onRangeChange?: (range: SearchRange) => void;
 }
 
 function startOfToday(): number {
@@ -51,12 +54,15 @@ const itemDisabledStyle: React.CSSProperties = { ...itemStyle, color: "var(--col
  * - 快速筛选：主题/发件人/收件人/正文包含关键词、仅看有附件、今天/本周/本月
  * 点条件即执行搜索（调用方跳 SearchView），无需二次确认。
  */
-export default function SearchFilterDropdown({ query, onSearch, onAdvanced }: Props) {
+export default function SearchFilterDropdown({ query, onSearch, onAdvanced, scope, onRangeChange }: Props) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const searchScope = useMailStore((s) => s.searchScope);
-  const searchRange = useMailStore((s) => s.searchRange);
-  const activeAccountId = useMailStore((s) => s.activeAccountId);
+  const globalScope = useMailStore((s) => s.searchScope);
+  const globalRange = useMailStore((s) => s.searchRange);
+  const globalAccountId = useMailStore((s) => s.activeAccountId);
+  const { searchScope, searchRange, activeAccountId } = scope ?? {
+    searchScope: globalScope, searchRange: globalRange, activeAccountId: globalAccountId,
+  };
   const q = query.trim();
 
   // 当前生效范围（与 SearchView 计算一致）
@@ -70,7 +76,8 @@ export default function SearchFilterDropdown({ query, onSearch, onAdvanced }: Pr
                 : "all";
 
   function setRange(range: SearchRange) {
-    useMailStore.getState().setSearchRange(range);
+    if (onRangeChange) onRangeChange(range);
+    else useMailStore.getState().setSearchRange(range);
     // 范围是"预设"：SearchView 的查询键包含范围，切过去/输入后搜索自然用新范围。
   }
 

@@ -9,6 +9,7 @@ use tauri::State;
 
 /// Key under which all customer memories are stored (encrypted user data KV).
 pub const CUSTOMER_MEMORIES_KEY: &str = "ai_customer_memories";
+pub(crate) static MEMORIES_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -93,6 +94,10 @@ pub struct CustomerMemory {
     #[serde(default)]
     pub follow_up_sequence_paused: bool,
     pub updated_at: i64,
+    #[serde(default)] pub profile_sources: Vec<String>,
+    #[serde(default)] pub generation_warnings: Vec<String>,
+    /// One recoverable snapshot; never recursively append old profiles to the new one.
+    #[serde(default)] pub previous_profile: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,11 +125,11 @@ pub struct CustomerMemoryInput {
     pub follow_up_sequence_paused: Option<bool>,
 }
 
-fn load_memories(state: &AppState) -> std::result::Result<Vec<CustomerMemory>, PebbleError> {
+pub(crate) fn load_memories(state: &AppState) -> std::result::Result<Vec<CustomerMemory>, PebbleError> {
     let loaded: Vec<CustomerMemory> = match state.store.get_secure_user_data(CUSTOMER_MEMORIES_KEY)? {
         Some(encrypted) => {
             let decrypted = state.crypto.decrypt(&encrypted)?;
-            serde_json::from_slice(&decrypted).unwrap_or_default()
+            serde_json::from_slice(&decrypted).map_err(|_|PebbleError::Storage("客户记录损坏，未覆盖原记录".into()))?
         }
         None => Vec::new(),
     };
@@ -171,6 +176,9 @@ fn group_company_profiles(memories: Vec<CustomerMemory>) -> Vec<CustomerMemory> 
                 existing.follow_up_sequence = memory.follow_up_sequence;
                 existing.follow_up_sequence_paused = memory.follow_up_sequence_paused;
                 existing.updated_at = memory.updated_at;
+                existing.profile_sources=memory.profile_sources;
+                existing.generation_warnings=memory.generation_warnings;
+                existing.previous_profile=memory.previous_profile;
             }
         } else {
             grouped.push(memory);
@@ -179,7 +187,7 @@ fn group_company_profiles(memories: Vec<CustomerMemory>) -> Vec<CustomerMemory> 
     grouped
 }
 
-fn save_memories(state: &AppState, memories: &[CustomerMemory]) -> std::result::Result<(), PebbleError> {
+pub(crate) fn save_memories(state: &AppState, memories: &[CustomerMemory]) -> std::result::Result<(), PebbleError> {
     let plaintext = serde_json::to_vec(memories)
         .map_err(|e| PebbleError::Internal(format!("Failed to serialize customer memories: {e}")))?;
     let encrypted = state.crypto.encrypt(&plaintext)?;
@@ -200,6 +208,10 @@ pub async fn save_customer_memory(
     state: State<'_, AppState>,
     input: CustomerMemoryInput,
 ) -> std::result::Result<CustomerMemory, PebbleError> {
+    save_customer_memory_inner(&state,input)
+}
+pub(crate) fn save_customer_memory_inner(state:&AppState,input:CustomerMemoryInput)->Result<CustomerMemory,PebbleError>{
+    let _guard=MEMORIES_WRITE_LOCK.lock().map_err(|_|PebbleError::Storage("客户记录正忙".into()))?;
     let mut memories = load_memories(&state)?;
     let now = now_timestamp();
     let email = input.email.trim().to_string();
@@ -214,7 +226,7 @@ pub async fn save_customer_memory(
         .or_else(|| memories.iter().find(|m| m.email == email).map(|m| m.id.clone()))
         .unwrap_or_else(new_id);
 
-    let saved = CustomerMemory {
+    let mut saved = CustomerMemory {
         id: id.clone(),
         email: email.clone(),
         name: input.name.clone().unwrap_or_default(),
@@ -238,10 +250,16 @@ pub async fn save_customer_memory(
         follow_up_sequence: input.follow_up_sequence.clone().unwrap_or_default(),
         follow_up_sequence_paused: input.follow_up_sequence_paused.unwrap_or(false),
         updated_at: now,
+        profile_sources: Vec::new(), generation_warnings: Vec::new(), previous_profile: String::new(),
     };
 
     match memories.iter_mut().find(|m| m.id == id) {
         Some(existing) => {
+            saved.message_count=existing.message_count;
+            saved.contacts=existing.contacts.clone();
+            saved.profile_sources=existing.profile_sources.clone();
+            saved.generation_warnings=existing.generation_warnings.clone();
+            saved.previous_profile=existing.previous_profile.clone();
             existing.name = saved.name.clone();
             existing.company = saved.company.clone();
             existing.summary = saved.summary.clone();
@@ -256,9 +274,10 @@ pub async fn save_customer_memory(
             existing.account_ids = saved.account_ids.clone();
             existing.follow_up_sequence = saved.follow_up_sequence.clone();
             existing.follow_up_sequence_paused = saved.follow_up_sequence_paused;
-            if !existing.contacts.iter().any(|contact| contact.email.eq_ignore_ascii_case(&email)) {
-                existing.contacts.push(saved.contacts[0].clone());
+            if !saved.contacts.iter().any(|contact| contact.email.eq_ignore_ascii_case(&email)) {
+                saved.contacts.push(CustomerProfileContact{email:email.clone(),name:saved.name.clone(),job_title:String::new()});
             }
+            existing.contacts=saved.contacts.clone();
             existing.updated_at = now;
         }
         None => memories.push(saved.clone()),
@@ -274,6 +293,7 @@ pub async fn delete_customer_memory(
     state: State<'_, AppState>,
     id: String,
 ) -> std::result::Result<Vec<CustomerMemory>, PebbleError> {
+    let _guard=MEMORIES_WRITE_LOCK.lock().map_err(|_|PebbleError::Storage("客户记录正忙".into()))?;
     let mut memories = load_memories(&state)?;
     memories.retain(|m| m.id != id);
     save_memories(&state, &memories)?;
@@ -283,15 +303,16 @@ pub async fn delete_customer_memory(
 /// Loose shape we ask the LLM to return. Everything optional so a partial or
 /// slightly-off response still degrades gracefully.
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all="camelCase")]
 struct LlmMemory {
     name: Option<String>,
     company: Option<String>,
     role: Option<String>,
     country: Option<String>,
     products: Option<Vec<String>>,
-    key_facts: Option<Vec<String>>,
+    #[serde(alias="key_facts")] key_facts: Option<Vec<String>>,
     relationship: Option<String>,
-    last_topics: Option<String>,
+    #[serde(alias="last_topics")] last_topics: Option<String>,
     tags: Option<Vec<String>>,
 }
 
@@ -309,17 +330,15 @@ pub async fn build_customer_memory(
     if email.is_empty() {
         return Err(PebbleError::Internal("客户邮箱不能为空".to_string()));
     }
-    let email_lc = email.to_lowercase();
-
-    // 1) Find messages involving this contact via the full-text index.
-    let search = state.search.clone();
-    let q = email.clone();
-    let hits = tokio::task::spawn_blocking(move || search.search(&q, (limit as usize) * 3 + 10))
-        .await
-        .map_err(|e| PebbleError::Internal(format!("Search task join error: {e}")))??;
-
-    let ids: Vec<String> = hits.iter().map(|h| h.message_id.clone()).collect();
-    let messages = state.store.get_messages_batch(&ids)?;
+    // Compatibility entry point: use the same exact, account-scoped mail
+    // retrieval as unified refresh, never depend on full-text index coverage.
+    let memories=load_memories(&state)?;
+    let previous=memories.iter().find(|m|m.email.eq_ignore_ascii_case(&email)||m.contacts.iter().any(|c|c.email.eq_ignore_ascii_case(&email)));
+    let mut scope=previous.map(|m|m.account_ids.clone()).unwrap_or_default();
+    if scope.is_empty(){let accounts=state.store.list_accounts()?;if accounts.len()==1{scope.push(accounts[0].id.clone());}}
+    if scope.is_empty(){return Err(PebbleError::Validation("请先在客户管理选择关联账号".into()));}
+    let mut emails=vec![email.clone()];if let Some(m)=previous{emails.extend(m.contacts.iter().map(|c|c.email.clone()));}
+    let messages=state.store.list_customer_correspondence(&emails,&scope,(limit as usize).clamp(1,500))?;
 
     // 2) Keep only messages where the contact is sender or recipient.
     //    尽量覆盖全部往来邮件（corpus 上限放宽，不再只分析几封）。
@@ -327,21 +346,16 @@ pub async fn build_customer_memory(
     let mut kept = 0usize;
     let mut account_ids: Vec<String> = Vec::new();
     for m in messages {
-        let involves = m.from_address.to_lowercase() == email_lc
-            || m.to_list
-                .iter()
-                .any(|a| a.address.to_lowercase() == email_lc);
-        if !involves {
-            continue;
-        }
         if !account_ids.contains(&m.account_id) {
             account_ids.push(m.account_id.clone());
         }
-        let body = m.body_text.trim();
+        let body=super::mail_assistant::body_text(&m);
+        let body=body.trim();
         if body.len() < 20 {
             continue;
         }
-        corpus.push_str(&format!("主题: {}\n{}\n\n", m.subject, body));
+        let excerpt=body.chars().take(2400).collect::<String>();
+        corpus.push_str(&format!("日期:{}\n主题: {}\n{}\n\n",m.date,m.subject,excerpt));
         kept += 1;
         if corpus.len() >= 30_000 {
             break;
@@ -376,7 +390,7 @@ language as the emails (usually Chinese), keep product/company names verbatim.";
     );
 
     let raw = TranslateService::complete_with_proxy(&cfg, proxy.as_ref(), &system, &user).await?;
-    let parsed = parse_memory_json(&raw);
+    let parsed = parse_memory_json(&raw)?;
 
     let name = parsed.name.clone().unwrap_or_default();
     let company = parsed.company.clone().unwrap_or_default();
@@ -402,6 +416,7 @@ language as the emails (usually Chinese), keep product/company names verbatim.";
     }
 
     // 4) Upsert by company where possible, preserving each person's role.
+    let _guard=MEMORIES_WRITE_LOCK.lock().map_err(|_|PebbleError::Storage("客户记录正忙".into()))?;
     let mut memories = load_memories(&state)?;
     let id = memories
         .iter()
@@ -438,6 +453,7 @@ language as the emails (usually Chinese), keep product/company names verbatim.";
         follow_up_sequence: Vec::new(),
         follow_up_sequence_paused: false,
         updated_at: now_timestamp(),
+        profile_sources: Vec::new(), generation_warnings: Vec::new(), previous_profile: String::new(),
     };
 
     match memories.iter_mut().find(|m| m.id == id) {
@@ -448,7 +464,9 @@ language as the emails (usually Chinese), keep product/company names verbatim.";
             } else {
                 saved.contacts.push(contact);
             }
-            saved.message_count += existing.message_count;
+            saved.profile_sources=existing.profile_sources.clone();
+            saved.generation_warnings=existing.generation_warnings.clone();
+            saved.previous_profile=existing.profile.clone();
             saved.source = existing.source.clone();
             saved.status = existing.status.clone();
             saved.stage = existing.stage.clone();
@@ -483,12 +501,16 @@ fn load_active_provider_config(
 }
 
 /// Extract the first JSON object from an LLM reply (tolerant of ```json fences).
-fn parse_memory_json(raw: &str) -> LlmMemory {
+fn parse_memory_json(raw: &str) -> Result<LlmMemory,PebbleError> {
     let text = raw.trim();
     let start = text.find('{').unwrap_or(0);
     let end = text.rfind('}').map(|i| i + 1).unwrap_or(text.len());
     let json = &text[start..end];
-    serde_json::from_str::<LlmMemory>(json).unwrap_or_default()
+    let parsed=serde_json::from_str::<LlmMemory>(json).map_err(|_|PebbleError::Validation("模型未返回有效画像结构，旧画像已保留".into()))?;
+    if parsed.key_facts.as_ref().is_none_or(|v|v.iter().all(|s|s.trim().is_empty())) && parsed.last_topics.as_deref().unwrap_or_default().trim().is_empty(){
+        return Err(PebbleError::Validation("模型没有提取有效往来信息，旧画像已保留".into()))
+    }
+    Ok(parsed)
 }
 
 fn build_summary(m: &LlmMemory, email: &str) -> String {
@@ -561,6 +583,30 @@ fn build_profile_text(m: &LlmMemory) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_state()->AppState{
+        let root=std::env::temp_dir().join(format!("customer-memory-test-{}",new_id()));std::fs::create_dir(&root).unwrap();
+        let key=root.join("portable-key");std::fs::write(&key,format!("PEBBLE-PORTABLE-KEY-V1\n{}\n","42".repeat(32))).unwrap();
+        let crypto=pebble_crypto::CryptoService::init_for_profile(&root).unwrap();std::fs::remove_file(&key).unwrap();std::fs::remove_dir(&root).unwrap();
+        let(tx,_)=std::sync::mpsc::channel();AppState::new(pebble_store::Store::open_in_memory().unwrap(),pebble_search::TantivySearch::open_in_memory().unwrap(),crypto,tx,root)
+    }
+    #[test]fn manual_save_preserves_real_mail_count_aliases_sources_and_previous_snapshot(){
+        let state=fixture_state();let mut m=memory("a","buyer@sample.invalid","Sample Buyer","Sample Ltd",10);
+        m.message_count=26;m.profile_sources=vec!["https://sample.invalid/about".into()];m.previous_profile="Previous profile".into();m.contacts.push(CustomerProfileContact{email:"colleague@sample.invalid".into(),name:"Colleague".into(),job_title:"Manager".into()});
+        save_memories(&state,&[m.clone()]).unwrap();
+        let input:CustomerMemoryInput=serde_json::from_value(serde_json::json!({"id":"a","email":m.email,"name":"Updated name","company":m.company,"profile":"Manual correction","accountIds":["account-a"]})).unwrap();
+        let saved=save_customer_memory_inner(&state,input).unwrap();
+        assert_eq!(saved.message_count,26);assert_eq!(saved.contacts.len(),2);assert_eq!(saved.previous_profile,"Previous profile");assert_eq!(saved.profile_sources,m.profile_sources);
+        let loaded=load_memories(&state).unwrap();assert_eq!(loaded[0].message_count,26);assert_eq!(loaded[0].profile,"Manual correction");
+    }
+    #[test]fn corrupt_customer_records_fail_closed_without_overwriting_private_data(){
+        let state=fixture_state();let bytes=state.crypto.encrypt(b"not valid JSON").unwrap();state.store.set_secure_user_data(CUSTOMER_MEMORIES_KEY,&bytes).unwrap();
+        let input:CustomerMemoryInput=serde_json::from_value(serde_json::json!({"email":"buyer@sample.invalid"})).unwrap();assert!(save_customer_memory_inner(&state,input).is_err());assert_eq!(state.store.get_secure_user_data(CUSTOMER_MEMORIES_KEY).unwrap().unwrap(),bytes);
+    }
+    #[test]fn camel_case_model_fields_are_not_lost_and_bad_output_never_becomes_success(){
+        let parsed=parse_memory_json(r#"{"name":"Sample Buyer","keyFacts":["Asked for a quotation"],"lastTopics":"Delivery date"}"#).unwrap();
+        assert!(build_profile_text(&parsed).contains("Asked for a quotation"));assert!(build_summary(&parsed,"buyer@sample.invalid").contains("Delivery date"));
+        for raw in ["not json","{}",r#"{"company":"Sample Company"}"#]{assert!(parse_memory_json(raw).is_err());}
+    }
 
     fn memory(id: &str, email: &str, name: &str, company: &str, updated_at: i64) -> CustomerMemory {
         CustomerMemory {
@@ -583,6 +629,7 @@ mod tests {
             follow_up_sequence: Vec::new(),
             follow_up_sequence_paused: false,
             updated_at,
+            profile_sources: Vec::new(), generation_warnings: Vec::new(), previous_profile: String::new(),
         }
     }
 

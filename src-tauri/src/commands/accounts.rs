@@ -1,6 +1,6 @@
 use crate::account_colors::default_account_color;
 use crate::commands::network::{
-    account_proxy_setting_from_parts, get_global_proxy_raw, http_proxy_from_mail_proxy,
+    account_proxy_setting_from_parts, get_mail_proxy_raw, http_proxy_from_mail_proxy,
     is_inherit_proxy_mode, mail_proxy_from_http, normalize_account_proxy_setting,
     proxy_config_from_parts, resolve_effective_proxy, resolve_mail_proxy_from_mode,
     AccountProxyMode, AccountProxySetting,
@@ -47,8 +47,11 @@ struct StoredAccountCredentials {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredMailConfig {
+    #[serde(default)]
     host: String,
+    #[serde(default)]
     port: u16,
+    #[serde(default)]
     username: String,
     #[serde(default)]
     password: String,
@@ -290,6 +293,10 @@ pub struct AddAccountRequest {
     #[serde(default)]
     pub accept_invalid_certs: bool,
     #[serde(default)]
+    pub imap_accept_invalid_certs: Option<bool>,
+    #[serde(default)]
+    pub smtp_accept_invalid_certs: Option<bool>,
+    #[serde(default)]
     pub allow_plaintext: bool,
     #[serde(default)]
     pub proxy_host: Option<String>,
@@ -385,7 +392,7 @@ pub async fn add_account(
                 username: username.clone(),
                 password: request.password.clone(),
                 security: request.imap_security,
-                accept_invalid_certs: request.accept_invalid_certs,
+                accept_invalid_certs: request.imap_accept_invalid_certs.unwrap_or(request.accept_invalid_certs),
                 proxy: proxy.clone(),
             },
             smtp: SmtpConfig {
@@ -394,7 +401,7 @@ pub async fn add_account(
                 username,
                 password: request.password,
                 security: request.smtp_security,
-                accept_invalid_certs: request.accept_invalid_certs,
+                accept_invalid_certs: request.smtp_accept_invalid_certs.unwrap_or(request.accept_invalid_certs),
                 proxy,
             },
             allow_plaintext: request.allow_plaintext,
@@ -448,8 +455,16 @@ pub async fn update_account(
     proxy_host: Option<String>,
     proxy_port: Option<u16>,
     account_color: Option<String>,
+    imap_username: Option<String>,
+    smtp_username: Option<String>,
+    sender_name: Option<String>,
+    certificate_exceptions: Option<CertificateExceptions>,
 ) -> std::result::Result<(), PebbleError> {
+    let _identity_guard = state.account_identity_lock.lock().await;
     validate_account_color(account_color.as_deref())?;
+    let exceptions = certificate_exceptions.unwrap_or_default();
+    let incoming_exception = exceptions.incoming.or(accept_invalid_certs);
+    let outgoing_exception = exceptions.outgoing.or(accept_invalid_certs);
 
     let credentials_dirty = password.is_some()
         || imap_host.is_some()
@@ -458,13 +473,16 @@ pub async fn update_account(
         || smtp_port.is_some()
         || imap_security.is_some()
         || smtp_security.is_some()
-        || accept_invalid_certs.is_some()
+        || incoming_exception.is_some()
+        || outgoing_exception.is_some()
         || proxy_host.is_some()
-        || proxy_port.is_some();
+        || proxy_port.is_some()
+        || imap_username.is_some()
+        || smtp_username.is_some();
     if !credentials_dirty {
         state
             .store
-            .update_account(&account_id, &email, &display_name, account_color.as_deref())?;
+            .update_account_with_sender(&account_id, &email, &display_name, account_color.as_deref(), sender_name.as_deref())?;
         return Ok(());
     }
 
@@ -529,7 +547,7 @@ pub async fn update_account(
     if let Some(sec) = imap_security {
         creds.imap.security = sec;
     }
-    if let Some(accept_invalid_certs) = accept_invalid_certs {
+    if let Some(accept_invalid_certs) = incoming_exception {
         creds.imap.accept_invalid_certs = accept_invalid_certs;
     }
     if let Some(proxy) = &updated_proxy {
@@ -540,7 +558,11 @@ pub async fn update_account(
         };
         creds.imap.proxy = proxy.clone();
     }
-    creds.imap.username = resolve_username(&creds.imap.username, &email);
+    if let Some(username) = imap_username {
+        creds.imap.username = username.trim().to_string();
+    } else {
+        creds.imap.username = resolve_username(&creds.imap.username, &email);
+    }
 
     // SMTP side
     if let Some(h) = smtp_host {
@@ -555,14 +577,18 @@ pub async fn update_account(
     if let Some(sec) = smtp_security {
         creds.smtp.security = sec;
     }
-    if let Some(accept_invalid_certs) = accept_invalid_certs {
+    if let Some(accept_invalid_certs) = outgoing_exception {
         creds.smtp.accept_invalid_certs = accept_invalid_certs;
     }
     // Mirror incoming proxy to SMTP; both connections share the same network path.
     if let Some(proxy) = updated_proxy {
         creds.smtp.proxy = proxy;
     }
-    creds.smtp.username = resolve_username(&creds.smtp.username, &email);
+    if let Some(username) = smtp_username {
+        creds.smtp.username = username.trim().to_string();
+    } else {
+        creds.smtp.username = resolve_username(&creds.smtp.username, &email);
+    }
 
     // `allow_plaintext` is set only at account creation; it is preserved here by
     // the deserialize→serialize round-trip of the stored credentials, so an
@@ -588,7 +614,7 @@ pub async fn update_account(
 
     state
         .store
-        .update_account(&account_id, &email, &display_name, account_color.as_deref())?;
+        .update_account_with_sender(&account_id, &email, &display_name, account_color.as_deref(), sender_name.as_deref())?;
 
     let config_bytes = serialize_account_credentials(&creds)?;
     let encrypted = state.crypto.encrypt(&config_bytes)?;
@@ -604,6 +630,7 @@ pub async fn update_account(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountDetails {
+    pub sender_name: String,
     pub email: String,
     pub display_name: String,
     pub color: Option<String>,
@@ -621,10 +648,13 @@ pub struct AccountDetails {
     pub proxy_mode: String,
     pub proxy_host: String,
     pub proxy_port: u16,
+    pub password_configured: bool,
 }
 
 fn credentials_to_details(creds: AccountCredentials) -> AccountDetails {
+    let password_configured = !creds.imap.password.is_empty() || !creds.smtp.password.is_empty();
     AccountDetails {
+        sender_name: String::new(),
         email: String::new(),
         display_name: String::new(),
         color: None,
@@ -655,6 +685,7 @@ fn credentials_to_details(creds: AccountCredentials) -> AccountDetails {
             .as_ref()
             .map(|p| p.port)
             .unwrap_or_default(),
+        password_configured,
     }
 }
 
@@ -668,35 +699,16 @@ pub async fn get_account_details(
         .get_account(&account_id)?
         .ok_or_else(|| PebbleError::Internal(format!("Account not found: {account_id}")))?;
 
-    let mut details = match state.store.get_auth_data(&account_id)? {
+    // OAuth auth_data contains tokens, not IMAP/SMTP credentials.
+    let auth_data = if matches!(account.provider, ProviderType::Gmail | ProviderType::Outlook) { None } else { state.store.get_auth_data(&account_id)? };
+    let mut details = match auth_data {
         Some(encrypted) => {
             let decrypted = state.crypto.decrypt(&encrypted)
                 .map_err(|e| PebbleError::Internal(format!("decrypt failed: {e}")))?;
-            match deserialize_account_credentials(&decrypted) {
-                Ok(creds) => credentials_to_details(creds),
-                Err(_) => credentials_to_details(AccountCredentials {
-                    proxy_mode: AccountProxyMode::Inherit,
-                    imap: ImapConfig {
-                        host: String::new(),
-                        port: 0,
-                        username: String::new(),
-                        password: String::new(),
-                        security: ConnectionSecurity::default(),
-                        accept_invalid_certs: false,
-                        proxy: None,
-                    },
-                    smtp: SmtpConfig {
-                        host: String::new(),
-                        port: 0,
-                        username: String::new(),
-                        password: String::new(),
-                        security: ConnectionSecurity::default(),
-                        accept_invalid_certs: false,
-                        proxy: None,
-                    },
-                    allow_plaintext: false,
-                }),
-            }
+            // Do not turn a decode failure into a convincing-looking blank
+            // form. The edit dialog reports the error so the user knows that
+            // the stored settings could not be read.
+            credentials_to_details(deserialize_account_credentials(&decrypted)?)
         }
         None => credentials_to_details(AccountCredentials {
             proxy_mode: AccountProxyMode::Inherit,
@@ -722,6 +734,7 @@ pub async fn get_account_details(
         }),
     };
 
+    details.sender_name = state.store.account_sender_name(&account_id)?;
     details.email = account.email;
     details.display_name = account.display_name;
     details.color = account.color;
@@ -897,7 +910,7 @@ pub async fn test_imap_connection(
     )?;
     let proxy = resolve_effective_proxy(
         requested_proxy,
-        get_global_proxy_raw(&state.crypto, &state.store)?,
+        get_mail_proxy_raw(&state.crypto, &state.store)?,
     )
     .map(mail_proxy_from_http);
     let password = request.password.unwrap_or_default();
@@ -941,7 +954,7 @@ pub async fn test_pop3_connection(
     )?;
     let proxy = resolve_effective_proxy(
         requested_proxy,
-        get_global_proxy_raw(&state.crypto, &state.store)?,
+        get_mail_proxy_raw(&state.crypto, &state.store)?,
     )
     .map(mail_proxy_from_http);
     let username = request.username.unwrap_or_default();
@@ -967,6 +980,7 @@ pub async fn test_pop3_connection(
 pub async fn test_account_connection(
     state: State<'_, AppState>,
     account_id: String,
+    strict_tls: Option<bool>,
 ) -> std::result::Result<String, PebbleError> {
     let account = state
         .store
@@ -978,9 +992,9 @@ pub async fn test_account_connection(
         let provider = GmailProvider::new_with_proxy(auth.tokens.access_token, auth.proxy)?;
         let (email, _history_id) = provider.get_profile().await?;
         if email.is_empty() {
-            return Ok("Gmail connection successful".to_string());
+            return Ok("Gmail API 连接通过；未发送测试邮件，未验证实际发件投递".to_string());
         }
-        return Ok(format!("Gmail connection successful ({email})"));
+        return Ok(format!("Gmail API 连接通过（{email}）；未发送测试邮件，未验证实际发件投递"));
     }
 
     if matches!(account.provider, ProviderType::Outlook) {
@@ -993,34 +1007,9 @@ pub async fn test_account_connection(
         // Graph connectivity check: list mail folders.
         let folders = provider.list_folders().await?;
         return Ok(format!(
-            "Outlook connection successful ({} folders)",
+            "Outlook API 连接通过（{} 个文件夹）；未发送测试邮件，未验证实际发件投递",
             folders.len()
         ));
-    }
-
-    if matches!(account.provider, ProviderType::Pop3) {
-        let existing = state
-            .store
-            .get_auth_data(&account_id)?
-            .ok_or_else(|| PebbleError::Internal("No auth data found".into()))?;
-        let decrypted = state.crypto.decrypt(&existing)?;
-        let credentials = deserialize_account_credentials(&decrypted)?;
-        let proxy = resolve_mail_proxy_from_mode(
-            &state.crypto,
-            &state.store,
-            credentials.proxy_mode,
-            credentials.imap.proxy.clone(),
-        )?;
-        let config = Pop3Config {
-            host: credentials.imap.host,
-            port: credentials.imap.port,
-            username: credentials.imap.username,
-            password: credentials.imap.password,
-            security: credentials.imap.security,
-            accept_invalid_certs: credentials.imap.accept_invalid_certs,
-            proxy,
-        };
-        return Pop3Provider::test_connection(&config).await;
     }
 
     let existing = state
@@ -1035,7 +1024,87 @@ pub async fn test_account_connection(
         credentials.proxy_mode,
         credentials.imap.proxy.clone(),
     )?;
-    pebble_mail::ImapProvider::test_connection_with_login(&credentials.imap).await
+    let strict = strict_tls.unwrap_or(false);
+    if strict {
+        credentials.imap.accept_invalid_certs = false;
+    }
+    let smtp = super::compose::load_smtp_config(&state.store, &state.crypto, &account_id)?;
+    let smtp_plain = smtp.security == ConnectionSecurity::Plain;
+    let smtp_exception = !strict && smtp.accept_invalid_certs;
+    let sender = pebble_mail::smtp::SmtpSender::new(smtp.host, smtp.port, smtp.username,
+        smtp.password, smtp.security, smtp_exception, smtp.proxy);
+    let incoming = async {
+        if strict && credentials.imap.security == ConnectionSecurity::Plain {
+            return Err(PebbleError::Validation("请先把收件连接设置为 SSL/TLS 或 STARTTLS".into()));
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+            if matches!(account.provider, ProviderType::Pop3) {
+                let c = &credentials.imap;
+                Pop3Provider::test_connection(&Pop3Config { host: c.host.clone(), port: c.port,
+                    username: c.username.clone(), password: c.password.clone(), security: c.security.clone(),
+                    accept_invalid_certs: c.accept_invalid_certs, proxy: c.proxy.clone() }).await
+            } else {
+                pebble_mail::ImapProvider::test_connection_with_login(&credentials.imap).await
+            }
+        }).await;
+        result.unwrap_or_else(|_| Err(PebbleError::Network("收件连接测试超时（25 秒）".into())))
+    };
+    let outgoing = async {
+        if strict && smtp_plain {
+            return Err(PebbleError::Validation("请先把发件连接设置为 SSL/TLS 或 STARTTLS".into()));
+        }
+        sender.test_connection().await
+    };
+    let (incoming, outgoing) = tokio::join!(incoming, outgoing);
+    let with_policy = |message: String, exception: bool| {
+        if exception { format!("{message}（已跳过证书验证）") } else { message }
+    };
+    connection_test_report(
+        incoming.map(|message| with_policy(message, credentials.imap.accept_invalid_certs)),
+        outgoing.map(|message| with_policy(message, smtp_exception)),
+    )
+}
+
+#[derive(Default, Deserialize)]
+pub struct CertificateExceptions {
+    incoming: Option<bool>,
+    outgoing: Option<bool>,
+}
+
+fn connection_test_report(incoming: Result<String, PebbleError>, outgoing: Result<String, PebbleError>) -> Result<String, PebbleError> {
+    let ok = incoming.is_ok() && outgoing.is_ok();
+    let line = |label: &str, result: Result<String, PebbleError>| match result {
+        Ok(message) => format!("{label}：通过 — {message}"),
+        Err(error) => format!("{label}：失败 — {error}"),
+    };
+    let report = format!("{}\n{}", line("收件", incoming), line("发件 SMTP", outgoing));
+    if ok { Ok(report) } else { Err(PebbleError::Network(report)) }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TestSmtpConnectionRequest {
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_security: ConnectionSecurity,
+    pub username: String,
+    pub password: String,
+    pub email: String,
+    #[serde(default)] pub proxy_host: Option<String>,
+    #[serde(default)] pub proxy_port: Option<u16>,
+    #[serde(default)] pub accept_invalid_certs: bool,
+    #[serde(default)] pub allow_plaintext: bool,
+}
+
+#[tauri::command]
+pub async fn test_smtp_connection(state: State<'_, AppState>, request: TestSmtpConnectionRequest) -> Result<String, PebbleError> {
+    validate_connection_security("SMTP", &request.smtp_host, &request.smtp_security, request.allow_plaintext)?;
+    let proxy = resolve_effective_proxy(proxy_config_from_parts(request.proxy_host, request.proxy_port, "SMTP test proxy")?,
+        get_mail_proxy_raw(&state.crypto, &state.store)?).map(mail_proxy_from_http);
+    if request.password.is_empty() { return Err(PebbleError::Validation("SMTP 测试需要密码或授权码".into())); }
+    let sender = pebble_mail::smtp::SmtpSender::new(request.smtp_host, request.smtp_port,
+        resolve_username(&request.username, &request.email), request.password, request.smtp_security,
+        request.accept_invalid_certs, proxy);
+    sender.test_connection().await
 }
 
 #[tauri::command]

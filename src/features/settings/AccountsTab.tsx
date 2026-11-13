@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
+import { useEffect, useMemo, useRef } from "react";
 import { Plus, Trash2, Mail, Pencil, Plug, RefreshCw } from "lucide-react";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import { useTranslation } from "react-i18next";
@@ -31,6 +32,9 @@ import { listEmailSignatures, saveEmailSignature, deleteEmailSignature, setDefau
 import SignatureEditor from "./SignatureEditor";
 import { ACCOUNT_COLOR_PRESETS, assignAccountColors, getAccountColor } from "@/lib/accountColors";
 import { inputStyle, labelStyle } from "../../styles/form";
+import { defaultIncomingPort, defaultSmtpPort } from "@/lib/mailPorts";
+import { findMailServerPreset } from "@/lib/mailAccountPresets";
+import { explainMailConnectionReport } from "@/lib/mailConnectionTest";
 import {
   getAccountSyncPreference,
   setAccountSyncPreference,
@@ -53,13 +57,12 @@ export default function AccountsTab() {
   const globalRealtimeMode = useUIStore((state) => state.realtimeMode);
   const focusAccountId = useUIStore((s) => s.focusAccountId);
   const setFocusAccountId = useUIStore((s) => s.setFocusAccountId);
-  const [showSetup, setShowSetup] = useState(false);
-  const [editingAccount, setEditingAccount] = useState<Account | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<{ id: string; email: string } | null>(null);
-  const [testingId, setTestingId] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<{ id: string; ok: boolean; message: string } | null>(null);
-  const [changingSyncId, setChangingSyncId] = useState<string | null>(null);
-  const [, setSyncPreferenceVersion] = useState(0);
+  const [showSetup, setShowSetup] = useWorkspaceState("src/features/settings/AccountsTab.tsx:AccountsTab:showSetup", false);
+  const [editingAccount, setEditingAccount] = useWorkspaceState<Account | null>("src/features/settings/AccountsTab.tsx:AccountsTab:editingAccount", null);
+  const [deleteTarget, setDeleteTarget] = useWorkspaceState<{ id: string; email: string } | null>("src/features/settings/AccountsTab.tsx:AccountsTab:deleteTarget", null);
+  const [accountTests, setAccountTests] = useWorkspaceState<Record<string, { ok: boolean; message: string } | "testing" | undefined>>("src/features/settings/AccountsTab.tsx:AccountsTab:accountTests", {});
+  const [changingSyncId, setChangingSyncId] = useWorkspaceState<string | null>("src/features/settings/AccountsTab.tsx:AccountsTab:changingSyncId", null);
+  const [, setSyncPreferenceVersion] = useWorkspaceState("src/features/settings/AccountsTab.tsx:AccountsTab:setSyncPreferenceVersion", 0);
 
   // When the sidebar's account context menu picks "账户设置", open the edit
   // dialog directly for that account.
@@ -73,16 +76,17 @@ export default function AccountsTab() {
   }, [focusAccountId, accounts, setFocusAccountId]);
 
   async function doTestConnection(accountId: string) {
-    setTestingId(accountId);
-    setTestResult(null);
+    setAccountTests((current) => ({ ...current, [accountId]: "testing" }));
     try {
       const report = await testAccountConnection(accountId);
-      setTestResult({ id: accountId, ok: true, message: report });
+      setAccountTests((current) => ({ ...current, [accountId]: { ok: true, message: report } }));
     } catch (err) {
       const msg = extractErrorMessage(err);
-      setTestResult({ id: accountId, ok: false, message: msg });
-    } finally {
-      setTestingId(null);
+      const details = await getAccountDetails(accountId).catch(() => null);
+      const preset = details && details.provider === "imap"
+        ? findMailServerPreset(details.email, details.imapHost, details.smtpHost)
+        : undefined;
+      setAccountTests((current) => ({ ...current, [accountId]: { ok: false, message: explainMailConnectionReport(msg, preset) } }));
     }
   }
 
@@ -126,7 +130,7 @@ export default function AccountsTab() {
   }
 
   return (
-    <div>
+        <div>
       {/* Section header */}
       <div
         style={{
@@ -213,6 +217,8 @@ export default function AccountsTab() {
             const realtimeStatus = realtimeStatusByAccount[account.id];
             const realtimeLabel = getAccountRealtimeStatusText(realtimeStatus, t);
             const accountColor = accountColorsById.get(account.id) ?? getAccountColor(account);
+            const testResult = accountTests[account.id];
+            const testing = testResult === "testing";
 
             return (
               <div
@@ -221,6 +227,7 @@ export default function AccountsTab() {
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "space-between",
+                  flexWrap: "wrap",
                   padding: "14px 16px",
                   backgroundColor: "var(--color-bg)",
                   borderTop: index > 0 ? "1px solid var(--color-border)" : "none",
@@ -287,7 +294,7 @@ export default function AccountsTab() {
                 <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
                   <button
                     onClick={() => doTestConnection(account.id)}
-                    disabled={testingId === account.id}
+                    disabled={testing}
                     title={t("accountSetup.testConnection", "Test Connection")}
                     aria-label={t("accountSetup.testConnection", "Test Connection")}
                     style={{
@@ -297,18 +304,18 @@ export default function AccountsTab() {
                       borderRadius: "6px",
                       border: "none",
                       backgroundColor: "transparent",
-                      color: testingId === account.id ? "var(--color-accent)" : "var(--color-text-secondary)",
-                      cursor: testingId === account.id ? "wait" : "pointer",
-                      opacity: testingId === account.id ? 0.6 : 1,
+                      color: testing ? "var(--color-accent)" : "var(--color-text-secondary)",
+                      cursor: testing ? "wait" : "pointer",
+                      opacity: testing ? 0.6 : 1,
                     }}
                     onMouseEnter={(e) => {
-                      if (testingId !== account.id) {
+                      if (!testing) {
                         e.currentTarget.style.color = "var(--color-accent)";
                         e.currentTarget.style.backgroundColor = "var(--color-bg-hover)";
                       }
                     }}
                     onMouseLeave={(e) => {
-                      if (testingId !== account.id) {
+                      if (!testing) {
                         e.currentTarget.style.color = "var(--color-text-secondary)";
                         e.currentTarget.style.backgroundColor = "transparent";
                       }
@@ -367,29 +374,26 @@ export default function AccountsTab() {
                     <Trash2 size={15} />
                   </button>
                 </div>
+                {testResult && testResult !== "testing" && (
+                  <div role={testResult.ok ? "status" : "alert"} style={{
+                    flex: "0 0 100%",
+                    boxSizing: "border-box",
+                    marginTop: "8px",
+                    padding: "8px 11px",
+                    borderRadius: "6px",
+                    backgroundColor: testResult.ok ? "rgba(34,197,94,0.1)" : "rgba(239,68,68,0.1)",
+                    color: testResult.ok ? "var(--color-text-primary)" : "var(--color-error, #dc2626)",
+                    fontSize: "12px",
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
+                    lineHeight: 1.5,
+                  }}>
+                    {testResult.message}
+                  </div>
+                )}
               </div>
             );
           })}
-        </div>
-      )}
-
-      {/* Test result */}
-      {testResult && (
-        <div
-          style={{
-            marginTop: "10px",
-            padding: "10px 12px",
-            borderRadius: "6px",
-            backgroundColor: testResult.ok ? "rgba(34,197,94,0.1)" : "rgba(239,68,68,0.1)",
-            border: `1px solid ${testResult.ok ? "rgba(34,197,94,0.3)" : "rgba(239,68,68,0.3)"}`,
-            color: testResult.ok ? "#22c55e" : "#ef4444",
-            fontSize: "12px",
-            whiteSpace: "pre-wrap",
-            fontFamily: "monospace",
-            lineHeight: 1.5,
-          }}
-        >
-          {testResult.message}
         </div>
       )}
 
@@ -464,31 +468,43 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
   const queryClient = useQueryClient();
   const dialogRef = useRef<HTMLDivElement>(null);
   const emailInputRef = useRef<HTMLInputElement>(null);
-  const [displayName, setDisplayName] = useState(account.display_name);
-  const [email, setEmail] = useState(account.email);
-  const [accountColor, setAccountColor] = useState(initialColor);
-  const [password, setPassword] = useState("");
-  const [imapHost, setImapHost] = useState("");
-  const [imapPort, setImapPort] = useState("");
-  const [smtpHost, setSmtpHost] = useState("");
-  const [smtpPort, setSmtpPort] = useState("");
-  const [imapSecurity, setImapSecurity] = useState<ConnectionSecurity | "">("");
-  const [smtpSecurity, setSmtpSecurity] = useState<ConnectionSecurity | "">("");
-  const [acceptInvalidCerts, setAcceptInvalidCerts] = useState<"" | "false" | "true">("");
-  const [oauthProxyMode, setOauthProxyMode] = useState<AccountProxyMode>("inherit");
-  const [proxyHost, setProxyHost] = useState("");
-  const [proxyPort, setProxyPort] = useState("");
-  const [signatures, setSignatures] = useState<EmailSignature[]>([]);
-  const [editingSigId, setEditingSigId] = useState<string | null>(null);
-  const [editingSigName, setEditingSigName] = useState("");
-  const [editingSigContent, setEditingSigContent] = useState("");
-  const [savingSig, setSavingSig] = useState(false);
-  const [imapFolderSettings, setImapFolderSettings] = useState<ImapSyncFolderSettings | null>(null);
-  const [selectedImapFolderIds, setSelectedImapFolderIds] = useState<Set<string>>(new Set());
-  const [folderLoading, setFolderLoading] = useState(false);
-  const [folderError, setFolderError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [displayName, setDisplayName] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":displayName", account.display_name);
+  const [senderName, setSenderName] = useWorkspaceState<string | null>("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":senderName", null);
+  const [email, setEmail] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":email", account.email);
+  const [accountColor, setAccountColor] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":accountColor", initialColor);
+  const [password, setPassword] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":password", "");
+  const [passwordConfigured, setPasswordConfigured] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":passwordConfigured", false);
+  const [imapHost, setImapHost] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":imapHost", "");
+  const [imapPort, setImapPort] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":imapPort", "");
+  const [imapUsername, setImapUsername] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":imapUsername", "");
+  const [smtpHost, setSmtpHost] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":smtpHost", "");
+  const [smtpPort, setSmtpPort] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":smtpPort", "");
+  const [smtpUsername, setSmtpUsername] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":smtpUsername", "");
+  const [imapSecurity, setImapSecurity] = useWorkspaceState<ConnectionSecurity | "">("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":imapSecurity", "");
+  const [smtpSecurity, setSmtpSecurity] = useWorkspaceState<ConnectionSecurity | "">("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":smtpSecurity", "");
+  const stateKey = "src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":";
+  const [incomingException, setIncomingException] = useWorkspaceState(stateKey + "incomingException", false);
+  const [outgoingException, setOutgoingException] = useWorkspaceState(stateKey + "outgoingException", false);
+  const [savedExceptions, setSavedExceptions] = useWorkspaceState(stateKey + "savedExceptions", { incoming: false, outgoing: false });
+  const [savedConnection, setSavedConnection] = useWorkspaceState(stateKey + "savedConnection", "");
+  const [advancedOpen, setAdvancedOpen] = useWorkspaceState(stateKey + "advancedConnection", false);
+  const [strictTesting, setStrictTesting] = useWorkspaceState(stateKey + "testing", false);
+  const [strictResult, setStrictResult] = useWorkspaceState<{ ok: boolean; message: string } | null>(stateKey + "strictResult", null);
+  const [oauthProxyMode, setOauthProxyMode] = useWorkspaceState<AccountProxyMode>("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":oauthProxyMode", "inherit");
+  const [proxyHost, setProxyHost] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":proxyHost", "");
+  const [proxyPort, setProxyPort] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":proxyPort", "");
+  const [signatures, setSignatures] = useWorkspaceState<EmailSignature[]>("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":signatures", []);
+  const [editingSigId, setEditingSigId] = useWorkspaceState<string | null>("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":editingSigId", null);
+  const [editingSigName, setEditingSigName] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":editingSigName", "");
+  const [editingSigContent, setEditingSigContent] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":editingSigContent", "");
+  const [savingSig, setSavingSig] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":savingSig", false);
+  const [imapFolderSettings, setImapFolderSettings] = useWorkspaceState<ImapSyncFolderSettings | null>("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":imapFolderSettings", null);
+  const [selectedImapFolderIds, setSelectedImapFolderIds] = useWorkspaceState<Set<string>>("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":selectedImapFolderIds", new Set());
+  const [folderLoading, setFolderLoading] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":folderLoading", false);
+  const [folderError, setFolderError] = useWorkspaceState<string | null>("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":folderError", null);
+  const [loading, setLoading] = useWorkspaceState("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":loading", false);
+  const [error, setError] = useWorkspaceState<string | null>("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":error", null);
+  const [detailsLoadError, setDetailsLoadError] = useWorkspaceState<string | null>("src/features/settings/AccountsTab.tsx:EditAccountModal:" + account.id + ":detailsLoadError", null);
   const isOAuth = account.provider === "gmail" || account.provider === "outlook";
   const isImap = account.provider === "imap";
   const isPop3 = account.provider === "pop3";
@@ -499,7 +515,7 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
     ? t("accountSetup.pop3Port", "POP3 port")
     : t("accountSetup.imapPort", "IMAP port");
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/AccountsTab.tsx:" + 'EditAccountModal:' + account.id + ':', () => {
     let cancelled = false;
     listEmailSignatures(account.id)
       .then((list) => {
@@ -517,30 +533,47 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
   // can see what is currently set. Password is intentionally left empty — the
   // user only needs to type a new one to change it.
   useEffect(() => {
+    // A detached editor can inherit the fields before the request completes.
+    // Fetch again only if it has not received the persisted settings yet.
+    if (senderName !== null) return;
     let cancelled = false;
+    setDetailsLoadError(null);
     getAccountDetails(account.id)
       .then((details) => {
         if (cancelled) return;
+        setSenderName(details.senderName ?? account.display_name);
         setImapHost(details.imapHost);
         setImapPort(details.imapPort ? String(details.imapPort) : "");
+        setImapUsername(details.imapUsername);
         setImapSecurity(details.imapSecurity || "");
-        setAcceptInvalidCerts(details.imapAcceptInvalidCerts ? "true" : "false");
+        setIncomingException(details.imapAcceptInvalidCerts);
+        setOutgoingException(details.smtpAcceptInvalidCerts);
+        setSavedExceptions({ incoming: details.imapAcceptInvalidCerts, outgoing: details.smtpAcceptInvalidCerts });
+        setSavedConnection(JSON.stringify([
+          account.email, details.imapHost, String(details.imapPort || ""), details.imapSecurity || "", details.imapUsername,
+          details.smtpHost, String(details.smtpPort || ""), details.smtpSecurity || "", details.smtpUsername,
+          details.proxyHost, String(details.proxyPort || ""),
+        ]));
         setSmtpHost(details.smtpHost);
         setSmtpPort(details.smtpPort ? String(details.smtpPort) : "");
+        setSmtpUsername(details.smtpUsername);
         setSmtpSecurity(details.smtpSecurity || "");
+        setPasswordConfigured(details.passwordConfigured);
         setProxyHost(details.proxyHost);
         setProxyPort(details.proxyPort ? String(details.proxyPort) : "");
         setOauthProxyMode((details.proxyMode as AccountProxyMode) || "inherit");
       })
       .catch((err) => {
-        console.warn("Failed to load account details:", err);
+        const message = extractErrorMessage(err);
+        console.warn("Failed to load account details:", message);
+        if (!cancelled) setDetailsLoadError(`读取当前账号设置失败：${message}`);
       });
     return () => {
       cancelled = true;
     };
-  }, [account.id]);
+  }, [account.id, account.display_name, senderName]);
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/AccountsTab.tsx:" + 'EditAccountModal:' + account.id + ':', () => {
     if (!isOAuth) return;
     let cancelled = false;
     getOAuthAccountProxySetting(account.id)
@@ -571,9 +604,10 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
         return;
       }
       if (event.key === "Tab" && dialogRef.current) {
-        const focusable = dialogRef.current.querySelectorAll<HTMLElement>(
-          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-        );
+        const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])',
+        )).filter(element => !element.matches(":disabled") && (!element.closest("details:not([open])") || element.matches("summary")));
+        if (!focusable.length) return;
         const first = focusable[0];
         const last = focusable[focusable.length - 1];
         if (event.shiftKey && document.activeElement === first) {
@@ -608,8 +642,33 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
     }
   }
 
+  const connectionMatchesSaved = !password && savedConnection === JSON.stringify([
+    email, imapHost, imapPort, imapSecurity, imapUsername, smtpHost, smtpPort, smtpSecurity, smtpUsername, proxyHost, proxyPort,
+  ]);
+  const restoreIncoming = incomingException && Boolean(strictResult && (strictResult.ok || /收件：通过(?:\s|$)/.test(strictResult.message)));
+  const restoreOutgoing = outgoingException && Boolean(strictResult && (strictResult.ok || /发件 SMTP：通过(?:\s|$)/.test(strictResult.message)));
+
+  useEffect(() => {
+    if (!connectionMatchesSaved) setStrictResult(null);
+  }, [connectionMatchesSaved]);
+
+  async function testStrictCertificates() {
+    setStrictTesting(true);
+    setStrictResult(null);
+    try {
+      const message = await testAccountConnection(account.id, true);
+      setStrictResult({ ok: true, message });
+    } catch (cause) {
+      const preset = isImap ? findMailServerPreset(email, imapHost, smtpHost) : undefined;
+      setStrictResult({ ok: false, message: explainMailConnectionReport(extractErrorMessage(cause), preset) });
+    } finally {
+      setStrictTesting(false);
+    }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (senderName === null || strictTesting || loading) return;
     setLoading(true);
     setError(null);
     try {
@@ -629,6 +688,9 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
           undefined,
           undefined,
           accountColor,
+          undefined,
+          undefined,
+          senderName,
         );
         const trimmedProxyHost = proxyHost.trim();
         const trimmedProxyPort = proxyPort.trim();
@@ -656,10 +718,17 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
           smtpPort ? parseInt(smtpPort, 10) : undefined,
           imapSecurity || undefined,
           smtpSecurity || undefined,
-          acceptInvalidCerts === "" ? undefined : acceptInvalidCerts === "true",
+          undefined,
           proxyHost.trim() || undefined,
           proxyPort ? parseInt(proxyPort, 10) : undefined,
           accountColor,
+          imapUsername.trim() || undefined,
+          smtpUsername.trim() || undefined,
+          senderName,
+          {
+            incoming: incomingException !== savedExceptions.incoming ? incomingException : undefined,
+            outgoing: outgoingException !== savedExceptions.outgoing ? outgoingException : undefined,
+          },
         );
       }
 
@@ -698,6 +767,16 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
     display: "flex",
     flexDirection: "column",
   };
+  function handleImapSecurityChange(value: ConnectionSecurity | "") {
+    setImapSecurity(value);
+    setIncomingException(false);
+    if (value) setImapPort(String(defaultIncomingPort(isPop3 ? "pop3" : "imap", value)));
+  }
+  function handleSmtpSecurityChange(value: ConnectionSecurity | "") {
+    setSmtpSecurity(value);
+    setOutgoingException(false);
+    if (value) setSmtpPort(String(defaultSmtpPort(value)));
+  }
   const signatureSmallButton = (background: string, color: string): React.CSSProperties => ({
     padding: "5px 12px",
     fontSize: "12px",
@@ -708,6 +787,12 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
     cursor: "pointer",
   });
   const colorInputValue = /^#[0-9a-fA-F]{6}$/.test(accountColor) ? accountColor : initialColor;
+  const advancedToggle = (
+    <button type="button" aria-expanded={advancedOpen} onClick={() => setAdvancedOpen(!advancedOpen)}
+      style={{ alignSelf: "flex-start", border: 0, padding: 0, background: "transparent", color: "var(--color-accent)", cursor: "pointer", fontSize: 13 }}>
+      {t("accountSetup.advancedConnection", "Advanced connection settings")}
+    </button>
+  );
   const proxyFields = (
     <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "12px" }}>
       <div style={fieldStyle}>
@@ -773,12 +858,16 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
         <div className="scroll-region edit-account-scroll" style={{ overflowY: "auto", padding: "20px" }}>
           <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
             <div style={fieldStyle}>
-              <label style={labelStyle}>{t("accountSetup.displayName")}</label>
-              <input aria-label={t("accountSetup.displayName")} style={inputStyle} type="text" required value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+              <label style={labelStyle}>{t("settings.accountNickname", "账号昵称（仅自己可见）")}</label>
+              <input aria-label={t("settings.accountNickname", "账号昵称（仅自己可见）")} style={inputStyle} type="text" required value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+            </div>
+            <div style={fieldStyle}>
+              <label style={labelStyle}>{t("settings.senderName", "对外发件人名称")}</label>
+              {account.provider === "outlook" ? <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{t("settings.outlookSenderManaged", "由 Microsoft 账户资料决定")}</span> : <input aria-label={t("settings.senderName", "对外发件人名称")} disabled={senderName === null} style={inputStyle} value={senderName ?? ""} onChange={e => setSenderName(e.target.value)} />}
             </div>
             <div style={fieldStyle}>
               <label style={labelStyle}>{t("accountSetup.emailAddress")}</label>
-              <input aria-label={t("accountSetup.emailAddress")} ref={emailInputRef} style={inputStyle} type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
+              <input aria-label={t("accountSetup.emailAddress")} ref={emailInputRef} style={inputStyle} type="email" required readOnly={isOAuth} value={email} onChange={(e) => setEmail(e.target.value)} />
             </div>
             <div style={fieldStyle}>
               <label htmlFor="account-color" style={labelStyle}>{t("settings.accountColor", "Account color")}</label>
@@ -866,23 +955,67 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
               </div>
             ) : (
               <>
+                {detailsLoadError && (
+                  <div role="alert" style={{ color: "#ef4444", fontSize: "12px", lineHeight: 1.5 }}>
+                    {detailsLoadError}
+                  </div>
+                )}
                 <div style={fieldStyle}>
-                  <label style={labelStyle}>{t("accountSetup.password")} <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>({t("settings.leaveEmptyKeep", "leave empty to keep current")})</span></label>
-                  <input aria-label={t("accountSetup.password")} style={inputStyle} type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+                  <label style={labelStyle}>{t("accountSetup.password")} <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>({passwordConfigured ? "已保存；不会显示原文，留空保持不变" : "尚未保存"})</span></label>
+                  <input aria-label={t("accountSetup.password")} style={inputStyle} type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={passwordConfigured ? "已保存（如需更改请重新输入）" : "请输入密码或应用专用密码"} />
                 </div>
 
+                {(savedExceptions.incoming || savedExceptions.outgoing) && (
+                  <div style={{ border: "1px solid var(--color-border)", borderRadius: 6, padding: 10, fontSize: 12, lineHeight: 1.5 }}>
+                    <div>{savedExceptions.incoming && savedExceptions.outgoing
+                      ? t("accountSetup.bothCertificateExceptions", "Certificate verification is disabled for incoming and outgoing mail.")
+                      : savedExceptions.incoming
+                        ? t("accountSetup.incomingCertificateExceptionActive", "Certificate verification is disabled for incoming mail.")
+                        : t("accountSetup.outgoingCertificateExceptionActive", "Certificate verification is disabled for outgoing mail.")}</div>
+                    <button type="button" onClick={() => void testStrictCertificates()} disabled={strictTesting || loading || !connectionMatchesSaved}
+                      style={{ ...signatureSmallButton("var(--color-bg-secondary)", "var(--color-text-primary)"), marginTop: 6 }}>
+                      {strictTesting ? t("accountSetup.testing", "Testing...") : t("accountSetup.testStrictCertificates", "Test with certificate verification")}
+                    </button>
+                    {!connectionMatchesSaved && (
+                      <div style={{ color: "var(--color-text-secondary)" }}>
+                        {t("accountSetup.saveBeforeStrictTest", "Save your connection changes before testing again.")}
+                      </div>
+                    )}
+                    {strictResult && connectionMatchesSaved && <div role={strictResult.ok ? "status" : "alert"} style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>
+                      {strictResult.message}
+                    </div>}
+                    {connectionMatchesSaved && (restoreIncoming || restoreOutgoing) && (
+                      <button type="button" onClick={() => {
+                        if (restoreIncoming) setIncomingException(false);
+                        if (restoreOutgoing) setOutgoingException(false);
+                      }}
+                        style={{ ...signatureSmallButton("var(--color-accent)", "#fff"), marginTop: 6 }}>
+                        {t("accountSetup.restoreCertificateVerification", "Restore certificate verification")}
+                      </button>
+                    )}
+                    {((savedExceptions.incoming && !incomingException) || (savedExceptions.outgoing && !outgoingException)) && (
+                      <div>{t("accountSetup.restoreCertificateVerificationOnSave", "Save to apply certificate verification.")}</div>
+                    )}
+                  </div>
+                )}
+                {advancedToggle}
+                {advancedOpen && <>
+                <div style={fieldStyle}>
+                  <label style={labelStyle}>{incomingHostLabel} 登录用户名</label>
+                  <input aria-label={`${incomingHostLabel} 登录用户名`} style={inputStyle} type="text" autoComplete="username" value={imapUsername} onChange={(e) => setImapUsername(e.target.value)} placeholder="默认使用邮箱地址" />
+                </div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: "12px" }}>
                   <div style={fieldStyle}>
                     <label style={labelStyle}>{incomingHostLabel} <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>({t("settings.optional", "optional")})</span></label>
-                    <input aria-label={incomingHostLabel} style={inputStyle} type="text" value={imapHost} onChange={(e) => setImapHost(e.target.value)} placeholder={t("settings.leaveEmptyKeep")} />
+                    <input aria-label={incomingHostLabel} style={inputStyle} type="text" value={imapHost} onChange={(e) => { setImapHost(e.target.value); if (e.target.value.trim()) setIncomingException(false); }} placeholder={t("settings.leaveEmptyKeep")} />
                   </div>
                   <div style={fieldStyle}>
                     <label style={labelStyle}>{incomingPortLabel}</label>
-                    <input aria-label={incomingPortLabel} style={{ ...inputStyle, width: "70px" }} type="number" value={imapPort} onChange={(e) => setImapPort(e.target.value)} />
+                    <input aria-label={incomingPortLabel} style={{ ...inputStyle, width: "70px" }} type="number" value={imapPort} onChange={(e) => { setImapPort(e.target.value); if (e.target.value) setIncomingException(false); }} />
                   </div>
                   <div style={fieldStyle}>
                     <label htmlFor="accountsetup-imap-security" style={labelStyle}>{t("accountSetup.security", "Security")}</label>
-                    <select id="accountsetup-imap-security" value={imapSecurity} onChange={(e) => setImapSecurity(e.target.value as ConnectionSecurity | "")} style={{ ...inputStyle, width: "110px" }}>
+                    <select id="accountsetup-imap-security" value={imapSecurity} onChange={(e) => handleImapSecurityChange(e.target.value as ConnectionSecurity | "")} style={{ ...inputStyle, width: "110px" }}>
                       <option value="">{t("settings.leaveEmptyKeep", "keep current")}</option>
                       <option value="tls">{t("accountSetup.securityTls", "SSL/TLS")}</option>
                       <option value="starttls">{t("accountSetup.securityStarttls", "STARTTLS")}</option>
@@ -894,15 +1027,15 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
                 <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: "12px" }}>
                   <div style={fieldStyle}>
                     <label style={labelStyle}>{t("accountSetup.smtpHost")} <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>({t("settings.optional", "optional")})</span></label>
-                    <input aria-label={t("accountSetup.smtpHost")} style={inputStyle} type="text" value={smtpHost} onChange={(e) => setSmtpHost(e.target.value)} placeholder={t("settings.leaveEmptyKeep")} />
+                    <input aria-label={t("accountSetup.smtpHost")} style={inputStyle} type="text" value={smtpHost} onChange={(e) => { setSmtpHost(e.target.value); if (e.target.value.trim()) setOutgoingException(false); }} placeholder={t("settings.leaveEmptyKeep")} />
                   </div>
                   <div style={fieldStyle}>
                     <label style={labelStyle}>{t("accountSetup.smtpPort")}</label>
-                    <input aria-label={t("accountSetup.smtpPort")} style={{ ...inputStyle, width: "70px" }} type="number" value={smtpPort} onChange={(e) => setSmtpPort(e.target.value)} />
+                    <input aria-label={t("accountSetup.smtpPort")} style={{ ...inputStyle, width: "70px" }} type="number" value={smtpPort} onChange={(e) => { setSmtpPort(e.target.value); if (e.target.value) setOutgoingException(false); }} />
                   </div>
                   <div style={fieldStyle}>
                     <label htmlFor="accountsetup-smtp-security" style={labelStyle}>{t("accountSetup.security", "Security")}</label>
-                    <select id="accountsetup-smtp-security" value={smtpSecurity} onChange={(e) => setSmtpSecurity(e.target.value as ConnectionSecurity | "")} style={{ ...inputStyle, width: "110px" }}>
+                    <select id="accountsetup-smtp-security" value={smtpSecurity} onChange={(e) => handleSmtpSecurityChange(e.target.value as ConnectionSecurity | "")} style={{ ...inputStyle, width: "110px" }}>
                       <option value="">{t("settings.leaveEmptyKeep", "keep current")}</option>
                       <option value="tls">{t("accountSetup.securityTls", "SSL/TLS")}</option>
                       <option value="starttls">{t("accountSetup.securityStarttls", "STARTTLS")}</option>
@@ -912,25 +1045,28 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
                 </div>
 
                 <div style={fieldStyle}>
-                  <label htmlFor="accountsetup-cert-policy" style={labelStyle}>
-                    {t("accountSetup.tlsCertificateVerification", "TLS certificate verification")}
-                  </label>
-                  <select
-                    id="accountsetup-cert-policy"
-                    value={acceptInvalidCerts}
-                    onChange={(e) => setAcceptInvalidCerts(e.target.value as "" | "false" | "true")}
-                    style={inputStyle}
-                  >
-                    <option value="">{t("settings.leaveEmptyKeep", "keep current")}</option>
-                    <option value="false">{t("accountSetup.verifyTlsCerts", "Verify certificates")}</option>
-                    <option value="true">{t("accountSetup.acceptInvalidCerts", "Allow invalid TLS certificates")}</option>
-                  </select>
+                  <label style={labelStyle}>{t("accountSetup.smtpHost")} 登录用户名</label>
+                  <input aria-label={`${t("accountSetup.smtpHost")} 登录用户名`} style={inputStyle} type="text" autoComplete="username" value={smtpUsername} onChange={(e) => setSmtpUsername(e.target.value)} placeholder="默认使用邮箱地址" />
                 </div>
 
+                <details>
+                  <summary style={{ cursor: "pointer", fontSize: 13 }}>{t("accountSetup.certificateExceptions", "Certificate exceptions")}</summary>
+                  <p style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{t("accountSetup.certificateExceptionHelp", "Only enable an exception after your mail administrator verifies the server. The app will skip its identity check for that connection.")}</p>
+                  <label style={{ display: "block", fontSize: 13, marginBottom: 6 }}>
+                    <input type="checkbox" checked={incomingException} disabled={imapSecurity === "plain"} onChange={event => setIncomingException(event.target.checked)} />
+                    {" "}{t("accountSetup.allowIncomingCertificate", "Skip certificate verification for incoming mail")}
+                  </label>
+                  <label style={{ display: "block", fontSize: 13 }}>
+                    <input type="checkbox" checked={outgoingException} disabled={smtpSecurity === "plain"} onChange={event => setOutgoingException(event.target.checked)} />
+                    {" "}{t("accountSetup.allowOutgoingCertificate", "Skip certificate verification for outgoing mail")}
+                  </label>
+                </details>
+                </>}
               </>
             )}
 
-            {proxyFields}
+            {isOAuth && advancedToggle}
+            {advancedOpen && proxyFields}
 
             {isImap && (
               <div
@@ -1221,7 +1357,7 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
 
             <button
               type="submit"
-              disabled={loading || folderLoading}
+              disabled={loading || folderLoading || senderName === null}
               style={{
                 padding: "9px 16px",
                 borderRadius: "6px",

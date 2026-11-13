@@ -46,6 +46,7 @@ const SAFE_STYLE_PROPERTIES = new Set([
   "padding-right",
   "padding-top",
   "text-align",
+  "table-layout",
   "text-decoration",
   "vertical-align",
   "visibility",
@@ -270,7 +271,7 @@ export function sanitizeHtml(html: string): string {
     ALLOWED_ATTR: [
       "href", "src", "alt", "title", "width", "height", "class",
       "target", "rel",
-      "dir", "id", "lang", "colspan", "rowspan", "border", "cellpadding",
+      "dir", "id", "lang", "colspan", "rowspan", "colwidth", "border", "cellpadding",
       "cellspacing", "align", "valign", "bgcolor", "color", "face", "size",
       "style",
     ],

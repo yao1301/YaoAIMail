@@ -101,6 +101,7 @@ describe("AccountsTab OAuth proxy", () => {
     await waitFor(() => {
       expect(getOAuthAccountProxySetting).toHaveBeenCalledWith("account-1");
     });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced connection settings" }));
     await waitFor(() => {
       expect((screen.getByLabelText("SOCKS5 Proxy") as HTMLInputElement).value).toBe(
         "127.0.0.1",
@@ -132,6 +133,9 @@ describe("AccountsTab OAuth proxy", () => {
         undefined,
         undefined,
         "#22c55e",
+        undefined,
+        undefined,
+        "User",
       );
     });
     expect(updateOAuthAccountProxySetting).toHaveBeenCalledWith(
@@ -193,6 +197,9 @@ describe("AccountsTab OAuth proxy", () => {
         undefined,
         undefined,
         "#f97316",
+        undefined,
+        undefined,
+        "User",
       );
     });
   });
@@ -222,6 +229,9 @@ describe("AccountsTab OAuth proxy", () => {
         undefined,
         undefined,
         "#0ea5e9",
+        undefined,
+        undefined,
+        "User",
       );
     });
   });

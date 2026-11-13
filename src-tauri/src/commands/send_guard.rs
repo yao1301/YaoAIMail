@@ -1,11 +1,12 @@
 use crate::commands::network::get_global_proxy_raw;
 use crate::commands::translate::decrypt_config;
 use crate::state::AppState;
-use pebble_core::PebbleError;
+use pebble_core::{FolderRole, PebbleError};
 use pebble_translate::types::TranslateProviderConfig;
 use pebble_translate::TranslateService;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use tauri::State;
 
 /// Key under which the send-guard config (enabled + mode) is stored.
@@ -14,32 +15,6 @@ const GUARD_CONFIG_KEY: &str = "send_guard_config";
 const CONTACT_ROLES_KEY: &str = "send_guard_roles";
 /// Cap on how many contacts the full-AI bulk pass will touch in one run.
 const BULK_AI_LIMIT: usize = 400;
-
-const DAY: i64 = 24 * 3600;
-/// A business identity almost never changes, so a confident judgment is kept
-/// effectively forever. Only weak/uncertain guesses are worth re-computing.
-/// Returns true when the cached entry should be recomputed by the bulk AI pass.
-fn needs_refresh(entry: &ContactRoleEntry, now: i64) -> bool {
-    // The user's own correction is permanent — never recompute.
-    if entry.source == RoleSource::Manual {
-        return false;
-    }
-    // Never classified → always worth a try.
-    if entry.role == ContactRole::Unknown {
-        return true;
-    }
-    let age = now - entry.inferred_at;
-    if entry.confidence >= 0.75 {
-        // Strong judgment (AI with clear signals): keep ~2 years.
-        age > 730 * DAY
-    } else if entry.confidence >= 0.5 {
-        // Reasonable judgment: revisit after a year.
-        age > 365 * DAY
-    } else {
-        // Weak guess (address-only, score barely over threshold): revisit monthly.
-        age > 30 * DAY
-    }
-}
 
 // ─── Data model ────────────────────────────────────────────────────────────────
 
@@ -190,7 +165,10 @@ pub(crate) fn load_roles(state: &AppState) -> Vec<ContactRoleEntry> {
     }
 }
 
-fn save_roles(state: &AppState, roles: &[ContactRoleEntry]) -> std::result::Result<(), PebbleError> {
+pub(crate) fn save_roles(
+    state: &AppState,
+    roles: &[ContactRoleEntry],
+) -> std::result::Result<(), PebbleError> {
     let plain = serde_json::to_vec(roles)
         .map_err(|e| PebbleError::Internal(format!("Failed to serialize contact roles: {e}")))?;
     let enc = state.crypto.encrypt(&plain)?;
@@ -299,57 +277,6 @@ pub async fn delete_contact_role(
 
 // ─── Multi-dimensional signal extraction (cheap, no AI) ────────────────────────
 
-/// Foreign country-code TLDs → the contact is likely an overseas buyer.
-fn tld_is_foreign(tld: &str) -> bool {
-    matches!(
-        tld,
-        "de" | "fr" | "co.uk" | "uk" | "jp" | "it" | "es" | "com.br" | "br" | "ru" | "nl"
-            | "com.au" | "au" | "ca" | "com.mx" | "mx" | "in" | "co.in" | "kr" | "co.kr"
-            | "us" | "at" | "be" | "ch" | "se" | "pl" | "tr" | "ae" | "sa" | "th" | "my"
-            | "sg" | "id" | "ph" | "vn" | "co.za" | "za" | "nz" | "pt" | "gr" | "cz"
-            | "dk" | "fi" | "no" | "hu" | "ro" | "ua" | "cl" | "ar" | "co" | "il" | "ie"
-    )
-}
-
-/// Domestic (China) TLDs → the contact is likely a local factory/supplier.
-fn tld_is_domestic(tld: &str) -> bool {
-    matches!(tld, "cn" | "com.cn" | "net.cn" | "org.cn" | "gov.cn" | "中国" | "公司" | "网络")
-}
-
-/// Chinese consumer mail providers → domestic signal (foreign buyers rarely use these).
-fn is_domestic_mail_provider(domain: &str) -> bool {
-    matches!(
-        domain,
-        "qq.com" | "163.com" | "126.com" | "sina.com" | "sina.cn" | "139.com" | "aliyun.com"
-            | "foxmail.com" | "21cn.com" | "189.cn" | "yeah.net" | "tom.com" | "sohu.com"
-    )
-}
-
-/// Domain-keyword hints: contains words suggesting a factory vs a trading/buyer entity.
-fn domain_keyword_score(domain: &str) -> f32 {
-    let d = domain.to_lowercase();
-    let supplier_kw = [
-        "factory", "manufactur", "mfg", "supply", "supplier", "industrial",
-        "sourcing", "workshop", "oem", "odm", "production", "plant", "muju", "mould", "mold",
-    ];
-    let customer_kw = [
-        "trade", "import", "export", "global", "buy", "shop", "store", "retail",
-        "brand", "distributor", "trading", "commerce", "sales", "group",
-    ];
-    let mut s = 0.0f32;
-    for k in supplier_kw {
-        if d.contains(k) {
-            s -= 1.5;
-        }
-    }
-    for k in customer_kw {
-        if d.contains(k) {
-            s += 1.0;
-        }
-    }
-    s
-}
-
 /// Domain fragments that identify a third-party SERVICE provider rather than a
 /// trading counterparty. Split by trade so the reason string can be specific.
 fn service_domain_groups() -> &'static [(&'static str, &'static [&'static str])] {
@@ -426,6 +353,42 @@ fn service_hit(email: &str) -> Option<&'static str> {
     None
 }
 
+/// Automated/system senders and obvious abuse addresses are not business
+/// contacts. Keep them unclassified instead of dressing them up as a customer,
+/// supplier or service provider.
+fn ignored_sender_hit(email: &str) -> Option<&'static str> {
+    let local = email
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let markers = [
+        "noreply", "no-reply", "do-not-reply", "donotreply", "mailer-daemon",
+        "postmaster", "bounce", "bounces", "abuse", "phishing", "spam", "newsletter",
+        "notification", "notifications", "alert", "alerts",
+    ];
+    markers
+        .iter()
+        .find(|marker| local == **marker || local.starts_with(&format!("{marker}.")))
+        .copied()
+}
+
+fn suspicious_message_signals(subject: &str, body: &str) -> usize {
+    let text = format!("{subject}\n{body}").to_lowercase();
+    [
+        "verify your account", "account will be suspended", "password expires",
+        "unusual sign-in", "unusual activity", "click here immediately", "claim your prize",
+        "lottery winner", "gift card", "cryptocurrency investment", "wallet address",
+        "bank account has changed", "update payment details", "wire funds urgently",
+        "确认您的账户", "账户将被停用", "密码即将过期", "异常登录", "点击链接验证",
+        "中奖", "领取奖金", "虚拟货币投资", "收款账户已变更", "紧急汇款",
+    ]
+    .iter()
+    .filter(|signal| text.contains(**signal))
+    .count()
+}
+
 /// Content words typical of service-provider correspondence (freight, customs,
 /// certification, banking). Used as a secondary signal on message history.
 fn service_corpus_words() -> &'static [&'static str] {
@@ -466,34 +429,19 @@ fn email_domain(email: &str) -> (String, String) {
     (domain, tld)
 }
 
-/// Ratio of CJK characters vs latin letters in a text (0..1). High = Chinese.
-fn cjk_ratio(text: &str) -> f32 {
-    let mut cjk = 0u32;
-    let mut latin = 0u32;
-    for c in text.chars() {
-        let code = c as u32;
-        if (0x4E00..=0x9FFF).contains(&code)
-            || (0x3400..=0x4DBF).contains(&code)
-            || (0xF900..=0xFAFF).contains(&code)
-        {
-            cjk += 1;
-        } else if c.is_ascii_alphabetic() {
-            latin += 1;
-        }
-    }
-    if cjk + latin == 0 {
-        0.0
-    } else {
-        cjk as f32 / (cjk + latin) as f32
-    }
-}
-
 /// Lightweight, AI-free role guess purely from the email address.
 /// Returns (role, confidence 0..1, reasons).
 fn cheap_role_from_address(email: &str) -> (ContactRole, f32, Vec<String>) {
-    let (domain, tld) = email_domain(email);
+    let (domain, _) = email_domain(email);
     if domain.is_empty() {
         return (ContactRole::Unknown, 0.0, vec![]);
+    }
+    if let Some(marker) = ignored_sender_hit(email) {
+        return (
+            ContactRole::Unknown,
+            0.0,
+            vec![format!("系统/群发地址特征（{marker}），不自动归入业务联系人")],
+        );
     }
     // Service providers are checked FIRST: a freight forwarder on a .cn domain
     // would otherwise be mislabelled as a factory and trigger false alarms.
@@ -504,61 +452,17 @@ fn cheap_role_from_address(email: &str) -> (ContactRole, f32, Vec<String>) {
             vec![format!("邮箱域名匹配{label}特征，判定为第三方服务商（不参与客户/工厂发错判断）")],
         );
     }
-    let mut score: f32 = 0.0; // >0 leans customer, <0 leans supplier
-    let mut reasons = Vec::new();
-
-    if tld_is_foreign(&tld) {
-        score += 2.0;
-        reasons.push(format!("邮箱域名后缀 .{tld} 为国外地区，更可能是海外客户"));
-    } else if tld_is_domestic(&tld) {
-        score -= 2.0;
-        reasons.push(format!("邮箱域名后缀 .{tld} 为国内，更可能是国内工厂/供应商"));
-    }
-    if is_domestic_mail_provider(&domain) {
-        score -= 1.0;
-        reasons.push("使用国内邮箱服务（如 QQ/163），更可能是国内联系人".to_string());
-    }
-    let kw = domain_keyword_score(&domain);
-    if kw < 0.0 {
-        score += kw; // supplier keyword
-        reasons.push("域名含工厂/供应相关词".to_string());
-    } else if kw > 0.0 {
-        score += kw;
-        reasons.push("域名含贸易/采购相关词".to_string());
-    }
-
-    if score >= 2.0 {
-        (ContactRole::Customer, (score / 4.0).min(0.85), reasons)
-    } else if score <= -2.0 {
-        (ContactRole::Supplier, (score.abs() / 4.0).min(0.85), reasons)
-    } else {
-        (ContactRole::Unknown, 0.0, vec!["仅从邮箱无法判断，需要结合邮件内容".to_string()])
-    }
+    // Country suffix, language, public mailbox provider and words in a domain
+    // are not proof of the commercial relationship. In particular, .cn must
+    // never mean "supplier". Customer/supplier needs correspondence evidence.
+    (
+        ContactRole::Unknown,
+        0.0,
+        vec!["邮箱地址本身不能证明客户或供应商关系，需要结合往来内容".to_string()],
+    )
 }
 
 // ─── Lexicons for content-based judgment ───────────────────────────────────────
-
-/// Words that, in correspondence, suggest the OTHER party is a CUSTOMER (we sell to them).
-fn customer_corpus_words() -> &'static [&'static str] {
-    &[
-        "your order", "your market", "your warehouse", "your port", "your client",
-        "your customer", "we can supply", "we will ship", "proforma", "pi ", "fob", "cif",
-        "retail", "catalog", "customize", "your logo", "your brand", "ship to", "delivery to",
-        "贵司", "贵公司", "您的市场", "您的客户", "发货", "报价", "形式发票", "PI", "装运",
-        "目的港", "目录", "定制", "你们订单", "下单", "采购方",
-    ]
-}
-
-/// Words that, in correspondence, suggest the OTHER party is a SUPPLIER (we buy from them).
-fn supplier_corpus_words() -> &'static [&'static str] {
-    &[
-        "factory", "manufacturer", "cost", "ex-factory", "exfactory", "unit price",
-        "production schedule", "lead time", "workshop", "raw material", "tooling", "mold",
-        "mould", "margin", "our supplier", "sub-supplier", "capacity", "qc", "inspection",
-        "工厂", "成本", "单价", "出厂价", "产线", "工价", "加工费", "模具", "原材料",
-        "排产", "交期", "产能", "良品率", "我司采购", "我方采购", "供应商", "定金", "尾款",
-    ]
-}
 
 /// Words that, in the OUTGOING DRAFT, signal a "selling to customer" intent.
 fn draft_customer_words() -> &'static [&'static str] {
@@ -579,6 +483,28 @@ fn draft_supplier_words() -> &'static [&'static str] {
         "our order to you", "deposit", "tooling", "mould", "capacity", "your workshop",
         "请报价", "贵厂", "成本", "出厂价", "产线", "工价", "模具", "原材料", "交期",
         "产能", "定金", "尾款", "贵司工厂", "你们工厂",
+    ]
+}
+
+/// A message received from a buyer/customer asking us to sell or quote.
+fn incoming_customer_words() -> &'static [&'static str] {
+    &[
+        "please quote", "send your quotation", "we are interested", "interested in your",
+        "we would like to buy", "we want to buy", "need your price", "price list", "catalog",
+        "catalogue", "minimum order", "moq", "sample", "place an order", "purchase order",
+        "our market", "our stores", "our customers", "our warehouse", "delivery to",
+        "请报价", "询价", "采购", "有兴趣", "价格表", "目录", "样品", "起订量", "下单",
+    ]
+}
+
+/// A message received from a factory/supplier offering production and cost.
+fn incoming_supplier_words() -> &'static [&'static str] {
+    &[
+        "our quotation", "our price", "unit price", "ex-factory", "factory price",
+        "production schedule", "production lead time", "our factory", "our workshop",
+        "our capacity", "raw material", "tooling cost", "mold cost", "mould cost",
+        "报价单", "我司报价", "出厂价", "单价", "成本", "排产", "生产交期", "工厂",
+        "车间", "产能", "原材料", "模具费", "加工费",
     ]
 }
 
@@ -608,9 +534,10 @@ fn draft_intent(text: &str) -> (String, Vec<String>) {
 
 // ─── Command: light auto-classify all contacts (free, instant) ─────────────────
 
-/// Classify every known contact using only the email address (domain/TLD signals).
+/// Classify only unmistakable third-party service contacts from the address.
 /// This is the "lightweight, no-burden" pass that runs automatically when the
-/// guard is enabled. It never calls the LLM and never overwrites a manual/AI tag.
+/// guard is enabled. Country/TLD/mailbox-provider guesses are intentionally
+/// forbidden; customer/supplier requires correspondence evidence.
 #[tauri::command]
 pub async fn auto_classify_contacts(
     state: State<'_, AppState>,
@@ -679,6 +606,7 @@ async fn resolve_contact_role(
     state: &AppState,
     account_id: &str,
     email: &str,
+    allow_web_research: bool,
 ) -> std::result::Result<ContactRoleEntry, PebbleError> {
     let email = email.trim().to_string();
     if email.is_empty() {
@@ -693,7 +621,32 @@ async fn resolve_contact_role(
     let hits = tokio::task::spawn_blocking(move || search.search(&q, 40))
         .await
         .map_err(|e| PebbleError::Internal(format!("Search task join error: {e}")))??;
-    let ids: Vec<String> = hits.iter().map(|h| h.message_id.clone()).collect();
+    let all_ids: Vec<String> = hits.iter().map(|h| h.message_id.clone()).collect();
+    let ignored_folder_ids: HashSet<String> = state
+        .store
+        .list_folders(account_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|folder| {
+            matches!(
+                folder.role,
+                Some(FolderRole::Spam | FolderRole::Trash | FolderRole::Drafts)
+            )
+        })
+        .map(|folder| folder.id)
+        .collect();
+    let folder_map = state
+        .store
+        .get_message_folder_ids_batch(&all_ids)
+        .unwrap_or_default();
+    let ids: Vec<String> = all_ids
+        .into_iter()
+        .filter(|id| {
+            !folder_map
+                .get(id)
+                .is_some_and(|folders| folders.iter().any(|folder| ignored_folder_ids.contains(folder)))
+        })
+        .collect();
     let messages = state.store.get_messages_batch(&ids)?;
 
     let own_email = state
@@ -701,15 +654,14 @@ async fn resolve_contact_role(
         .get_account(&account_id)
         .ok()
         .flatten()
-        .and_then(|a| a.email.split('@').next().map(|d| d.to_lowercase()))
+        .map(|a| a.email.trim().to_lowercase())
         .unwrap_or_default();
 
     let mut corpus = String::new();
-    let mut cjk_total = 0u32;
-    let mut latin_total = 0u32;
     let mut direction_score: f32 = 0.0; // >0 customer, <0 supplier
     let mut service_signals = 0usize;
     let mut trade_signals = 0usize;
+    let mut suspicious_messages = 0usize;
     for m in &messages {
         let involves = m.from_address.to_lowercase() == email_lc
             || m.to_list
@@ -722,30 +674,37 @@ async fn resolve_contact_role(
         if body.len() < 15 {
             continue;
         }
-        let is_outgoing = m.from_address.to_lowercase().contains(&own_email)
+        if suspicious_message_signals(&m.subject, body) >= 2 {
+            suspicious_messages += 1;
+            continue;
+        }
+        let is_outgoing = m.from_address.trim().eq_ignore_ascii_case(&own_email)
             && !own_email.is_empty();
         let lower = body.to_lowercase();
-        let c = count_signals(&lower, customer_corpus_words()) as f32;
-        let s = count_signals(&lower, supplier_corpus_words()) as f32;
+        let (c, s) = if is_outgoing {
+            (
+                count_signals(&lower, draft_customer_words()) as f32,
+                count_signals(&lower, draft_supplier_words()) as f32,
+            )
+        } else {
+            (
+                count_signals(&lower, incoming_customer_words()) as f32,
+                count_signals(&lower, incoming_supplier_words()) as f32,
+            )
+        };
         service_signals += count_signals(&lower, service_corpus_words());
         trade_signals += (c + s) as usize;
-        if is_outgoing {
-            direction_score += c - s; // we sell to them → customer
-        } else {
-            direction_score += s - c; // they sell to us → supplier
-        }
-        cjk_total += (cjk_ratio(body) * 100.0) as u32;
-        latin_total += 100u32;
-        corpus.push_str(&format!("主题: {}\n{}\n\n", m.subject, body));
+        direction_score += c - s;
+        corpus.push_str(&format!(
+            "[{}]\n主题: {}\n{}\n\n",
+            if is_outgoing { "我方发出" } else { "对方发来" },
+            m.subject,
+            body
+        ));
         if corpus.len() >= 6000 {
             break;
         }
     }
-    let chinese_ratio = if latin_total == 0 {
-        0.0
-    } else {
-        (cjk_total as f32) / (latin_total as f32)
-    };
 
     // L1 + L2 structured signal summary (feeds the AI as context).
     let (addr_role, addr_conf, addr_reasons) = cheap_role_from_address(&email);
@@ -777,11 +736,12 @@ async fn resolve_contact_role(
 
     let mut signal_summary = String::new();
     signal_summary.push_str(&format!(
-        "邮箱地址特征: {}\n历史邮件中文比例: {:.0}%\n交易方向(>0偏客户, <0偏供应商): {:.1}\n服务类用语命中: {} 处（订舱/报关/检验/结汇）\n",
+        "邮箱地址特征: {}\n按收发方向提取的交易关系分数(>0偏客户, <0偏供应商): {:.1}\n有效交易用语: {} 处\n服务类用语: {} 处（订舱/报关/检验/结汇）\n已排除的疑似垃圾/欺诈邮件: {} 封\n",
         addr_reasons.join("；"),
-        chinese_ratio * 100.0,
         direction_score,
-        service_signals
+        trade_signals,
+        service_signals,
+        suspicious_messages
     ));
 
     // Resolve a friendly name from the contacts index.
@@ -793,22 +753,62 @@ async fn resolve_contact_role(
         .and_then(|c| c.name)
         .unwrap_or_default();
 
-    let (role, source, confidence, reasons) = if corpus.trim().is_empty() {
-        // No history: fall back to the address-only guess, but tell the user
-        // why the result may be imprecise (depends on mail sync completion).
+    let initial = if corpus.trim().is_empty() {
         let mut reasons = addr_reasons;
-        reasons.push(
-            "暂无往来邮件样本，仅按邮箱地址规则判断；邮件同步完成后重新识别可提升精度"
-                .to_string(),
-        );
-        (addr_role, RoleSource::Inferred, addr_conf, reasons)
+        reasons.push(if suspicious_messages > 0 {
+            "现有样本均疑似垃圾、欺诈或系统邮件，已排除并保持未分类".to_string()
+        } else {
+            "没有可用的正常往来邮件，不能仅凭域名或国家判断".to_string()
+        });
+        (ContactRole::Unknown, RoleSource::Inferred, 0.0, reasons)
     } else if let Some(cfg) = try_load_provider(&state) {
         match ai_classify_role(&state, &cfg, &email, &name, &signal_summary, &corpus).await {
-            Ok(r) => r,
-            Err(_) => heuristic_role(chinese_ratio, direction_score, addr_role, addr_conf, addr_reasons),
+            Ok((role, source, confidence, reasons))
+                if !matches!(role, ContactRole::Customer | ContactRole::Supplier)
+                    || confidence >= 0.72 => (role, source, confidence, reasons),
+            Ok((_role, _source, confidence, mut reasons)) => {
+                reasons.push(format!("模型置信度仅 {:.0}%，为避免误判暂不分类", confidence * 100.0));
+                (ContactRole::Unknown, RoleSource::Inferred, confidence, reasons)
+            }
+            Err(_) => heuristic_role(direction_score, addr_role, addr_conf, addr_reasons),
         }
     } else {
-        heuristic_role(chinese_ratio, direction_score, addr_role, addr_conf, addr_reasons)
+        heuristic_role(direction_score, addr_role, addr_conf, addr_reasons)
+    };
+
+    // Search is deliberately the LAST resort and is budgeted by the bulk
+    // caller. It only runs when normal correspondence analysis stayed unknown,
+    // and only a high-confidence result is accepted.
+    let (role, source, confidence, reasons) = if initial.0 == ContactRole::Unknown
+        && allow_web_research
+        && !corpus.trim().is_empty()
+        && ignored_sender_hit(&email).is_none()
+    {
+        if let Some(cfg) = try_load_provider(&state) {
+            match web_research_contact_role(
+                state,
+                &cfg,
+                &email,
+                &name,
+                &signal_summary,
+                &corpus,
+            )
+            .await
+            {
+                Some(researched) => researched,
+                None => {
+                    let mut unchanged = initial;
+                    unchanged
+                        .3
+                        .push("联网核验未得到足够可靠的直接证据，保持未分类".to_string());
+                    unchanged
+                }
+            }
+        } else {
+            initial
+        }
+    } else {
+        initial
     };
 
     let entry = ContactRoleEntry {
@@ -841,7 +841,7 @@ pub async fn infer_contact_role(
             return Ok(e);
         }
     }
-    let entry = resolve_contact_role(&state, &account_id, &email).await?;
+    let entry = resolve_contact_role(&state, &account_id, &email, true).await?;
     let mut roles = load_roles(&state);
     match roles.iter_mut().find(|r| r.email.to_lowercase() == email_lc) {
         Some(e) => *e = entry.clone(),
@@ -852,7 +852,8 @@ pub async fn infer_contact_role(
 }
 
 /// Bulk full-AI inference for all contacts (best quality, costs API calls).
-/// Skips contacts already classified within the cache TTL or manually tagged.
+/// Every inferred result is re-evaluated when the user explicitly clicks the
+/// one-click action; only real manual corrections remain untouched.
 #[tauri::command]
 pub async fn infer_all_contact_roles(
     state: State<'_, AppState>,
@@ -862,9 +863,9 @@ pub async fn infer_all_contact_roles(
         .store
         .list_known_contacts(&account_id, "", 2000)
         .unwrap_or_default();
-    let ts = now_secs();
     let mut roles = load_roles(&state);
     let mut count = 0usize;
+    let mut web_lookups = 0usize;
     for c in contacts {
         if count >= BULK_AI_LIMIT {
             break;
@@ -874,14 +875,26 @@ pub async fn infer_all_contact_roles(
             continue;
         }
         let email_lc = email.to_lowercase();
-        // Skip manual tags and fresh, non-unknown entries.
+        // The user's explicit correction always wins. Automatic judgments are
+        // deliberately refreshed so newly synced correspondence can repair an
+        // earlier weak or wrong result.
         let skip = roles
             .iter()
-            .any(|r| r.email.to_lowercase() == email_lc && !needs_refresh(r, ts));
+            .any(|r| r.email.to_lowercase() == email_lc && r.source == RoleSource::Manual);
         if skip {
             continue;
         }
-        if let Ok(entry) = resolve_contact_role(&state, &account_id, &email).await {
+        if let Ok(entry) = resolve_contact_role(
+            &state,
+            &account_id,
+            &email,
+            web_lookups < 20,
+        )
+        .await
+        {
+            if entry.reasons.iter().any(|reason| reason.starts_with("联网核验")) {
+                web_lookups += 1;
+            }
             count += 1;
             let lc = entry.email.to_lowercase();
             match roles.iter_mut().find(|r| r.email.to_lowercase() == lc) {
@@ -1072,6 +1085,82 @@ fn try_load_provider(state: &AppState) -> Option<TranslateProviderConfig> {
     serde_json::from_str(&decrypted).ok()
 }
 
+async fn web_research_contact_role(
+    state: &AppState,
+    cfg: &TranslateProviderConfig,
+    email: &str,
+    name: &str,
+    signal_summary: &str,
+    corpus: &str,
+) -> Option<(ContactRole, RoleSource, f32, Vec<String>)> {
+    let (domain, _) = email_domain(email);
+    if domain.is_empty() {
+        return None;
+    }
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(14))
+        .user_agent("YaoAIMail/1.1 contact-role-research");
+    if let Ok(Some(proxy)) = get_global_proxy_raw(&state.crypto, &state.store) {
+        if let Ok(uri) = proxy.socks5h_uri() {
+            if let Ok(reqwest_proxy) = reqwest::Proxy::all(&uri) {
+                builder = builder.proxy(reqwest_proxy);
+            }
+        }
+    }
+    let client = builder.build().ok()?;
+    // Search the company domain, not the full personal mailbox, so the lookup
+    // is useful without sending a contact's local-part to public search engines.
+    let query = format!(
+        "\"{domain}\" company products manufacturer distributor importer retailer"
+    );
+    let items = crate::commands::search_router::search_free(state, &client, &query).await.items;
+    let email_lc = email.to_ascii_lowercase();
+    let domain_lc = domain.to_ascii_lowercase();
+    let relevant: Vec<_> = items
+        .into_iter()
+        .filter(|item| {
+            let haystack = format!("{} {} {}", item.title, item.url, item.description)
+                .to_ascii_lowercase();
+            haystack.contains(&email_lc) || haystack.contains(&domain_lc)
+        })
+        .take(6)
+        .collect();
+    if relevant.is_empty() {
+        return None;
+    }
+    let evidence = relevant
+        .iter()
+        .map(|item| format!("- {}\n  {}\n  {}", item.title, item.url, item.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let web_summary = format!(
+        "{signal_summary}\n联网搜索补充（仅可作为佐证，不能覆盖真实往来）：\n{evidence}"
+    );
+    let (role, source, confidence, mut reasons) = ai_classify_role(
+        state,
+        cfg,
+        email,
+        name,
+        &web_summary,
+        corpus,
+    )
+    .await
+    .ok()?;
+    let accepted = match role {
+        ContactRole::Customer | ContactRole::Supplier => confidence >= 0.82,
+        ContactRole::Service => confidence >= 0.85,
+        ContactRole::Neutral | ContactRole::Unknown => false,
+    };
+    if !accepted {
+        return None;
+    }
+    reasons.insert(
+        0,
+        format!("联网核验：找到 {} 条与该邮箱域名直接相关的公开结果", relevant.len()),
+    );
+    Some((role, source, confidence, reasons))
+}
+
 async fn ai_classify_role(
     state: &AppState,
     cfg: &TranslateProviderConfig,
@@ -1081,23 +1170,25 @@ async fn ai_classify_role(
     corpus: &str,
 ) -> std::result::Result<(ContactRole, RoleSource, f32, Vec<String>), PebbleError> {
     let proxy = get_global_proxy_raw(&state.crypto, &state.store)?;
-    let system = "You are a foreign-trade contact classifier. Decide the role of an email contact \
-relative to the user's company. Consider MULTIPLE independent signals (do NOT rely on keywords alone):\n\
-1) Email domain nationality: .cn/.com.cn/Chinese mail providers (qq/163) => likely domestic supplier/factory in China; \
-foreign ccTLDs (.de/.fr/.co.uk/.jp/.it/.com.br/...) or international mailboxes => likely overseas customer.\n\
-2) Language of past correspondence: mostly Chinese => likely domestic supplier; mostly English/foreign => likely overseas customer.\n\
-3) Trade direction: who pays / who issues documents? We send THEM quotes/PI/proforma/dispatch => they are a CUSTOMER. \
+    let system = "You are a conservative foreign-trade contact classifier. Decide the role of an email contact \
+relative to the user's company from actual correspondence. Never infer customer vs supplier from country, \
+domain suffix (.cn included), mailbox provider, language, nationality, or a company-sounding domain. \
+Those are not evidence of the commercial relationship. Use these rules:\n\
+1) Trade direction: who pays / who issues documents? We send THEM quotes/PI/proforma/dispatch => they are a CUSTOMER. \
 They send US cost/ex-factory price/production schedule => they are a SUPPLIER.\n\
-4) Communication content: inquiries for price/samples/orders/customization/branding => CUSTOMER; \
+2) Communication content: their inquiries for price/samples/orders/customization/branding => CUSTOMER; \
 talk of production line/tooling/materials/capacity/margin => SUPPLIER.\n\
-5) Who initiates: they ask for quotes/samples => CUSTOMER; they quote cost to us => SUPPLIER.\n\
-6) SERVICE PROVIDER check (do this FIRST): if the contact is a third party that neither buys from nor sells \
+3) Every sample is labelled [我方发出] or [对方发来]. Respect that direction and do not let quoted text \
+inside a reply override the newest message's actual direction.\n\
+4) SERVICE PROVIDER check (do this FIRST): if the contact is a third party that neither buys from nor sells \
 goods to us — freight forwarder, shipping line, customs broker, courier, inspection/certification body \
 (SGS, Bureau Veritas, Intertek, TUV, UL, CCIC, CE/ROHS/REACH testing labs), bank/insurer/payment platform, \
 B2B platform or system notification, exhibition organiser, law/accounting firm — then role is 'service'. \
 Typical clues: talk of booking, containers, bill of lading, customs clearance, vessel/ETD, inspection or \
 test reports, certificates, audits, remittance/LC handling, platform notices. A Chinese domain does NOT \
-make a forwarder a factory.\n\
+make a forwarder a factory. Automated, bulk, phishing or fraud mail is 'unknown', not a service provider.\n\
+5) If evidence is missing, mixed, indirect, or could fit both sides, return 'unknown'. Precision is more \
+important than coverage. Do not classify merely to fill the address book.\n\
 Return STRICT JSON (no markdown) with: 'role' = exactly one of 'customer' | 'supplier' | 'service' | 'neutral' | 'unknown'; \
 'confidence' = 0.0-1.0; 'reasons' = array of short Chinese sentences explaining the decision.";
     let user = format!(
@@ -1179,7 +1270,6 @@ sentences explaining each concern (empty if ok).";
 
 /// Rule-based role when AI is unavailable or history is thin.
 fn heuristic_role(
-    chinese_ratio: f32,
     direction_score: f32,
     addr_role: ContactRole,
     addr_conf: f32,
@@ -1192,18 +1282,11 @@ fn heuristic_role(
     }
     let mut score: f32 = 0.0;
     let mut reasons = Vec::new();
-    if chinese_ratio > 0.6 {
-        score -= 1.5;
-        reasons.push("历史邮件以中文为主，更可能是国内供应商".to_string());
-    } else if chinese_ratio < 0.3 && chinese_ratio > 0.0 {
-        score += 1.5;
-        reasons.push("历史邮件以英文/外文为主，更可能是海外客户".to_string());
-    }
-    if direction_score > 0.5 {
-        score += 2.0;
+    if direction_score >= 2.0 {
+        score += direction_score.min(5.0);
         reasons.push("沟通中由我们向其报价/发货，倾向于是客户".to_string());
-    } else if direction_score < -0.5 {
-        score -= 2.0;
+    } else if direction_score <= -2.0 {
+        score += direction_score.max(-5.0);
         reasons.push("沟通中由其向我们报成本/排产，倾向于是供应商".to_string());
     }
     // Blend with the address signal.
@@ -1249,4 +1332,56 @@ fn parse_json(raw: &str) -> serde_json::Value {
     let end = text.rfind('}').map(|i| i + 1).unwrap_or(text.len());
     let json = &text[start..end];
     serde_json::from_str::<serde_json::Value>(json).unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn country_domain_never_decides_business_role() {
+        let (cn_role, cn_confidence, _) = cheap_role_from_address("buyer@example.cn");
+        let (de_role, de_confidence, _) = cheap_role_from_address("factory@example.de");
+        let (qq_role, qq_confidence, _) = cheap_role_from_address("person@qq.com");
+        assert_eq!(cn_role, ContactRole::Unknown);
+        assert_eq!(de_role, ContactRole::Unknown);
+        assert_eq!(qq_role, ContactRole::Unknown);
+        assert_eq!(cn_confidence, 0.0);
+        assert_eq!(de_confidence, 0.0);
+        assert_eq!(qq_confidence, 0.0);
+    }
+
+    #[test]
+    fn automated_sender_is_not_a_business_contact() {
+        let (role, confidence, reasons) = cheap_role_from_address("no-reply@shop.example");
+        assert_eq!(role, ContactRole::Unknown);
+        assert_eq!(confidence, 0.0);
+        assert!(reasons.iter().any(|reason| reason.contains("系统/群发")));
+    }
+
+    #[test]
+    fn clear_service_domain_remains_service() {
+        let (role, confidence, _) = cheap_role_from_address("booking@sample-logistics.com");
+        assert_eq!(role, ContactRole::Service);
+        assert!(confidence >= 0.8);
+    }
+
+    #[test]
+    fn heuristic_requires_correspondence_margin() {
+        let weak = heuristic_role(1.0, ContactRole::Unknown, 0.0, Vec::new());
+        let customer = heuristic_role(3.0, ContactRole::Unknown, 0.0, Vec::new());
+        let supplier = heuristic_role(-3.0, ContactRole::Unknown, 0.0, Vec::new());
+        assert_eq!(weak.0, ContactRole::Unknown);
+        assert_eq!(customer.0, ContactRole::Customer);
+        assert_eq!(supplier.0, ContactRole::Supplier);
+    }
+
+    #[test]
+    fn obvious_phishing_requires_multiple_independent_markers() {
+        assert_eq!(suspicious_message_signals("hello", "ordinary business message"), 0);
+        assert!(suspicious_message_signals(
+            "Unusual activity",
+            "Verify your account now because your password expires today"
+        ) >= 2);
+    }
 }

@@ -4,7 +4,7 @@ import { sanitizeHtml } from "../../src/lib/sanitizeHtml";
 describe("sanitizeHtml", () => {
   it("restores safe inline image dimensions when sanitizing email signatures", () => {
     const sanitized = sanitizeHtml(
-      '<img src="https://example.com/rsg.png" style="max-width: unset; width: 72.095px; height: 62.2472px">',
+      '<img src="https://example.com/logo.png" style="max-width: unset; width: 72.095px; height: 62.2472px">',
     );
 
     const template = document.createElement("template");
@@ -27,7 +27,7 @@ describe("sanitizeHtml", () => {
     });
     try {
       const sanitized = sanitizeHtml(
-        '<img src="https://example.com/rsg.png" style="width: 72.095px; height: 62.2472px">',
+        '<img src="https://example.com/logo.png" style="width: 72.095px; height: 62.2472px">',
       );
       const template = document.createElement("template");
       template.innerHTML = sanitized;

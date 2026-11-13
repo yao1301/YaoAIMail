@@ -3,9 +3,10 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { getRenderedHtml } from "@/lib/api";
 import type { Message, RenderedHtml } from "@/lib/api";
-import { defaultPrivacyMode } from "@/lib/privacyMode";
+import { privacyModeToApi, useStoredPrivacyMode, type StoredPrivacyMode } from "@/lib/privacyMode";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
 import { ShadowDomEmail } from "./ShadowDomEmail";
+import { plainTextEmailToHtml } from "@/lib/historicalQuoteCards";
 
 interface Props {
   message: Message;
@@ -22,15 +23,21 @@ function formatFullDate(timestamp: number): string {
 export default function ThreadMessageBubble({ message, defaultExpanded = false }: Props) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(defaultExpanded);
-  const [rendered, setRendered] = useState<RenderedHtml | null>(null);
+  const privacyMode = useStoredPrivacyMode();
+  const [cached, setCached] = useState<{ id: string; mode: StoredPrivacyMode; html: RenderedHtml } | null>(null);
+  const rendered = cached?.id === message.id && cached.mode === privacyMode ? cached.html : null;
 
   useEffect(() => {
+    let current = true;
     if (expanded && !rendered) {
-      getRenderedHtml(message.id, defaultPrivacyMode())
-        .then((html) => setRendered({ ...html, html: sanitizeHtml(html.html) }))
+      getRenderedHtml(message.id, privacyModeToApi(privacyMode))
+        .then((html) => {
+          if (current) setCached({ id: message.id, mode: privacyMode, html: { ...html, html: sanitizeHtml(html.html) } });
+        })
         .catch((err) => console.warn("Failed to render thread message HTML", err));
     }
-  }, [expanded, rendered, message.id]);
+    return () => { current = false; };
+  }, [expanded, rendered, message.id, privacyMode]);
 
   return (
     <div
@@ -84,17 +91,7 @@ export default function ThreadMessageBubble({ message, defaultExpanded = false }
             )}
           </div>
           {/* Body content */}
-          {rendered?.html ? (
-            <ShadowDomEmail html={rendered.html} />
-          ) : (
-            <pre style={{
-              fontSize: "13px", color: "var(--color-text-primary)",
-              whiteSpace: "pre-wrap", wordBreak: "break-word",
-              margin: 0, fontFamily: "inherit",
-            }}>
-              {message.body_text}
-            </pre>
-          )}
+          <ShadowDomEmail html={rendered?.html || plainTextEmailToHtml(message.body_text || "")} />
         </div>
       )}
     </div>

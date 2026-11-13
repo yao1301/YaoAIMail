@@ -13,9 +13,14 @@ use crate::types::TranslateResult;
 fn build_deepl_form(text: &str, from: &str, to: &str) -> Vec<(String, String)> {
     let from_trimmed = from.trim();
     let omit_source = from_trimmed.is_empty() || from_trimmed.eq_ignore_ascii_case("auto");
+    let target = match to.trim().to_ascii_uppercase().as_str() {
+        "EN" => "EN-US".to_owned(),
+        "PT" => "PT-PT".to_owned(),
+        code => code.to_owned(),
+    };
     let mut form = vec![
         ("text".to_string(), text.to_string()),
-        ("target_lang".to_string(), to.trim().to_uppercase()),
+        ("target_lang".to_string(), target),
     ];
     if !omit_source {
         form.push(("source_lang".to_string(), from_trimmed.to_uppercase()));
@@ -114,5 +119,13 @@ mod tests {
     fn trims_and_uppercases_target() {
         let form = build_deepl_form("hello", "auto", "  zh-cn  ");
         assert_eq!(form_get(&form, "target_lang"), Some("ZH-CN"));
+    }
+
+    #[test]
+    fn uses_target_variants_for_generic_english_and_portuguese() {
+        for (requested, expected) in [("en", "EN-US"), ("pt", "PT-PT"), ("pt-BR", "PT-BR"), ("zh-Hant", "ZH-HANT"), ("ar", "AR")] {
+            let form = build_deepl_form("text", "auto", requested);
+            assert_eq!(form_get(&form, "target_lang"), Some(expected));
+        }
     }
 }

@@ -13,7 +13,7 @@ use pebble_rules::{RuleEngine, RuleTrigger};
 use pebble_search::TantivySearch;
 use pebble_store::Store;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -93,45 +93,47 @@ fn new_mail_event_payload(stored: &pebble_mail::StoredMessage) -> serde_json::Va
     })
 }
 
-fn rule_trigger_for_stored_message(
-    store: &Store,
-    stored: &pebble_mail::StoredMessage,
-) -> RuleTrigger {
-    let folder_ids: HashSet<&str> = stored.folder_ids.iter().map(String::as_str).collect();
-    let is_sent = store
-        .list_folders(&stored.message.account_id)
-        .map(|folders| {
-            folders.iter().any(|folder| {
-                folder.role == Some(FolderRole::Sent) && folder_ids.contains(folder.id.as_str())
-            })
-        })
-        .unwrap_or(false);
-    if is_sent {
-        RuleTrigger::Send
-    } else {
-        RuleTrigger::Receive
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncedMailKind { Incoming, Sent, FiledSent, Other }
+
+fn synced_mail_kind(store: &Store, stored: &pebble_mail::StoredMessage) -> pebble_core::Result<SyncedMailKind> {
+    let folders = store.list_folders(&stored.message.account_id)?;
+    let mut custom = false;
+    let mut inbox = false;
+    for folder in folders.iter().filter(|folder| stored.folder_ids.contains(&folder.id)) {
+        match folder.role {
+            Some(FolderRole::Sent) => return Ok(SyncedMailKind::Sent),
+            Some(FolderRole::Inbox) => inbox = true,
+            None if !folder.is_system => custom = true,
+            _ => {}
+        }
     }
+    if inbox { return Ok(SyncedMailKind::Incoming); }
+    if custom {
+        return Ok(if store.has_outgoing_copy(&stored.message)? { SyncedMailKind::FiledSent } else { SyncedMailKind::Incoming });
+    }
+    Ok(SyncedMailKind::Other)
 }
 
-fn should_send_new_mail_notification(
-    store: &Store,
-    stored: &pebble_mail::StoredMessage,
-) -> pebble_core::Result<bool> {
-    if !stored.notify || stored.message.is_read || stored.message.is_deleted || stored.message.is_draft {
-        return Ok(false);
-    }
+fn is_new_incoming(kind: SyncedMailKind, stored: &pebble_mail::StoredMessage) -> bool {
+    kind == SyncedMailKind::Incoming && stored.notify
+        && !stored.message.is_read && !stored.message.is_deleted && !stored.message.is_draft
+}
 
-    let folder_ids: HashSet<&str> = stored.folder_ids.iter().map(String::as_str).collect();
-    if folder_ids.is_empty() {
-        return Ok(false);
-    }
+#[cfg(test)]
+fn should_send_new_mail_notification(store: &Store, stored: &pebble_mail::StoredMessage) -> pebble_core::Result<bool> {
+    Ok(is_new_incoming(synced_mail_kind(store, stored)?, stored))
+}
 
-    let folders = store.list_folders(&stored.message.account_id)?;
-    Ok(folders.iter().any(|folder| {
-        let eligible = folder.role == Some(FolderRole::Inbox)
-            || (folder.role.is_none() && !folder.is_system);
-        eligible && folder_ids.contains(folder.id.as_str())
-    }))
+fn new_mail_notification_title(account: Option<&pebble_core::Account>) -> String {
+    let Some(account) = account else { return "新邮件".into(); };
+    let name = account.display_name.trim();
+    let email = account.email.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case(email) {
+        format!("新邮件 · {email}")
+    } else {
+        format!("新邮件 · {name} · {email}")
+    }
 }
 
 fn new_mail_notification_body(stored: &pebble_mail::StoredMessage) -> String {
@@ -179,10 +181,10 @@ fn open_message_from_notification(app: &tauri::AppHandle, account_id: &str, mess
     windows,
     all(not(windows), not(target_os = "linux"), not(target_os = "macos"))
 ))]
-fn show_default_new_mail_notification(app: &tauri::AppHandle, body: &str) -> Result<(), String> {
+fn show_default_new_mail_notification(app: &tauri::AppHandle, title: &str, body: &str) -> Result<(), String> {
     app.notification()
         .builder()
-        .title("YaoAIMail - New Mail")
+        .title(title)
         .body(body)
         .show()
         .map_err(|e| e.to_string())
@@ -191,6 +193,7 @@ fn show_default_new_mail_notification(app: &tauri::AppHandle, body: &str) -> Res
 #[cfg(target_os = "linux")]
 fn show_linux_new_mail_notification(
     app: &tauri::AppHandle,
+    title: &str,
     body: &str,
     account_id: &str,
     message_id: &str,
@@ -199,7 +202,7 @@ fn show_linux_new_mail_notification(
 
     let mut notification = notify_rust::Notification::new();
     notification
-        .summary("YaoAIMail - New Mail")
+        .summary(title)
         .body(body)
         .appname("YaoAIMail")
         .auto_icon()
@@ -237,6 +240,7 @@ fn is_macos_notification_open_response(
 #[cfg(target_os = "macos")]
 fn show_macos_new_mail_notification(
     app: &tauri::AppHandle,
+    title: &str,
     body: &str,
     account_id: &str,
     message_id: &str,
@@ -246,6 +250,7 @@ fn show_macos_new_mail_notification(
     let app_handle = app.clone();
     let account_id = account_id.to_string();
     let message_id = message_id.to_string();
+    let title = title.to_string();
     let body = body.to_string();
     let app_id = if tauri::is_dev() {
         "com.apple.Terminal".to_string()
@@ -259,7 +264,7 @@ fn show_macos_new_mail_notification(
             let _ = mac_notification_sys::set_application(&app_id);
             let mut notification = mac_notification_sys::Notification::new();
             notification
-                .title("YaoAIMail - New Mail")
+                .title(&title)
                 .message(&body)
                 .main_button(mac_notification_sys::MainButton::SingleAction("Open"))
                 .wait_for_click(true);
@@ -279,6 +284,7 @@ fn show_macos_new_mail_notification(
 #[cfg(windows)]
 fn show_windows_new_mail_notification(
     app: &tauri::AppHandle,
+    title: &str,
     body: &str,
     account_id: &str,
     message_id: &str,
@@ -288,7 +294,7 @@ fn show_windows_new_mail_notification(
     let account_id = account_id.to_string();
     let message_id = message_id.to_string();
     tauri_winrt_notification::Toast::new(&notifications::windows_notification_app_id(app))
-        .title("YaoAIMail - New Mail")
+        .title(title)
         .text1(body)
         .duration(tauri_winrt_notification::Duration::Short)
         .add_button("Open", NOTIFICATION_OPEN_ACTION)
@@ -308,6 +314,7 @@ fn show_windows_new_mail_notification(
 
 fn show_new_mail_notification(
     app: &tauri::AppHandle,
+    title: &str,
     stored: &pebble_mail::StoredMessage,
 ) -> Result<(), String> {
     let body = new_mail_notification_body(stored);
@@ -319,10 +326,11 @@ fn show_new_mail_notification(
             // Windows 7 has no actionable WinRT toast. The notification plugin's
             // windows7-compat path uses a native balloon without loading the
             // unsupported packaged-app notification APIs.
-            return show_default_new_mail_notification(app, &body);
+            return show_default_new_mail_notification(app, title, &body);
         }
         match show_windows_new_mail_notification(
             app,
+            title,
             &body,
             &stored.message.account_id,
             &stored.message.id,
@@ -330,24 +338,24 @@ fn show_new_mail_notification(
             Ok(()) => Ok(()),
             Err(e) => {
                 warn!("Failed to show clickable Windows notification, falling back: {e}");
-                show_default_new_mail_notification(app, &body)
+                show_default_new_mail_notification(app, title, &body)
             }
         }
     }
 
     #[cfg(target_os = "linux")]
     {
-        show_linux_new_mail_notification(app, &body, &stored.message.account_id, &stored.message.id)
+        show_linux_new_mail_notification(app, title, &body, &stored.message.account_id, &stored.message.id)
     }
 
     #[cfg(target_os = "macos")]
     {
-        show_macos_new_mail_notification(app, &body, &stored.message.account_id, &stored.message.id)
+        show_macos_new_mail_notification(app, title, &body, &stored.message.account_id, &stored.message.id)
     }
 
     #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
     {
-        show_default_new_mail_notification(app, &body)
+        show_default_new_mail_notification(app, title, &body)
     }
 }
 
@@ -367,18 +375,10 @@ fn maybe_send_new_mail_notification(
         return;
     }
 
-    match should_send_new_mail_notification(store, stored) {
-        Ok(true) => {
-            if let Err(e) = show_new_mail_notification(app, stored) {
-                warn!("Failed to show new mail notification: {e}");
-            }
-            notifications::mark_attention_indicator(app);
-        }
-        Ok(false) => {}
-        Err(e) => warn!(
-            "Failed to evaluate new mail notification eligibility for message {}: {e}",
-            stored.message.id
-        ),
+    let account = store.get_account(&stored.message.account_id).ok().flatten();
+    let title = new_mail_notification_title(account.as_ref());
+    if let Err(e) = show_new_mail_notification(app, &title, stored) {
+        warn!("Failed to show new mail notification: {e}");
     }
 }
 
@@ -445,17 +445,27 @@ pub async fn index_new_messages(
             }
         };
 
+        let kind = synced_mail_kind(store, &stored).unwrap_or_else(|error| {
+            warn!("Failed to classify synced message: {error}");
+            SyncedMailKind::Other
+        });
         if let Some(ref app) = app {
-            let _ = app.emit(events::MAIL_NEW, new_mail_event_payload(&stored));
-            maybe_send_new_mail_notification(app, store, &stored);
+            let is_new = is_new_incoming(kind, &stored);
+            let event = if is_new { events::MAIL_NEW } else { events::MAIL_MESSAGES_CHANGED };
+            let _ = app.emit(event, new_mail_event_payload(&stored));
+            if is_new { maybe_send_new_mail_notification(app, store, &stored); }
         }
 
         let account_id = stored.message.account_id.clone();
         let engine = engines
             .entry(account_id.clone())
             .or_insert_with(|| load_engine(store, &account_id));
-        if let Some(engine) = engine.as_ref() {
-            let trigger = rule_trigger_for_stored_message(store, &stored);
+        let trigger = match kind {
+            SyncedMailKind::Sent => Some(RuleTrigger::Send),
+            SyncedMailKind::FiledSent => None, // Sync echo of a send already filed into a mixed folder.
+            SyncedMailKind::Incoming | SyncedMailKind::Other => Some(RuleTrigger::Receive),
+        };
+        if let (Some(engine), Some(trigger)) = (engine.as_ref(), trigger) {
             let actions = engine.evaluate_for_trigger(&stored.message, trigger);
             for action in actions {
                 if let Err(e) = apply_rule_action(
@@ -718,6 +728,9 @@ fn queue_remote_rule_action(
 
     match action {
         RuleAction::MarkRead => {
+            if pebble_store::local_messages::is_local_message_id(&message.remote_id) {
+                return Ok(false);
+            }
             if account.provider == ProviderType::Imap
                 && source_folder
                     .as_ref()
@@ -986,6 +999,28 @@ mod rule_writeback_tests {
             notify: true,
         };
 
+        assert!(should_send_new_mail_notification(&store, &stored).unwrap());
+    }
+
+    #[test]
+    fn filed_outgoing_mail_does_not_alert_but_a_separate_inbox_delivery_can() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let inbox = test_folder(&account.id);
+        let mut sent = test_folder(&account.id);
+        sent.remote_id = "Sent".into();
+        sent.role = Some(FolderRole::Sent);
+        let custom = test_label(&account.id, "Projects", "Projects");
+        for folder in [&inbox, &sent, &custom] { store.insert_folder(folder).unwrap(); }
+        let mut sent_message = test_message(&account.id);
+        sent_message.message_id_header = Some("<outbound@example.test>".into());
+        store.insert_message(&sent_message, &[sent.id.clone()]).unwrap();
+        let mut stored = pebble_mail::StoredMessage { message: sent_message, folder_ids: vec![sent.id, custom.id.clone()], notify: true };
+        assert!(!should_send_new_mail_notification(&store, &stored).unwrap());
+        stored.folder_ids = vec![custom.id];
+        assert!(!should_send_new_mail_notification(&store, &stored).unwrap());
+        stored.folder_ids = vec![inbox.id];
         assert!(should_send_new_mail_notification(&store, &stored).unwrap());
     }
 

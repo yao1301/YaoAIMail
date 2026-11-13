@@ -2,6 +2,7 @@ use crate::state::AppState;
 use pebble_core::traits::LabelProvider;
 use pebble_core::{Message, PebbleError, ProviderType};
 use pebble_mail::{ImapConfig, ImapProvider};
+use pebble_store::local_messages::is_local_message_id;
 use serde_json::json;
 use tauri::State;
 
@@ -45,6 +46,10 @@ pub async fn update_message_flags(
                 Some(m) => m,
                 None => return Ok(WritebackInfo::None),
             };
+
+            if is_local_message_id(&msg.remote_id) {
+                return Ok(WritebackInfo::None);
+            }
 
             let provider_type = store
                 .get_account(&msg.account_id)?

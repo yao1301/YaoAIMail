@@ -68,7 +68,10 @@ export default function ToastContainer() {
               strokeWidth={toast.type === "success" ? 2.5 : 2}
               style={{ flexShrink: 0 }}
             />
-            <span style={{ flex: 1, lineHeight: 1.4 }}>{toast.message}</span>
+            <div style={{ flex: 1, minWidth: 0, lineHeight: 1.4, overflowWrap: 'anywhere' }}>
+              {toast.title && <div style={{ fontWeight: 650, fontSize: 12, marginBottom: 4 }}>{toast.title}</div>}
+              <span>{toast.message}</span>
+            </div>
             {toast.action && (
               <button
                 onClick={() => {

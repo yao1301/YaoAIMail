@@ -4,7 +4,7 @@ function extensionOf(filename: string): string {
 }
 
 async function extractPdf(file: File): Promise<string> {
-  const [{ GlobalWorkerOptions, getDocument }, workerModule] = await Promise.all([
+  const [{ GlobalWorkerOptions, getDocument, OPS }, workerModule] = await Promise.all([
     import("pdfjs-dist"),
     import("pdfjs-dist/build/pdf.worker.min.mjs?url"),
   ]);
@@ -12,17 +12,25 @@ async function extractPdf(file: File): Promise<string> {
   const data = new Uint8Array(await file.arrayBuffer());
   const pdf = await getDocument({ data }).promise;
   const pages: string[] = [];
-  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-    const page = await pdf.getPage(pageNumber);
-    const content = await page.getTextContent();
-    const text = content.items
-      .map((item) => ("str" in item ? item.str : ""))
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (text) pages.push(`[[PAGE:${pageNumber}]]\n${text}`);
-  }
-  return pages.join("\n\n");
+  try {
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const content = await page.getTextContent();
+      const text = content.items
+        .map((item) => ("str" in item ? item.str + (item.hasEOL ? "\n" : " ") : ""))
+        .join("")
+        .replace(/[^\S\n]+/g, " ")
+        .trim();
+      if (text) pages.push(`[[PAGE:${pageNumber}]]\n${text}`);
+      else {
+        const operations = await page.getOperatorList();
+        if (operations.fnArray.some(op => op === OPS.paintImageXObject || op === OPS.paintInlineImageXObject || op === OPS.paintImageMaskXObject)) {
+          throw new Error(`第 ${pageNumber} 页是没有可提取文字的图片页，需要 OCR；没有跳过后继续。`);
+        }
+      }
+    }
+    return pages.join("\n\n");
+  } finally { await pdf.destroy(); }
 }
 
 async function extractWorkbook(file: File): Promise<string> {

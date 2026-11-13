@@ -5,12 +5,15 @@ import Placeholder from "@tiptap/extension-placeholder";
 import { TextStyle } from "@tiptap/extension-text-style";
 import FontFamily from "@tiptap/extension-font-family";
 import Image from "@tiptap/extension-image";
-import { TableKit } from "@tiptap/extension-table";
 import Underline from "@tiptap/extension-underline";
 import { Markdown as MarkdownExtension } from "tiptap-markdown";
 import TurndownService from "turndown";
 import { getSignature, listEmailSignatures } from "@/lib/signatures";
-import { sanitizeHtml } from "@/lib/sanitizeHtml";
+import { extractComposeBodyHtml } from "@/lib/composeBody";
+export { extractComposeBodyHtml } from "@/lib/composeBody";
+import { inlineEmbeddedImages } from "@/lib/inlineImages";
+import { markdownToHtml } from "@/lib/renderMarkdown";
+import { composeTableExtensions } from "@/features/compose/composeTableExtensions";
 import type { EmailAddress, Message } from "@/lib/ipc-types";
 import type { TFunction } from "i18next";
 
@@ -31,6 +34,7 @@ interface UseComposeEditorArgs {
     quotedReplyHtml?: string;
   } | null;
   prefillBody?: string;
+  aiGenerated?: boolean;
   preferredSignatureId?: string;
 }
 
@@ -40,12 +44,17 @@ interface BuildComposeEditorContentArgs {
   isReply: boolean;
   signatureHtml: string;
   prefillBody?: string;
+  aiGenerated?: boolean;
   t: TFunction;
+  /** `composeReplyTo.body_html_raw` with `cid:` images resolved to data: URLs. */
+  hydratedBodyHtml?: string | null;
 }
 
 interface BuildReplyQuoteHtmlArgs {
   composeReplyTo: Message | null;
   t: TFunction;
+  /** `composeReplyTo.body_html_raw` with `cid:` images resolved to data: URLs. */
+  hydratedBodyHtml?: string | null;
 }
 
 interface ShouldApplyInitialEditorContentArgs {
@@ -115,65 +124,34 @@ function plainTextToParagraphs(text: string) {
   return paragraphs || "<p></p>";
 }
 
-function parseBodyHtml(html: string) {
-  const doc = new DOMParser().parseFromString(html, "text/html");
-  return doc.body.innerHTML;
-}
-
-function decodeHtmlEntities(value: string) {
-  const doc = new DOMParser().parseFromString(value, "text/html");
-  return doc.body.textContent ?? "";
-}
-
-function startsWithEncodedHtmlTag(value: string) {
-  return /^\s*(?:&lt;|&#0*60;|&#x0*3c;)\s*\/?[a-z][\w:-]*(?:\s|\/?(?:&gt;|&#0*62;|&#x0*3e;))/i.test(value);
-}
-
-function looksLikeHtml(value: string) {
-  return /<\s*\/?[a-z][\w:-]*(?:\s|\/?>)/i.test(value);
-}
-
-export function extractComposeBodyHtml(html: string) {
-  try {
-    const source = html.trim();
-    let body = parseBodyHtml(source);
-    const decoded = decodeHtmlEntities(body).trim();
-
-    if (startsWithEncodedHtmlTag(source) && decoded !== body.trim() && looksLikeHtml(decoded)) {
-      body = parseBodyHtml(decoded);
-    }
-
-    return sanitizeHtml(body);
-  } catch {
-    return `<p>${escapeHtml(html)}</p>`;
-  }
-}
-
 export function buildComposeEditorContent({
   composeMode,
   composeReplyTo,
   isReply,
   signatureHtml,
   prefillBody,
+  aiGenerated,
   t,
+  hydratedBodyHtml,
 }: BuildComposeEditorContentArgs) {
   try {
     if (isReply && composeReplyTo) {
       const replyBody = prefillBody?.trim()
-        ? plainTextToParagraphs(prefillBody)
+        ? (aiGenerated ? markdownToHtml(prefillBody) : plainTextToParagraphs(prefillBody))
         : "<p><br></p>";
       return `${replyBody}${signatureHtml}`;
     }
     if (composeMode === "forward" && composeReplyTo) {
       const sender = escapeHtml(composeReplyTo.from_name || composeReplyTo.from_address || "");
       const fwdSubject = escapeHtml(composeReplyTo.subject || "");
-      const body = composeReplyTo.body_html_raw
-        ? extractComposeBodyHtml(composeReplyTo.body_html_raw)
+      const sourceHtml = hydratedBodyHtml ?? composeReplyTo.body_html_raw;
+      const body = sourceHtml
+        ? extractComposeBodyHtml(sourceHtml)
         : `<p>${escapeHtml(composeReplyTo.body_text || "")}</p>`;
       return `${signatureHtml}<br/><br/><p>${escapeHtml(t("compose.forwardedHeader"))}</p><p>${escapeHtml(t("compose.forwardedFrom", { sender }))}</p><p>${escapeHtml(t("compose.forwardedSubject", { subject: fwdSubject }))}</p>${body}`;
     }
     if (composeMode === "new" && prefillBody?.trim()) {
-      return `${plainTextToParagraphs(prefillBody)}${signatureHtml}`;
+      return `${aiGenerated ? markdownToHtml(prefillBody) : plainTextToParagraphs(prefillBody)}${signatureHtml}`;
     }
     return signatureHtml;
   } catch (err) {
@@ -182,7 +160,7 @@ export function buildComposeEditorContent({
   }
 }
 
-export function buildReplyQuoteHtml({ composeReplyTo, t }: BuildReplyQuoteHtmlArgs) {
+export function buildReplyQuoteHtml({ composeReplyTo, t, hydratedBodyHtml }: BuildReplyQuoteHtmlArgs) {
   if (!composeReplyTo) return "";
 
   const sender = formatQuoteAddress({
@@ -193,8 +171,9 @@ export function buildReplyQuoteHtml({ composeReplyTo, t }: BuildReplyQuoteHtmlAr
   const to = formatQuoteAddressList(composeReplyTo.to_list || []);
   const cc = formatQuoteAddressList(composeReplyTo.cc_list || []);
   const subject = escapeHtml(composeReplyTo.subject || "");
-  const body = composeReplyTo.body_html_raw
-    ? extractComposeBodyHtml(composeReplyTo.body_html_raw)
+  const sourceHtml = hydratedBodyHtml ?? composeReplyTo.body_html_raw;
+  const body = sourceHtml
+    ? extractComposeBodyHtml(sourceHtml)
     : `<p>${escapeHtml(composeReplyTo.body_text || "")}</p>`;
   return `<div class="compose-original-quote" style="margin:18px 0 0;border:1px solid #d9dde3;border-radius:10px;overflow:hidden;background:#ffffff;color:#24292f;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.55"><div style="padding:12px 14px;background:#f3f4f6;border-bottom:1px solid #d9dde3"><div style="margin:0 0 7px;color:#4b5563;font-size:12px;font-weight:700">${escapeHtml(t("compose.originalMessage"))}</div><table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;font:inherit"><tbody>${quoteHeaderRow(t("compose.from"), sender)}${quoteHeaderRow(t("compose.sentDate"), dateStr)}${quoteHeaderRow(t("compose.to"), to)}${quoteHeaderRow(t("compose.cc"), cc)}${quoteHeaderRow(t("compose.subject"), subject)}</tbody></table></div><div style="padding:14px 16px;background:#ffffff">${body}</div></div>`;
 }
@@ -224,6 +203,7 @@ export function useComposeEditor({
   t,
   restoredDraft,
   prefillBody,
+  aiGenerated,
   preferredSignatureId,
 }: UseComposeEditorArgs) {
   const [editorMode, setEditorMode] = useState<EditorMode>(restoredDraft?.editorMode ?? "rich");
@@ -277,12 +257,46 @@ export function useComposeEditor({
     return `<br/><br/><div style="color:var(--color-text-secondary);font-size:13px">--<br/>${body}</div>`;
   }, [signature]);
 
+  // The stored body_html_raw keeps the original `cid:` references for inline
+  // images (logos, signature banners). Resolve them to data: URLs the same way
+  // the reading view does, so reply/forward quotes keep their images.
+  const [hydratedBodyHtml, setHydratedBodyHtml] = useState<string | null>(null);
+  const [quoteHydrationSettled, setQuoteHydrationSettled] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    setHydratedBodyHtml(null);
+    const raw = composeReplyTo?.body_html_raw;
+    if (!composeReplyTo?.id || !raw || !/\bcid:/i.test(raw)) {
+      setQuoteHydrationSettled(true);
+      return;
+    }
+    setQuoteHydrationSettled(false);
+    // Local attachment reads are fast, but never block compose initialization
+    // for more than 1.5s — fall back to the unhydrated HTML.
+    const fallbackTimer = setTimeout(() => setQuoteHydrationSettled(true), 1500);
+    inlineEmbeddedImages(raw, composeReplyTo.id)
+      .then((hydrated) => {
+        if (!cancelled) setHydratedBodyHtml(hydrated);
+      })
+      .catch(() => {
+        // Keep the raw HTML; broken images are still better than an empty quote.
+      })
+      .finally(() => {
+        clearTimeout(fallbackTimer);
+        if (!cancelled) setQuoteHydrationSettled(true);
+      });
+    return () => {
+      cancelled = true;
+      clearTimeout(fallbackTimer);
+    };
+  }, [composeReplyTo?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const editorContent = useMemo(() => {
-    return buildComposeEditorContent({ composeMode, composeReplyTo, isReply, signatureHtml, prefillBody, t });
-  }, [composeMode, composeReplyTo, isReply, t, signatureHtml, prefillBody]);
+    return buildComposeEditorContent({ composeMode, composeReplyTo, isReply, signatureHtml, prefillBody, aiGenerated, t, hydratedBodyHtml });
+  }, [composeMode, composeReplyTo, isReply, t, signatureHtml, prefillBody, aiGenerated, hydratedBodyHtml]);
   const generatedQuotedReplyHtml = useMemo(() => {
-    return isReply ? buildReplyQuoteHtml({ composeReplyTo, t }) : "";
-  }, [composeReplyTo, isReply, t]);
+    return isReply ? buildReplyQuoteHtml({ composeReplyTo, t, hydratedBodyHtml }) : "";
+  }, [composeReplyTo, isReply, t, hydratedBodyHtml]);
   // The reply target is a live store object. It can briefly disappear while
   // switching compose tabs, applying an AI draft, or restoring a backend
   // draft. A reply must keep the original quote that was visible when the
@@ -293,8 +307,20 @@ export function useComposeEditor({
   );
   useEffect(() => {
     if (!isReply || stableQuotedReplyHtml || !generatedQuotedReplyHtml) return;
+    // Wait for cid: hydration (or its 1.5s fallback) so the captured quote
+    // keeps the original images instead of broken references.
+    if (!quoteHydrationSettled) return;
     setStableQuotedReplyHtml(generatedQuotedReplyHtml);
-  }, [generatedQuotedReplyHtml, isReply, stableQuotedReplyHtml]);
+  }, [generatedQuotedReplyHtml, isReply, stableQuotedReplyHtml, quoteHydrationSettled]);
+  // If the fallback timer fired first and the quote was captured without
+  // images, replace it once hydration delivers them.
+  useEffect(() => {
+    if (!isReply || !hydratedBodyHtml) return;
+    if (stableQuotedReplyHtml.includes("cid:")) {
+      const regenerated = buildReplyQuoteHtml({ composeReplyTo, t, hydratedBodyHtml });
+      if (!regenerated.includes("cid:")) setStableQuotedReplyHtml(regenerated);
+    }
+  }, [hydratedBodyHtml, isReply, composeReplyTo, t, stableQuotedReplyHtml]);
   const quotedReplyHtml = stableQuotedReplyHtml || generatedQuotedReplyHtml;
 
   const editor = useEditor({
@@ -303,18 +329,7 @@ export function useComposeEditor({
       StarterKit,
       Placeholder.configure({ placeholder: t("compose.editorPlaceholder", "Write your message...") }),
       MarkdownExtension.configure({ html: true, transformPastedText: true }),
-      TableKit.configure({
-        table: {
-          resizable: false,
-          HTMLAttributes: { style: "border-collapse:collapse;width:100%;max-width:100%;margin:12px 0" },
-        },
-        tableCell: {
-          HTMLAttributes: { style: "border:1px solid #d1d5db;padding:6px 8px;vertical-align:top" },
-        },
-        tableHeader: {
-          HTMLAttributes: { style: "border:1px solid #cbd5e1;padding:6px 8px;background-color:#f3f4f6;font-weight:600;text-align:left" },
-        },
-      }),
+      ...composeTableExtensions(),
       TextStyle,
       FontFamily.configure({ types: ["textStyle"] }),
       Image.configure({ inline: true, allowBase64: true }),
@@ -325,6 +340,7 @@ export function useComposeEditor({
 
   // Set editor content after creation to avoid initialization crashes
   useEffect(() => {
+    if (!quoteHydrationSettled) return;
     if (!shouldApplyInitialEditorContent({
       editorExists: Boolean(editor),
       initialized: contentInitializedRef.current,
@@ -342,7 +358,7 @@ export function useComposeEditor({
     }
     contentInitializedRef.current = true;
     setEditorContentReady(true);
-  }, [editor, editorContent, isReply, restoredDraft, signatureReady]);
+  }, [editor, editorContent, isReply, restoredDraft, signatureReady, quoteHydrationSettled]);
 
   useEffect(() => {
     if (!editor) {
@@ -400,6 +416,8 @@ export function useComposeEditor({
     switchMode,
     textareaRef,
     editorContentReady,
+    signature,
+    signatureHtml,
     quotedReplyHtml,
   };
 }

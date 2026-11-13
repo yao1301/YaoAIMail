@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useWorkspaceState } from '@/lib/workspaceState';
+import { useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Calculator, CalendarDays, Clock3, Copy, ExternalLink, PackageSearch, Plus, RefreshCw, Search, TrendingUp, X } from "lucide-react";
 import { aiPrompt, getDashboardData, type DashboardData } from "@/lib/api";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { useToastStore } from "@/stores/toast.store";
 import MarkdownView from "@/lib/renderMarkdown";
-import { identifyTrackingLookup, type TrackingLookup } from "./trackingLookup";
+import TrackingTools from "./TrackingTools";
+import { FOREIGN_TOOL_SOURCES, hsCodeLookupUrl } from "./foreignToolSources";
 
 const HS_SYSTEM = `你是外贸商品归类辅助员。请基于当前有效的 HS 2022 或目的国最新税则判断，不要沿用已经失效的编码。先判断商品本质、材料、功能、工作方式、是否成套、功率和用途，再给出最可能的编码、需要排除的候选、仍需确认的参数，并提醒用户最终在 WCO 或目的国官方税则复核。不确定时保留 6 位，不要编造十位税号。用中文回答。`;
 
@@ -104,22 +106,20 @@ function currencyLabel(code: string) {
 }
 
 export default function ForeignToolsTab() {
-  const [hsInput, setHsInput] = useState("");
-  const [hsOutput, setHsOutput] = useState("");
-  const [hsBusy, setHsBusy] = useState(false);
-  const [trackNo, setTrackNo] = useState("");
-  const [trackingResult, setTrackingResult] = useState<TrackingLookup | null>(null);
-  const [container, setContainer] = useState<keyof typeof CONTAINERS>("40HQ");
-  const [length, setLength] = useState(50);
-  const [width, setWidth] = useState(40);
-  const [height, setHeight] = useState(35);
-  const [weight, setWeight] = useState(12);
-  const [dashboard, setDashboard] = useState<DashboardData | null>(null);
-  const [dashboardBusy, setDashboardBusy] = useState(false);
-  const [now, setNow] = useState(() => new Date());
-  const [newCity, setNewCity] = useState("北京");
-  const [newCurrency, setNewCurrency] = useState("AUD");
-  const [currencies, setCurrencies] = useState<Array<{ code: string; amount: number }>>(() => {
+  const [hsInput, setHsInput] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:hsInput", "");
+  const [hsOutput, setHsOutput] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:hsOutput", "");
+  const [hsBusy, setHsBusy] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:hsBusy", false);
+  const [container, setContainer] = useWorkspaceState<keyof typeof CONTAINERS>("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:container", "40HQ");
+  const [length, setLength] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:length", 50);
+  const [width, setWidth] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:width", 40);
+  const [height, setHeight] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:height", 35);
+  const [weight, setWeight] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:weight", 12);
+  const [dashboard, setDashboard] = useWorkspaceState<DashboardData | null>("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:dashboard", null);
+  const [dashboardBusy, setDashboardBusy] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:dashboardBusy", false);
+  const [now, setNow] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:now", () => new Date());
+  const [newCity, setNewCity] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:newCity", "北京");
+  const [newCurrency, setNewCurrency] = useWorkspaceState("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:newCurrency", "AUD");
+  const [currencies, setCurrencies] = useWorkspaceState<Array<{ code: string; amount: number }>>("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:currencies", () => {
     try {
       const parsed = JSON.parse(localStorage.getItem(CURRENCIES_KEY) || "null");
       if (!Array.isArray(parsed)) return DEFAULT_CURRENCIES;
@@ -127,7 +127,7 @@ export default function ForeignToolsTab() {
       return valid;
     } catch { return DEFAULT_CURRENCIES; }
   });
-  const [zones, setZones] = useState<Array<{ city: string; zone: string }>>(() => {
+  const [zones, setZones] = useWorkspaceState<Array<{ city: string; zone: string }>>("src/features/settings/ForeignToolsTab.tsx:ForeignToolsTab:zones", () => {
     try {
       const parsed = JSON.parse(localStorage.getItem(ZONES_KEY) || "null");
       return Array.isArray(parsed) && parsed.length ? parsed : DEFAULT_CITIES;
@@ -166,27 +166,13 @@ export default function ForeignToolsTab() {
     return { volume, cartonVolume, byVolume, byWeight, estimated: Math.max(0, Math.min(byVolume, byWeight)) };
   }, [container, length, width, height, weight]);
 
-  const open = (url: string) => invoke("open_external_url", { url });
-  async function runSmartTracking() {
-    const result = identifyTrackingLookup(trackNo);
-    if (!result) {
-      useToastStore.getState().addToast({ message: "请先输入单号", type: "info" });
-      return;
-    }
-    setTrackingResult(result);
-    try {
-      await open(result.url);
-      useToastStore.getState().addToast({ message: `已识别为${result.label}，正在打开 ${result.provider}`, type: "success" });
-    } catch (error) {
+  async function open(url: string) {
+    try { await invoke("open_external_url", { url }); return true; }
+    catch (error) {
       useToastStore.getState().addToast({ message: `无法打开查询网站：${extractErrorMessage(error)}`, type: "error" });
+      return false;
     }
   }
-  const trackingLinks = [
-    ["集装箱 / 提单综合追踪", `https://www.searates.com/container/tracking/?number=${encodeURIComponent(trackNo)}`],
-    ["船舶 AIS 查询", "https://www.vesselfinder.com/"],
-    ["国际快递 17TRACK", `https://www.17track.net/zh-cn?nums=${encodeURIComponent(trackNo)}`],
-    ["空运单 Track-Trace", "https://www.track-trace.com/aircargo"],
-  ];
   const holidays = (dashboard?.holidays ?? []).filter((item) => new Date(`${item.date}T23:59:59`) >= now).slice(0, 8);
   const cnyPerUsd = dashboard?.usdRates?.CNY;
   const availableCurrencies = [...new Set(["USD", "EUR", "GBP", "HKD", "JPY", "AUD", "CAD", "CHF", "CNY", "NZD", "SGD", "KRW", "INR", "THB", "MYR", "IDR", "PHP", "AED", "SAR", "TRY", "MXN", "BRL", "ZAR", "SEK", "NOK", "DKK", "PLN", "CZK", "HUF", ...Object.keys(dashboard?.usdRates ?? {})])].sort();
@@ -291,20 +277,12 @@ export default function ForeignToolsTab() {
       <ToolSection icon={<Search size={16} />} title="HS 编码辅助查询">
         <textarea style={{ ...input, minHeight: 74, resize: "vertical" }} value={hsInput} onChange={(event) => setHsInput(event.target.value)} placeholder="尽量写清材料、用途、工作原理、功率、是否成套、附件以及目的国；不要只写商品名称。" />
         <button type="button" disabled={hsBusy} onClick={() => void runHs()} style={primary}>{hsBusy ? "正在分析…" : "按最新 HS 辅助判断"}</button>
-        <div style={links}>{[["HS编码网（过滤过期编码）", `https://www.hsbianma.com/Search?keywords=${encodeURIComponent(hsInput)}`], ["WCO Trade Tools", "https://www.wcotradetools.org/en/harmonized-system"], ["中国海关税则查询", "http://online.customs.gov.cn/static/pages/taxRateQuery.html"]].map(([label, url]) => <LinkButton key={label} label={label} url={url} open={open} />)}</div>
+        <div style={links}>{[["HS编码网（过滤过期编码）", hsCodeLookupUrl(hsInput)], ["WCO Trade Tools", FOREIGN_TOOL_SOURCES.wco], ["中国海关查询目录", FOREIGN_TOOL_SOURCES.customs]].map(([label, url]) => <LinkButton key={label} label={label} url={url} open={open} />)}</div>
         {hsOutput && <Result text={hsOutput} />}
       </ToolSection>
 
       <ToolSection icon={<PackageSearch size={16} />} title="物流、集装箱与空运追踪">
-        <form onSubmit={(event) => { event.preventDefault(); void runSmartTracking(); }} style={{ display: "flex", gap: 8 }}>
-          <input style={input} value={trackNo} onChange={(event) => { setTrackNo(event.target.value); setTrackingResult(null); }} placeholder="输入物流单号、集装箱号、IMO 或 MMSI，按回车直接查询" aria-label="物流智能查询单号" />
-          <button type="submit" style={{ ...primary, marginTop: 0, whiteSpace: "nowrap" }}><Search size={14} />智能查询</button>
-        </form>
-        {trackingResult && <div role="status" style={{ marginTop: 8, padding: "7px 9px", borderRadius: 7, background: "color-mix(in srgb, var(--color-accent) 9%, var(--color-bg-secondary))", color: "var(--color-text-secondary)", fontSize: 12 }}>已识别：<strong style={{ color: "var(--color-accent)" }}>{trackingResult.label}</strong> · {trackingResult.provider}</div>}
-        <p style={{ ...hint, margin: "7px 0 0" }}>会优先识别 ISO 集装箱号、IMO/MMSI 船舶号；其余单号按普通国际物流查询。无法确定时不会冒充船舶或集装箱结果。</p>
-        <div style={{ ...hint, marginTop: 9 }}>手动选择其他查询渠道：</div>
-        <div style={links}>{trackingLinks.map(([label, url]) => <LinkButton key={label} label={label} url={url} open={open} />)}</div>
-        <p style={hint}>不同船公司和航空公司的数据授权不同，综合站查不到时请进入承运人官网复核。</p>
+        <TrackingTools />
       </ToolSection>
 
       <ToolSection icon={<Calculator size={16} />} title="装柜数量快速估算">

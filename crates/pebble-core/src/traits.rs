@@ -44,6 +44,8 @@ pub struct AuthCredentials {
 }
 
 pub struct OutgoingMessage {
+    /// Frozen outgoing identity; a local account label never replaces it.
+    pub from: Option<EmailAddress>,
     pub to: Vec<EmailAddress>,
     pub cc: Vec<EmailAddress>,
     pub bcc: Vec<EmailAddress>,

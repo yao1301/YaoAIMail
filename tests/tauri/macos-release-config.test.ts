@@ -18,8 +18,11 @@ describe("macOS release configuration", () => {
     expect(tauriConfig.version).toBe(packageJson.version);
     expect(cargoVersion).toBe(packageJson.version);
     expect(changelog).toContain(`## [${packageJson.version}] - `);
-    expect(changelog).toContain(`[Unreleased]: https://github.com/QingJ01/Pebble/compare/v${packageJson.version}...HEAD`);
-    expect(releaseWorkflow).toContain(`default: v${packageJson.version}`);
+    // Personal builds have no upstream tag. Manual workflows require an
+    // explicit tag instead of silently rebuilding a previously published one.
+    const manualTag = releaseWorkflow.match(/^      tag:\n((?:        [^\n]+\n)+)/m)?.[1];
+    expect(manualTag).toContain("required: true");
+    expect(manualTag).not.toMatch(/^        default:/m);
   });
 
   it("defines explicit desktop build scripts for Windows, macOS, and Linux bundles", () => {

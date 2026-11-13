@@ -2,27 +2,16 @@ import { useEffect, useState } from "react";
 import ComposeView from "@/features/compose/ComposeView";
 import TitleBar from "@/components/TitleBar";
 import ToastContainer from "@/components/ToastContainer";
-import ConfirmDialog from "@/components/ConfirmDialog";
 import { useComposeStore, type ComposePrefill } from "@/stores/compose.store";
 import { useUIStore } from "@/stores/ui.store";
-import { useConfirmStore } from "@/stores/confirm.store";
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { isComposeDirty } from '@/stores/compose.store';
+import { confirmComposeLeave } from './draftPersistence';
 
 /** 全局确认弹窗（与主布局 Layout 中的 GlobalConfirmDialog 等价）。 */
-function ComposeWindowConfirm() {
-  const { isOpen, title, message, destructive, confirmLabel, cancelLabel, handleConfirm, handleCancel } = useConfirmStore();
-  if (!isOpen) return null;
-  return (
-    <ConfirmDialog
-      title={title}
-      message={message}
-      destructive={destructive}
-      confirmLabel={confirmLabel}
-      cancelLabel={cancelLabel}
-      onConfirm={handleConfirm}
-      onCancel={handleCancel}
-    />
-  );
-}
+import { ComposeWindowConfirm } from './ComposeWindowConfirm';
+export { ComposeWindowConfirm } from './ComposeWindowConfirm';
+
 
 /**
  * 独立写信窗口（多窗口模式）。
@@ -45,6 +34,25 @@ function decodePrefill(raw: string | null): ComposePrefill | undefined {
 export default function ComposeWindowApp() {
   const [ready, setReady] = useState(false);
   const [failed, setFailed] = useState(false);
+  const activeTabId = useComposeStore(state => state.activeTabId);
+  const composeMode = useComposeStore(state => state.composeMode);
+  useEffect(() => { if (ready && composeMode === null) void getCurrentWindow().close(); }, [ready, composeMode]);
+
+  useEffect(() => {
+    let disposed = false;
+    let confirming = false;
+    const native = getCurrentWindow();
+    const subscription = native.onCloseRequested(async event => {
+      if (!isComposeDirty()) return;
+      event.preventDefault();
+      if (confirming) return;
+      confirming = true;
+      try { if (await confirmComposeLeave() && !disposed) await native.destroy(); }
+      finally { confirming = false; }
+    });
+    void subscription.catch(() => {});
+    return () => { disposed = true; void subscription.then(unlisten => unlisten()).catch(() => {}); };
+  }, []);
 
   useEffect(() => {
     try {
@@ -74,12 +82,13 @@ export default function ComposeWindowApp() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
-      <TitleBar />
+      <TitleBar nativeCloseGuard />
       <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-        <ComposeView />
+        <ComposeView tabId={activeTabId ?? undefined} />
       </div>
       <ToastContainer />
       <ComposeWindowConfirm />
     </div>
   );
 }
+

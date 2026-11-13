@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useWorkspaceState } from '@/lib/workspaceState';
 import { aiPrompt } from "@/lib/api";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { useToastStore } from "@/stores/toast.store";
@@ -12,9 +12,9 @@ const ASSISTANT_SYSTEM = `你是外贸业务员的 AI 业务助手。
 回答使用用户指令的语言，简洁、可执行。`;
 
 export default function AIAssistantTab({ quick: _quick = false }: { quick?: boolean }) {
-  const [instruction, setInstruction] = useState("");
-  const [result, setResult] = useState("");
-  const [running, setRunning] = useState(false);
+  const [instruction, setInstruction] = useWorkspaceState("src/features/settings/AIAssistantTab.tsx:AIAssistantTab:instruction", "");
+  const [result, setResult] = useWorkspaceState("src/features/settings/AIAssistantTab.tsx:AIAssistantTab:result", "");
+  const [running, setRunning] = useWorkspaceState("src/features/settings/AIAssistantTab.tsx:AIAssistantTab:running", false);
 
   async function runInstruction() {
     const command = instruction.trim();

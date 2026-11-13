@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessageSummary } from "../../src/lib/api";
+import { MessageDeletionNavigationContext } from "../../src/hooks/useMessageDeletionNavigation";
 
 const mocks = vi.hoisted(() => ({
   queryClient: {
@@ -13,7 +14,16 @@ const mocks = vi.hoisted(() => ({
   archiveMessage: vi.fn(),
   moveToFolder: vi.fn(),
   addToast: vi.fn(),
+  getMessage: vi.fn(),
+  listAttachments: vi.fn(),
+  getAttachmentPath: vi.fn(),
+  openDraft: vi.fn(),
+  sendDrafts: vi.fn(),
+  deleteMessage: vi.fn(),
+  confirm: vi.fn(),
 }));
+vi.mock('../../src/hooks/useSendDrafts',()=>({useSendDrafts:()=>({sendDrafts:mocks.sendDrafts,sending:false})}));
+vi.mock('../../src/stores/confirm.store', () => ({ useConfirmStore: { getState: () => ({ confirm: mocks.confirm }) } }));
 
 vi.mock("react-i18next", () => ({
   initReactI18next: { type: "3rdParty", init: vi.fn() },
@@ -46,6 +56,14 @@ vi.mock("../../src/lib/api", () => ({
   updateMessageFlags: mocks.updateMessageFlags,
   archiveMessage: mocks.archiveMessage,
   moveToFolder: mocks.moveToFolder,
+  deleteMessage: mocks.deleteMessage,
+  getMessage: mocks.getMessage,
+  listAttachments: mocks.listAttachments,
+  getAttachmentPath: mocks.getAttachmentPath,
+}));
+
+vi.mock("../../src/stores/compose.store", () => ({
+  useComposeStore: { getState: () => ({ openDraft: mocks.openDraft }) },
 }));
 
 vi.mock("../../src/stores/kanban.store", () => ({
@@ -98,6 +116,42 @@ describe("MessageItem", () => {
     mocks.updateMessageFlags.mockResolvedValue(undefined);
     mocks.archiveMessage.mockResolvedValue("archived");
     mocks.moveToFolder.mockResolvedValue(undefined);
+    mocks.deleteMessage.mockReset().mockResolvedValue(undefined);
+    mocks.confirm.mockResolvedValue(true);
+  });
+
+  it("right-click deletion settles list navigation after success", async () => {
+    const complete = vi.fn().mockReturnValue(true);
+    render(<MessageDeletionNavigationContext.Provider value={() => complete}>
+      <MessageItem message={makeMessage()} isSelected onClick={vi.fn()} />
+    </MessageDeletionNavigationContext.Provider>);
+    fireEvent.contextMenu(screen.getByRole("option"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "删除", exact: true }));
+    await waitFor(() => expect(complete).toHaveBeenCalledWith(["message-1"]));
+    expect(mocks.deleteMessage).toHaveBeenCalledWith("message-1");
+  });
+
+  it("right-click deletion rolls back navigation when the delete fails", async () => {
+    const complete = vi.fn();
+    mocks.deleteMessage.mockRejectedValueOnce(new Error("offline"));
+    render(<MessageDeletionNavigationContext.Provider value={() => complete}>
+      <MessageItem message={makeMessage()} isSelected onClick={vi.fn()} />
+    </MessageDeletionNavigationContext.Provider>);
+    fireEvent.contextMenu(screen.getByRole("option"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "删除", exact: true }));
+    await waitFor(() => expect(mocks.restoreMessagesCache).toHaveBeenCalled());
+    expect(complete).toHaveBeenCalledWith([]);
+  });
+  it('clearly labels an unsent draft, shows recipients and sends the batch selected by its context menu',()=>{
+    render(<MessageItem message={makeMessage({is_draft:true,to_list:[{address:'buyer@example.test',name:null}]})} isSelected={true} onClick={vi.fn()} batchMode batchSelected draftSendIds={['message-1','message-2']} folderRole="drafts" />);
+    expect(screen.getByLabelText('草稿，未发送')).toBeTruthy();expect(screen.getByText('收件人：buyer@example.test')).toBeTruthy();
+    expect(screen.getByLabelText('草稿，未发送').textContent).toBe('');expect(screen.getByLabelText('草稿，未发送').title).toBe('草稿（未发送）');
+    expect(screen.queryByText('草稿 · 未发送')).toBeNull();
+    fireEvent.contextMenu(screen.getByRole('option'));fireEvent.click(screen.getByRole('menuitem',{name:'发送',exact:true}));expect(mocks.sendDrafts).toHaveBeenCalledWith(['message-1','message-2']);
+  });
+  it('does not offer a draft send command for received messages',()=>{
+    render(<MessageItem message={makeMessage()} isSelected={false} onClick={vi.fn()}/>);
+    fireEvent.contextMenu(screen.getByRole('option'));expect(screen.queryByRole('menuitem',{name:'发送',exact:true})).toBeNull();
   });
 
   it("labels the archive action as unarchive in the archive folder", () => {
@@ -114,6 +168,34 @@ describe("MessageItem", () => {
 
     expect(screen.getByRole("button", { name: "Unarchive" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Archive" })).toBeNull();
+  });
+
+  it("opens sent-mail Edit as a full new draft with HTML and attachments", async () => {
+    const sent = makeMessage({ has_attachments: true, to_list: [{ address: "buyer@example.org", name: null }] });
+    mocks.getMessage.mockResolvedValue({ ...sent, body_text: "Plain fallback", body_html_raw: '<table style="table-layout:fixed"><tbody><tr><td colwidth="96" style="background-color:#fff2cc">Order</td></tr></tbody></table>' });
+    mocks.listAttachments.mockResolvedValue([{ id: "attachment-1", filename: "Order.xlsx", is_inline: false, local_path: null, size: 8 }]);
+    mocks.getAttachmentPath.mockResolvedValue("Y:/portable/data/attachments/Order.xlsx");
+    render(<MessageItem message={sent} isSelected={false} onClick={vi.fn()} folderRole="sent" />);
+    fireEvent.contextMenu(screen.getByRole("option"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "编辑" }));
+    await waitFor(() => expect(mocks.openDraft).toHaveBeenCalled());
+    const snapshot = mocks.openDraft.mock.calls[0][0];
+    expect(snapshot.sourceDraftId).toBeUndefined();
+    expect(snapshot.accountId).toBe(sent.account_id);
+    expect(snapshot.richTextHtml).toContain("<table");
+    expect(snapshot.richTextHtml).toContain('colwidth="96"');
+    expect(snapshot.attachments).toEqual([{ name: "Order.xlsx", path: "Y:/portable/data/attachments/Order.xlsx", size: 8 }]);
+  });
+
+  it("keeps the existing screen and shows an error when Edit cannot load an attachment", async () => {
+    mocks.getMessage.mockResolvedValue({ ...makeMessage(), body_text: "Body", body_html_raw: "" });
+    mocks.listAttachments.mockResolvedValue([{ id: "missing", is_inline: false }]);
+    mocks.getAttachmentPath.mockRejectedValue(new Error("missing attachment"));
+    render(<MessageItem message={makeMessage()} isSelected={false} onClick={vi.fn()} />);
+    fireEvent.contextMenu(screen.getByRole("option"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "编辑" }));
+    await waitFor(() => expect(mocks.addToast).toHaveBeenCalledWith(expect.objectContaining({ type: "error" })));
+    expect(mocks.openDraft).not.toHaveBeenCalled();
   });
 
   it("restores message lists when archive optimistic update fails", async () => {

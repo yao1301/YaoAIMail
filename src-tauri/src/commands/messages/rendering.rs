@@ -1,8 +1,8 @@
 use crate::state::AppState;
 use crate::commands::messages::{connect_imap, find_message_folder, refresh_search_document};
-use pebble_core::{Message, PebbleError, PrivacyMode, RenderedHtml, TrustType};
+use pebble_core::{Message, PebbleError, PrivacyMode, ProviderType, RenderedHtml, TrustType};
 use pebble_mail::parser::parse_raw_email;
-use pebble_mail::persist_message_attachments;
+use pebble_mail::sync::persist_message_attachments_checked;
 use pebble_privacy::PrivacyGuard;
 use pebble_store::Store;
 use tauri::{AppHandle, Emitter, State};
@@ -78,6 +78,16 @@ async fn hydrate_message_body(
         .await?;
     let _ = provider.disconnect().await;
     let parsed = parse_raw_email(&raw)?;
+    // Do not mark the message complete until attachment files and records are
+    // durable. The old order could leave a body-only message after a storage
+    // failure, which made the UI stop retrying.
+    state.store.delete_attachments_by_message(&message.id)?;
+    persist_message_attachments_checked(
+        &state.store,
+        &state.attachments_dir,
+        &message.id,
+        parsed.attachments,
+    )?;
     message.body_text = parsed.body_text.clone();
     message.body_html_raw = parsed.body_html.clone();
     message.snippet = parsed.snippet.clone();
@@ -91,14 +101,69 @@ async fn hydrate_message_body(
         message.has_attachments,
         None,
     )?;
-    persist_message_attachments(
-        &state.store,
-        &state.attachments_dir,
-        &message.id,
-        parsed.attachments,
-    );
     let _ = refresh_search_document(state, &message.id);
     Ok(())
+}
+
+/// Re-fetch and rebuild one remote IMAP message, including body, HTML,
+/// attachments and the local search document. Existing body content is kept
+/// until the complete raw message and all attachment writes succeed.
+#[tauri::command]
+pub async fn redownload_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message_id: String,
+) -> std::result::Result<Message, PebbleError> {
+    let state_ref = state.inner();
+    let mut message = state_ref
+        .store
+        .get_message(&message_id)?
+        .ok_or_else(|| PebbleError::Internal(format!("Message not found: {message_id}")))?;
+    let account = state_ref
+        .store
+        .get_account(&message.account_id)?
+        .ok_or_else(|| PebbleError::Internal(format!("Account not found: {}", message.account_id)))?;
+    if account.provider != ProviderType::Imap {
+        return Err(PebbleError::Validation(
+            "当前仅支持重新下载 IMAP 邮件；Gmail/Outlook 邮件由服务商接口直接同步。".to_string(),
+        ));
+    }
+
+    {
+        let mut hydrating = state_ref.hydrating_messages.lock().await;
+        if !hydrating.insert(message_id.clone()) {
+            return Err(PebbleError::Validation("这封邮件正在下载，请稍候。".to_string()));
+        }
+    }
+
+    let result = async {
+        state_ref.store.prepare_message_for_redownload(&message_id)?;
+        hydrate_message_body(state_ref, &mut message).await?;
+        state_ref.store.complete_body_download_job(&message_id)?;
+        let updated = state_ref
+            .store
+            .get_message(&message_id)?
+            .ok_or_else(|| PebbleError::Internal(format!("Message disappeared: {message_id}")))?;
+        let _ = app.emit("message:hydrated", message_id.clone());
+        Ok::<Message, PebbleError>(updated)
+    }
+    .await;
+
+    {
+        let mut hydrating = state_ref.hydrating_messages.lock().await;
+        hydrating.remove(&message_id);
+    }
+
+    match result {
+        Ok(updated) => Ok(updated),
+        Err(error) => {
+            let _ = state_ref
+                .store
+                .fail_body_download_job(&message_id, &error.to_string());
+            let _ = app.emit("message:hydrate-failed", message_id);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]

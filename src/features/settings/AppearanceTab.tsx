@@ -1,4 +1,5 @@
-import { useRef, useState } from "react";
+import { useWorkspaceState } from '@/lib/workspaceState';
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Image, Trash2, Upload } from "lucide-react";
 import { useUIStore } from "@/stores/ui.store";
@@ -7,12 +8,9 @@ import { backgroundImageUrl, deleteBackgroundImage, importBackgroundImage } from
 
 const THEMES: { id: Theme; labelKey: string; descKey: string }[] = [
   { id: "light", labelKey: "settings.themeLight", descKey: "settings.themeLightDesc" },
-  { id: "dark", labelKey: "settings.themeDark", descKey: "settings.themeDarkDesc" },
-  { id: "system", labelKey: "settings.themeSystem", descKey: "settings.themeSystemDesc" },
-  { id: "warm", labelKey: "settings.themeWarm", descKey: "settings.themeWarmDesc" },
-  { id: "ocean", labelKey: "settings.themeOcean", descKey: "settings.themeOceanDesc" },
-  { id: "forest", labelKey: "settings.themeForest", descKey: "settings.themeForestDesc" },
-  { id: "highContrast", labelKey: "settings.themeHighContrast", descKey: "settings.themeHighContrastDesc" },
+  { id: "macos", labelKey: "settings.themeMacos", descKey: "settings.themeMacosDesc" },
+  { id: "minimal", labelKey: "settings.themeMinimal", descKey: "settings.themeMinimalDesc" },
+  { id: "studio", labelKey: "settings.themeStudio", descKey: "settings.themeStudioDesc" },
 ];
 
 const FONT_FAMILIES: Array<{ id: AppFontFamily; label: string }> = [
@@ -43,8 +41,8 @@ function errorMessage(error: unknown): string {
 export default function AppearanceTab() {
   const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [uploading, setUploading] = useWorkspaceState("src/features/settings/AppearanceTab.tsx:AppearanceTab:uploading", false);
+  const [error, setError] = useWorkspaceState<string | null>("src/features/settings/AppearanceTab.tsx:AppearanceTab:error", null);
   const theme = useUIStore((s) => s.theme);
   const setTheme = useUIStore((s) => s.setTheme);
   const fontFamily = useUIStore((s) => s.fontFamily);
@@ -102,6 +100,7 @@ export default function AppearanceTab() {
         {THEMES.map((th) => (
           <button
             key={th.id}
+            className={`theme-choice theme-choice--${th.id}`}
             onClick={() => setTheme(th.id)}
             style={{
               flex: 1,
@@ -114,6 +113,12 @@ export default function AppearanceTab() {
               color: "var(--color-text-primary)",
             }}
           >
+            <span className="theme-choice__preview" aria-hidden="true">
+              <span className="theme-choice__preview-bar" />
+              <span className="theme-choice__preview-sidebar" />
+              <span className="theme-choice__preview-card" />
+              <span className="theme-choice__preview-button" />
+            </span>
             <div style={{ fontWeight: 600, fontSize: "13px", marginBottom: "4px" }}>{t(th.labelKey)}</div>
             <div style={{ fontSize: "12px", color: "var(--color-text-secondary)" }}>{t(th.descKey)}</div>
           </button>
@@ -275,6 +280,12 @@ export default function AppearanceTab() {
           )}
         </div>
 
+        {error && (
+          <div role="alert" style={{ color: "var(--color-error, #dc2626)", fontSize: "12px" }}>
+            {error}
+          </div>
+        )}
+
         {backgroundImage && (
           <>
             <div>
@@ -320,11 +331,6 @@ export default function AppearanceTab() {
           </>
         )}
 
-        {error && (
-          <div role="alert" style={{ color: "#ef4444", fontSize: "12px" }}>
-            {error}
-          </div>
-        )}
       </div>
     </div>
   );

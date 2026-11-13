@@ -34,6 +34,7 @@ import { useFolderUnreadCountsForAccounts } from "../hooks/queries/useFolderUnre
 import {
   allAccountsFolderId,
   sortFoldersForSidebar,
+  unreadCountForAllUnread,
   unreadCountForFolder,
 } from "../lib/folderAggregation";
 import type { Account, Folder as FolderType } from "../lib/api";
@@ -62,6 +63,7 @@ import {
   setFolderCacheIfCurrent,
 } from "../lib/folderCache";
 import { withFolderDepth } from "../lib/folderHierarchy";
+import { ACCOUNT_DRAG_TYPE, readAccountOrder, orderAccounts, moveAccountInOrder, saveAccountOrder } from "../lib/accountOrder";
 
 const EMPTY_ACCOUNTS: Account[] = [];
 const EMPTY_FOLDERS: FolderType[] = [];
@@ -90,16 +92,9 @@ function accountDisplayName(account: Account): string {
   return local || account.email;
 }
 
-const SPIN_STYLE_ID = "pebble-sidebar-spin-keyframes";
-
-function ensureSpinKeyframes() {
-  if (typeof document === "undefined") return;
-  if (document.getElementById(SPIN_STYLE_ID)) return;
-  const style = document.createElement("style");
-  style.id = SPIN_STYLE_ID;
-  style.textContent = "@keyframes pebble-sidebar-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }";
-  document.head.appendChild(style);
-}
+// 旋转动画的关键帧定义在 src/styles/index.css（.app-spin）。
+// 不要在这里用 <style> 注入：注入只在某个点击动作里发生过，没点过时
+// 关键帧不存在，所有"XX中…"图标就是静止的。
 
 const ROLE_ICONS: Record<string, React.ReactNode> = {
   inbox: <Inbox size={16} />,
@@ -211,8 +206,36 @@ export default function Sidebar() {
 
   const showUnread = useUIStore((s) => s.showFolderUnreadCount);
   const { data: accounts = EMPTY_ACCOUNTS } = useAccountsQuery();
+  const [accountOrder, setAccountOrder] = useState(readAccountOrder);
+  const orderedAccounts = useMemo(() => orderAccounts(accounts, accountOrder), [accounts, accountOrder]);
+  const draggedAccount = useRef<string | null>(null);
+  const [dragAccountId, setDragAccountId] = useState<string | null>(null);
+  const [accountDrop, setAccountDrop] = useState<{ id: string; position: 'before' | 'after' } | null>(null);
   const allAccountsMode = accounts.length > 1 && !activeAccountId;
   const [syncingAll, setSyncingAll] = useState(false);
+
+  function clearAccountDrag() {
+    draggedAccount.current = null;
+    setDragAccountId(null); setAccountDrop(null);
+  }
+
+  function reorderAccount(source: string, target: string, position: 'before' | 'after') {
+    const ids = orderedAccounts.map(account => account.id);
+    const next = moveAccountInOrder(ids, source, target, position);
+    if (next === ids || next.every((id, index) => id === ids[index])) return;
+    try {
+      saveAccountOrder(next);
+      setAccountOrder(next);
+    } catch {
+      useToastStore.getState().addToast({ type: 'error', message: '账号顺序保存失败，请重试。' });
+    }
+  }
+
+  function accountDropPosition(event: React.DragEvent): 'before' | 'after' {
+    const header = event.target instanceof Element ? event.target.closest('.sidebar-account-button') : null;
+    const bounds = (header ?? event.currentTarget).getBoundingClientRect();
+    return event.clientY < bounds.top + bounds.height / 2 ? 'before' : 'after';
+  }
 
   // Track which accounts are expanded in the sidebar. Default: all expanded.
   const [expandedAccounts, setExpandedAccounts] = useState<Set<string>>(() => new Set());
@@ -474,7 +497,6 @@ export default function Sidebar() {
 
   async function handleSyncAllAccounts() {
     if (syncingAll || accounts.length === 0) return;
-    ensureSpinKeyframes();
     setSyncingAll(true);
     try {
       const results = await Promise.allSettled(
@@ -698,7 +720,7 @@ export default function Sidebar() {
   // 始终分组（不随 allAccountsMode 切换）：每个账号一组、各自可折叠。
   const foldersByAccount = useMemo(() => {
     const map = new Map<string, FolderType[]>();
-    for (const account of accounts) map.set(account.id, []);
+    for (const account of orderedAccounts) map.set(account.id, []);
     for (const folder of folders) {
       const list = map.get(folder.account_id) ?? [];
       list.push(folder);
@@ -723,7 +745,7 @@ export default function Sidebar() {
       });
     }
     return map;
-  }, [folders, accounts]);
+  }, [folders, orderedAccounts]);
 
   const showAccountGroups = !!foldersByAccount && accounts.length >= 1;
 
@@ -840,6 +862,7 @@ export default function Sidebar() {
 
   return (
     <aside
+      className="mail-folder-pane"
       aria-label={t("sidebar.navigation", "Sidebar")}
       style={{
         width: sidebarCollapsed ? "48px" : `${sidebarWidth}px`,
@@ -880,7 +903,7 @@ export default function Sidebar() {
         <SidebarButton
           icon={
             syncingAll ? (
-              <RefreshCw size={16} style={{ animation: "pebble-sidebar-spin 1s linear infinite" }} />
+              <RefreshCw size={16} className="app-spin" />
             ) : (
               <RefreshCw size={16} />
             )
@@ -907,7 +930,7 @@ export default function Sidebar() {
           onClick={() => safeSetActiveView("kanban")}
         />
         <SidebarButton
-          icon={taskRunning("addressBookTagging") ? <RefreshCw size={16} style={{ animation: "pebble-sidebar-spin 1s linear infinite" }} /> : <ContactRound size={16} />}
+          icon={taskRunning("addressBookTagging") ? <RefreshCw size={16} className="app-spin" /> : <ContactRound size={16} />}
           label={taskRunning("addressBookTagging") ? "地址本识别中…" : "地址本"}
           isActive={activeView === "addressBook"}
           collapsed={sidebarCollapsed}
@@ -915,7 +938,7 @@ export default function Sidebar() {
           onClick={() => safeSetActiveView("addressBook")}
         />
         <SidebarButton
-          icon={taskRunning("companyResearch") ? <RefreshCw size={16} style={{ animation: "pebble-sidebar-spin 1s linear infinite" }} /> : <Building2 size={16} />}
+          icon={taskRunning("companyResearch") ? <RefreshCw size={16} className="app-spin" /> : <Building2 size={16} />}
           label={taskRunning("companyResearch") ? "资信调研中…" : "资信调研"}
           isActive={activeView === "companyResearch"}
           collapsed={sidebarCollapsed}
@@ -923,7 +946,7 @@ export default function Sidebar() {
           onClick={() => safeSetActiveView("companyResearch")}
         />
         <SidebarButton
-          icon={(taskRunning("leadFinder") || autoDev.running) ? <RefreshCw size={16} style={{ animation: autoDev.paused ? "none" : "pebble-sidebar-spin 1s linear infinite" }} /> : <UserSearch size={16} />}
+          icon={(taskRunning("leadFinder") || autoDev.running) ? <RefreshCw size={16} className={autoDev.paused ? undefined : "app-spin"} /> : <UserSearch size={16} />}
           label={autoDev.running ? `自动开发 ${autoDev.done}/${autoDev.total}${autoDev.paused ? "（暂停）" : ""}` : taskRunning("leadFinder") ? "开发客户中…" : "开发客户"}
           isActive={activeView === "leadFinder"}
           collapsed={sidebarCollapsed}
@@ -954,7 +977,7 @@ export default function Sidebar() {
           label="所有未读"
           badge={
             showUnread && hasRealFolders
-              ? unreadCountForFolder(allAccountsFolderId("inbox"), folders, unreadCounts)
+              ? unreadCountForAllUnread(folders, unreadCounts)
               : undefined
           }
           isActive={activeFolderId === allAccountsFolderId("inbox") && activeView === "inbox"}
@@ -1025,7 +1048,7 @@ export default function Sidebar() {
       >
         {runningTasks.length > 0 && !sidebarCollapsed && (
           <div title={runningTasks.map((task) => task.label).join("；")} style={{ display: "flex", alignItems: "center", gap: 7, margin: "0 4px 5px", padding: "6px 8px", borderRadius: 6, background: "color-mix(in srgb, var(--color-accent) 10%, transparent)", color: "var(--color-accent)", fontSize: 11 }}>
-            <RefreshCw size={13} style={{ animation: "pebble-sidebar-spin 1s linear infinite" }} />
+            <RefreshCw size={13} className="app-spin" />
             <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{runningTasks.length === 1 ? runningTasks[0].label : `${runningTasks.length} 项后台任务处理中`}</span>
           </div>
         )}
@@ -1041,7 +1064,7 @@ export default function Sidebar() {
               border: "1px solid color-mix(in srgb, var(--color-accent) 25%, transparent)",
             }}
           >
-            <RefreshCw size={12} style={{ animation: "pebble-sidebar-spin 1s linear infinite", flexShrink: 0 }} />
+            <RefreshCw size={12} className="app-spin" style={{ flexShrink: 0 }} />
             <span style={{ flex: 1, minWidth: 0 }}>正在下载邮件正文：剩余 {bodyBackfillRemaining} 封</span>
           </div>
         )}
@@ -1049,22 +1072,54 @@ export default function Sidebar() {
           ? Array.from(foldersByAccount.entries()).map(([accountId, accountFolders]) => {
               const account = accounts.find((a) => a.id === accountId);
               const accountUnread = showUnread
-                ? accountFolders.reduce(
-                    // 垃圾邮件不计入账号未读数（用户要求不显示垃圾邮件数）
-                    (sum, folder) => sum + (folder.role === "spam" ? 0 : (unreadCounts[folder.id] ?? 0)),
-                    0,
-                  )
+                ? unreadCountForAllUnread(accountFolders, unreadCounts)
                 : 0;
               const isExpanded = expandedAccounts.has(accountId);
               const isAccountActive = activeAccountId === accountId;
               const labelText = account ? accountDisplayName(account) : accountId;
               return (
-                <div key={accountId} style={{ marginBottom: 8, border: "1px solid color-mix(in srgb, var(--color-border) 80%, transparent)", borderRadius: 8, background: "color-mix(in srgb, var(--color-bg-secondary) 68%, transparent)", overflow: "hidden" }}>
+                <div key={accountId} data-sidebar-account-id={accountId}
+                  onDragOver={event => {
+                    if (!draggedAccount.current || draggedAccount.current === accountId) return;
+                    event.preventDefault(); event.stopPropagation();
+                    event.dataTransfer.dropEffect = 'move';
+                    const position = accountDropPosition(event);
+                    setAccountDrop(current => current?.id === accountId && current.position === position ? current : { id: accountId, position });
+                  }}
+                  onDragLeave={event => {
+                    if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setAccountDrop(null);
+                  }}
+                  onDropCapture={event => {
+                    const source = draggedAccount.current;
+                    if (!source) return;
+                    event.preventDefault(); event.stopPropagation();
+                    const position = accountDropPosition(event);
+                    clearAccountDrag();
+                    reorderAccount(source, accountId, position);
+                  }}
+                  style={{ marginBottom: 8, border: "1px solid color-mix(in srgb, var(--color-border) 80%, transparent)", borderRadius: 8, background: "color-mix(in srgb, var(--color-bg-secondary) 68%, transparent)", overflow: "hidden",
+                    opacity: dragAccountId === accountId ? 0.5 : 1,
+                    boxShadow: accountDrop?.id === accountId ? `inset 0 ${accountDrop.position === 'before' ? '2px' : '-2px'} 0 var(--color-accent)` : 'none',
+                  }}>
                   {!sidebarCollapsed && (
                     <div
+                      className="sidebar-account-button"
                       role="button"
                       aria-pressed={isAccountActive}
+                      data-active={isAccountActive ? "true" : undefined}
                       tabIndex={0}
+                      draggable={accounts.length > 1}
+                      title={accounts.length > 1 ? '拖动账号名称可上下排序；也可按 Alt + ↑ / ↓ 调整' : undefined}
+                      onDragStart={event => {
+                        if (accounts.length < 2) { event.preventDefault(); return; }
+                        event.stopPropagation();
+                        clearFolderDragState();
+                        draggedAccount.current = accountId;
+                        setDragAccountId(accountId);
+                        event.dataTransfer.effectAllowed = 'move';
+                        event.dataTransfer.setData(ACCOUNT_DRAG_TYPE, accountId);
+                      }}
+                      onDragEnd={clearAccountDrag}
                       onClick={() => handleAccountClick(accountId)}
                       onContextMenu={(event) => {
                         if (!account) return;
@@ -1073,6 +1128,13 @@ export default function Sidebar() {
                         setAccountMenu({ x: event.clientX, y: event.clientY, account });
                       }}
                       onKeyDown={(e) => {
+                        if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+                          e.preventDefault(); e.stopPropagation();
+                          const index = orderedAccounts.findIndex(account => account.id === accountId);
+                          const target = orderedAccounts[index + (e.key === 'ArrowUp' ? -1 : 1)];
+                          if (target) reorderAccount(accountId, target.id, e.key === 'ArrowUp' ? 'before' : 'after');
+                          return;
+                        }
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
                           handleAccountClick(accountId);
@@ -1095,7 +1157,7 @@ export default function Sidebar() {
                           : isExpanded ? "1px solid var(--color-border)" : "1px solid transparent",
                         borderLeft: isAccountActive ? "3px solid var(--color-accent)" : "3px solid transparent",
                         boxShadow: isAccountActive ? "0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent)" : "none",
-                        cursor: "pointer",
+                        cursor: accounts.length > 1 ? "grab" : "pointer",
                         userSelect: "none",
                         color: isAccountActive ? "var(--color-accent)" : "var(--color-text-primary)",
                         fontSize: 12,
@@ -1103,8 +1165,10 @@ export default function Sidebar() {
                       }}
                     >
                       <span
+                        className="sidebar-account-toggle"
                         role="button"
                         tabIndex={0}
+                        aria-expanded={isExpanded}
                         aria-label={isExpanded ? "收起该账号文件夹" : "展开该账号文件夹"}
                         onClick={(event) => {
                           event.stopPropagation();
@@ -1127,9 +1191,9 @@ export default function Sidebar() {
                             });
                           }
                         }}
-                        style={{ display: "flex", alignItems: "center", cursor: "pointer" }}
+                        title={isExpanded ? "收起文件夹" : "展开文件夹"}
                       >
-                        {isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                        {isExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
                       </span>
                       <span
                         role="button"
@@ -1150,7 +1214,7 @@ export default function Sidebar() {
                           overflow: "hidden",
                           textOverflow: "ellipsis",
                           whiteSpace: "nowrap",
-                          cursor: "pointer",
+                          cursor: "inherit",
                         }}
                         title={labelText}
                       >
@@ -1189,7 +1253,7 @@ export default function Sidebar() {
                             data-folder-id={folder.id}
                             style={{
                               marginLeft: 10 + depth * 14,
-                              borderLeft: depth === 0 ? "2px solid color-mix(in srgb, var(--color-accent) 28%, var(--color-border))" : "none",
+                              borderLeft: "none",
                               paddingLeft: depth === 0 ? 4 : 10,
                               opacity: dragFolderId === folder.id ? 0.45 : 1,
                               borderRadius: 6,
@@ -1369,7 +1433,7 @@ export default function Sidebar() {
           onClick={() => openRightPanel("foreignTools")}
         />
         <SidebarButton
-          icon={taskRunning("customerProfile", "customerProfileUpdate", "customerProfileListUpdate") ? <RefreshCw size={16} style={{ animation: "pebble-sidebar-spin 1s linear infinite" }} /> : <ContactRound size={16} />}
+          icon={taskRunning("customerProfile", "customerProfileUpdate", "customerProfileListUpdate") ? <RefreshCw size={16} className="app-spin" /> : <ContactRound size={16} />}
           label={taskRunning("customerProfile", "customerProfileUpdate", "customerProfileListUpdate") ? "客户画像处理中…" : "客户管理"}
           isActive={activeView === "customerProfile"}
           collapsed={sidebarCollapsed}
@@ -1465,11 +1529,13 @@ function SidebarButton({
 }) {
   return (
     <button
+      className="sidebar-nav-button"
       type="button"
       onClick={onClick}
       onContextMenu={onContextMenu}
       aria-label={collapsed ? label : undefined}
       aria-current={isActive ? "page" : undefined}
+      data-active={isActive ? "true" : undefined}
       title={collapsed ? label : undefined}
       disabled={disabled}
       style={{

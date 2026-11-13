@@ -5,6 +5,7 @@ use tauri::State;
 use reqwest::Client;
 
 const EXTERNAL_SERVICE_KEYS: &str = "external_service_api_keys";
+static KEY_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StoredExternalServiceKeys {
@@ -20,6 +21,10 @@ struct StoredExternalServiceKeys {
     firecrawl_keys: Vec<String>,
     #[serde(default)]
     hunter_keys: Vec<String>,
+    #[serde(default)]
+    deepseek_keys: Vec<String>,
+    #[serde(default)]
+    deepseek_search_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,10 +34,13 @@ pub struct ExternalServiceKeyStatus {
     pub brave_configured: bool,
     pub firecrawl_configured: bool,
     pub hunter_configured: bool,
+    pub deepseek_configured: bool,
+    pub deepseek_search_enabled: bool,
     pub tavily_key_count: usize,
     pub brave_key_count: usize,
     pub firecrawl_key_count: usize,
     pub hunter_key_count: usize,
+    pub deepseek_key_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +88,9 @@ fn json_number(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
 
 async fn check_provider(provider: &str, api_key: &str) -> Result<ExternalServiceUsage, PebbleError> {
     let provider = normalize_provider(provider)?;
+    if provider == "deepseek" {
+        return check_deepseek_key(api_key).await;
+    }
     let client = Client::builder().timeout(std::time::Duration::from_secs(12)).build()
         .map_err(|error| PebbleError::Network(error.to_string()))?;
     let response = match provider {
@@ -128,6 +139,24 @@ async fn check_provider(provider: &str, api_key: &str) -> Result<ExternalService
     }
 }
 
+async fn check_deepseek_key(key: &str) -> Result<ExternalServiceUsage, PebbleError> {
+    let response = Client::builder().redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(8)).build()
+        .map_err(|_| PebbleError::Network("DeepSeek 连接初始化失败".into()))?
+        .get("https://api.deepseek.com/user/balance").bearer_auth(key).send().await
+        .map_err(|_| PebbleError::Network("无法连接 DeepSeek 官方接口".into()))?;
+    let (valid, message) = match pebble_websearch::bounded_json(response).await {
+        Ok(body) => match body.get("is_available").and_then(serde_json::Value::as_bool) {
+            Some(true) => (true, "DeepSeek 官方 Key 有效"),
+            Some(false) => (true, "DeepSeek 官方 Key 有效；余额不足时将使用原有搜索"),
+            None => (false, "DeepSeek 返回了无法识别的账户信息"),
+        },
+        Err(pebble_websearch::Failure::Auth) => (false, "DeepSeek 拒绝了这个 Key，请使用 DeepSeek 官方平台签发的 Key"),
+        Err(_) => (false, "暂时无法验证 DeepSeek Key，请稍后重试"),
+    };
+    Ok(usage_from_values("deepseek", None, None, "", None, message, false, valid))
+}
+
 #[tauri::command]
 pub async fn validate_external_service_api_key(
     provider: String,
@@ -160,6 +189,7 @@ fn normalize_provider(provider: &str) -> Result<&'static str, PebbleError> {
         "brave" => Ok("brave"),
         "firecrawl" => Ok("firecrawl"),
         "hunter" => Ok("hunter"),
+        "deepseek" => Ok("deepseek"),
         _ => Err(PebbleError::Validation(
             "Unsupported external service provider".to_string(),
         )),
@@ -167,10 +197,14 @@ fn normalize_provider(provider: &str) -> Result<&'static str, PebbleError> {
 }
 
 fn load_keys(state: &AppState) -> Result<StoredExternalServiceKeys, PebbleError> {
-    let Some(encrypted) = state.store.get_secure_user_data(EXTERNAL_SERVICE_KEYS)? else {
+    load_keys_from(&state.store, &state.crypto)
+}
+
+fn load_keys_from(store: &pebble_store::Store, crypto: &pebble_crypto::CryptoService) -> Result<StoredExternalServiceKeys, PebbleError> {
+    let Some(encrypted) = store.get_secure_user_data(EXTERNAL_SERVICE_KEYS)? else {
         return Ok(StoredExternalServiceKeys::default());
     };
-    let plaintext = state.crypto.decrypt(&encrypted)?;
+    let plaintext = crypto.decrypt(&encrypted)?;
     let mut keys: StoredExternalServiceKeys = serde_json::from_slice(&plaintext)
         .map_err(|error| PebbleError::Internal(format!("Invalid external service keys: {error}")))?;
     promote_legacy_key(&mut keys.tavily_keys, keys.tavily.take());
@@ -201,10 +235,13 @@ fn status(keys: &StoredExternalServiceKeys) -> ExternalServiceKeyStatus {
         brave_configured: !keys.brave_keys.is_empty(),
         firecrawl_configured: !keys.firecrawl_keys.is_empty(),
         hunter_configured: !keys.hunter_keys.is_empty(),
+        deepseek_configured: !keys.deepseek_keys.is_empty(),
+        deepseek_search_enabled: keys.deepseek_search_enabled && !keys.deepseek_keys.is_empty(),
         tavily_key_count: keys.tavily_keys.len(),
         brave_key_count: keys.brave_keys.len(),
         firecrawl_key_count: keys.firecrawl_keys.len(),
         hunter_key_count: keys.hunter_keys.len(),
+        deepseek_key_count: keys.deepseek_keys.len(),
     }
 }
 
@@ -215,12 +252,37 @@ pub async fn get_external_service_key_status(
     Ok(status(&load_keys(&state)?))
 }
 
+/// Independent, explicit consent. Merely saving a Key never permits billing.
+#[tauri::command]
+pub async fn set_deepseek_search_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<ExternalServiceKeyStatus, PebbleError> {
+    update_deepseek_consent(&state, enabled)
+}
+
+fn update_deepseek_consent(state: &AppState, enabled: bool) -> Result<ExternalServiceKeyStatus, PebbleError> {
+    let _guard = KEY_WRITE_LOCK.lock().map_err(|_| PebbleError::Internal("外部服务设置暂时无法保存，请重试。".into()))?;
+    let mut keys = load_keys(state)?;
+    if enabled && keys.deepseek_keys.is_empty() {
+        return Err(PebbleError::Validation("请先保存 DeepSeek 官方 API Key，再启用付费搜索。".into()));
+    }
+    keys.deepseek_search_enabled = enabled;
+    save_keys(state, &keys)?;
+    Ok(status(&keys))
+}
+
+pub(super) fn deepseek_key_is_enabled(store: &pebble_store::Store, crypto: &pebble_crypto::CryptoService, key: &str) -> bool {
+    load_keys_from(store, crypto).map(|keys| keys.deepseek_search_enabled && keys.deepseek_keys.iter().any(|saved| saved == key)).unwrap_or(false)
+}
+
 #[tauri::command]
 pub async fn save_external_service_api_key(
     state: State<'_, AppState>,
     provider: String,
     api_key: String,
 ) -> Result<ExternalServiceKeyStatus, PebbleError> {
+    let _guard = KEY_WRITE_LOCK.lock().map_err(|_| PebbleError::Internal("外部服务设置暂时无法保存，请重试。".into()))?;
     let provider = normalize_provider(&provider)?;
     let mut keys = load_keys(&state)?;
     let api_key = api_key.trim().to_string();
@@ -230,9 +292,14 @@ pub async fn save_external_service_api_key(
             "brave" => &mut keys.brave_keys,
             "firecrawl" => &mut keys.firecrawl_keys,
             "hunter" => &mut keys.hunter_keys,
+            "deepseek" => &mut keys.deepseek_keys,
             _ => unreachable!(),
         };
-        if !target.iter().any(|item| item == &api_key) {
+        if provider == "deepseek" {
+            if target.first() != Some(&api_key) { keys.deepseek_search_enabled = false; }
+            let target = &mut keys.deepseek_keys;
+            *target = vec![api_key];
+        } else if !target.iter().any(|item| item == &api_key) {
             target.push(api_key);
         }
     }
@@ -241,9 +308,10 @@ pub async fn save_external_service_api_key(
         "brave" => keys.brave = None,
         "firecrawl" => keys.firecrawl = None,
         "hunter" => keys.hunter = None,
+        "deepseek" => (),
         _ => unreachable!(),
     }
-    if keys.tavily_keys.is_empty() && keys.brave_keys.is_empty() && keys.firecrawl_keys.is_empty() && keys.hunter_keys.is_empty() {
+    if keys.tavily_keys.is_empty() && keys.brave_keys.is_empty() && keys.firecrawl_keys.is_empty() && keys.hunter_keys.is_empty() && keys.deepseek_keys.is_empty() {
         state.store.delete_secure_user_data(EXTERNAL_SERVICE_KEYS)?;
     } else {
         save_keys(&state, &keys)?;
@@ -252,20 +320,35 @@ pub async fn save_external_service_api_key(
 }
 
 #[tauri::command]
+pub async fn list_external_service_api_keys(
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<Vec<super::external_service_keys::KeyEntry>, PebbleError> {
+    let provider = normalize_provider(&provider)?;
+    let keys = get_external_service_api_keys(&state, provider)?;
+    super::external_service_keys::entries(&state.crypto, provider, &keys)
+}
+
+#[tauri::command]
 pub async fn delete_external_service_api_key(
     state: State<'_, AppState>,
     provider: String,
+    key_id: String,
 ) -> Result<ExternalServiceKeyStatus, PebbleError> {
+    let _guard = KEY_WRITE_LOCK.lock().map_err(|_| PebbleError::Internal("外部服务设置暂时无法保存，请重试。".into()))?;
     let provider = normalize_provider(&provider)?;
     let mut keys = load_keys(&state)?;
-    match provider {
-        "tavily" => keys.tavily_keys.clear(),
-        "brave" => keys.brave_keys.clear(),
-        "firecrawl" => keys.firecrawl_keys.clear(),
-        "hunter" => keys.hunter_keys.clear(),
+    let target = match provider {
+        "tavily" => &mut keys.tavily_keys,
+        "brave" => &mut keys.brave_keys,
+        "firecrawl" => &mut keys.firecrawl_keys,
+        "hunter" => &mut keys.hunter_keys,
+        "deepseek" => &mut keys.deepseek_keys,
         _ => unreachable!(),
-    }
-    if keys.tavily_keys.is_empty() && keys.brave_keys.is_empty() && keys.firecrawl_keys.is_empty() && keys.hunter_keys.is_empty() {
+    };
+    super::external_service_keys::remove(&state.crypto, provider, target, &key_id)?;
+    if provider == "deepseek" && keys.deepseek_keys.is_empty() { keys.deepseek_search_enabled = false; }
+    if keys.tavily_keys.is_empty() && keys.brave_keys.is_empty() && keys.firecrawl_keys.is_empty() && keys.hunter_keys.is_empty() && keys.deepseek_keys.is_empty() {
         state.store.delete_secure_user_data(EXTERNAL_SERVICE_KEYS)?;
     } else {
         save_keys(&state, &keys)?;
@@ -285,6 +368,7 @@ pub(crate) fn get_external_service_api_key(
         "brave" => keys.brave_keys.first().cloned(),
         "firecrawl" => keys.firecrawl_keys.first().cloned(),
         "hunter" => keys.hunter_keys.first().cloned(),
+        "deepseek" => keys.deepseek_keys.first().cloned(),
         _ => unreachable!(),
     })
 }
@@ -302,6 +386,7 @@ pub(crate) fn get_external_service_api_keys(
         "brave" => keys.brave_keys,
         "firecrawl" => keys.firecrawl_keys,
         "hunter" => keys.hunter_keys,
+        "deepseek" => keys.deepseek_keys,
         _ => unreachable!(),
     })
 }
@@ -316,6 +401,7 @@ mod tests {
         assert_eq!(normalize_provider("brave").unwrap(), "brave");
         assert_eq!(normalize_provider("firecrawl").unwrap(), "firecrawl");
         assert_eq!(normalize_provider("hunter").unwrap(), "hunter");
+        assert_eq!(normalize_provider("deepseek").unwrap(), "deepseek");
         assert!(normalize_provider("unknown").is_err());
     }
 }

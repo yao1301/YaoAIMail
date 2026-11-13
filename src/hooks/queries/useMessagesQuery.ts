@@ -1,11 +1,15 @@
-import { useInfiniteQuery, type InfiniteData, type QueryClient } from "@tanstack/react-query";
+import { useId, useState } from "react";
+import { useInfiniteQuery, useQueryClient, type InfiniteData, type QueryClient } from "@tanstack/react-query";
 import { listMessages, listUnreadMessages } from "@/lib/api";
 import type { MessageSummary } from "@/lib/api";
+import { useMailSortStore } from "@/stores/mailSort.store";
 
 export const MESSAGES_PAGE_SIZE = 50;
 
-export const messagesQueryKey = (folderId: string, folderIds?: string[]) =>
-  ["messages", folderId, folderIds] as const;
+export const messagesQueryKey = (folderId: string, folderIds?: string[], senderAscending?: boolean) =>
+  senderAscending === undefined
+    ? ["messages", folderId, folderIds] as const
+    : ["messages", folderId, folderIds, "sender", senderAscending] as const;
 
 /**
  * Paginated message list backed by React Query's useInfiniteQuery.
@@ -17,36 +21,60 @@ export function useMessagesQuery(
   folderId: string | null,
   folderIds?: string[],
   unreadOnly = false,
+  folderVisit = 0,
 ) {
+  const client = useQueryClient();
+  const instanceId = useId();
+  const [visit, setVisit] = useState({ unreadOnly, folderVisit, generation: 0 });
+  const currentVisit = visit.unreadOnly === unreadOnly && visit.folderVisit === folderVisit
+    ? visit : { unreadOnly, folderVisit, generation: visit.generation + 1 };
+  if (currentVisit !== visit) setVisit(currentVisit);
+  const unreadKey = ["messages", "__unread__", instanceId, currentVisit.generation] as const;
+  const sort = useMailSortStore((s) => s.sort);
+  const senderAscending = sort.key === "sender" ? sort.dir === "asc" : undefined;
   const query = useInfiniteQuery({
-    queryKey: messagesQueryKey(unreadOnly ? "__unread__" : folderId ?? "", unreadOnly ? undefined : folderIds),
-    queryFn: ({ pageParam }) =>
-      unreadOnly
-        ? listUnreadMessages(
-            MESSAGES_PAGE_SIZE,
-            typeof pageParam === "number" ? pageParam : 0,
-          )
-        : listMessages(
+    queryKey: unreadOnly ? [...unreadKey, senderAscending] : messagesQueryKey(folderId ?? "", folderIds, senderAscending),
+    queryFn: ({ pageParam }) => {
+      if (unreadOnly) {
+        // Keep rows already shown in this visit eligible even after their flag
+        // changes. SQLite still supplies the current flags and overall sort.
+        const visibleIds = [...new Set(client.getQueriesData<MessagesInfiniteData>({ queryKey: unreadKey })
+          .flatMap(([, data]) => data?.pages.flatMap(page => page.map(message => message.id)) ?? []))];
+        const offset = typeof pageParam === "number" ? pageParam : 0;
+        return visibleIds.length
+          ? listUnreadMessages(MESSAGES_PAGE_SIZE, offset, senderAscending, visibleIds)
+          : listUnreadMessages(MESSAGES_PAGE_SIZE, offset, senderAscending);
+      }
+      return listMessages(
           folderId!,
           MESSAGES_PAGE_SIZE,
-          0,
+          senderAscending === undefined ? 0 : (pageParam as number),
           folderIds,
-          pageParam === 0 ? null : (pageParam as { date: number; id: string }),
-        ),
+          senderAscending !== undefined || pageParam === 0 ? null : (pageParam as { date: number; id: string }),
+          senderAscending,
+        );
+    },
     initialPageParam: 0 as number | { date: number; id: string },
     getNextPageParam: (lastPage, allPages) => {
       if (lastPage.length < MESSAGES_PAGE_SIZE) return undefined;
-      if (unreadOnly) return allPages.length * MESSAGES_PAGE_SIZE;
+      if (unreadOnly || senderAscending !== undefined) return allPages.length * MESSAGES_PAGE_SIZE;
       const last = lastPage[lastPage.length - 1];
       return { date: last.date, id: last.id };
     },
     enabled: !!folderId || unreadOnly,
     // 15s staleTime：新邮件到达后（mail:new 事件 invalidate）立即刷新；
     // 即使事件偶发丢失，也最多 15 秒出现在列表，不会干等 60 秒。
-    staleTime: 15_000,
+    staleTime: unreadOnly ? 0 : 15_000,
   });
 
-  const data: MessageSummary[] = query.data?.pages.flat() ?? [];
+  // A row can move across a loaded page boundary during send/sync. Keep its
+  // stable local ID once until the remaining pages finish refreshing.
+  const seen = new Set<string>();
+  const data: MessageSummary[] = (query.data?.pages.flat() ?? []).filter(message => {
+    if (seen.has(message.id)) return false;
+    seen.add(message.id);
+    return true;
+  });
   return {
     data,
     isLoading: query.isLoading,
@@ -113,8 +141,31 @@ export function snapshotMessagesCache(queryClient: QueryClient) {
 export function restoreMessagesCache(
   queryClient: QueryClient,
   snapshot: ReturnType<typeof snapshotMessagesCache>,
+  deletedIds?: readonly string[],
 ) {
   for (const [key, data] of snapshot) {
-    queryClient.setQueryData(key, data);
+    if (!deletedIds) {
+      queryClient.setQueryData(key, data);
+      continue;
+    }
+    // A failed delete must not resurrect other concurrently deleted rows or
+    // overwrite newer read/star flags with a whole-list snapshot.
+    const restoreIds = new Set(deletedIds);
+    queryClient.setQueryData<MessagesInfiniteData>(key, current => {
+      if (!current || !data) return current;
+      const present = new Set(current.pages.flat().map(message => message.id));
+      const pages = current.pages.map(page => [...page]);
+      data.pages.forEach((page, pageIndex) => {
+        const target = pages[Math.min(pageIndex, pages.length - 1)];
+        if (!target) return;
+        page.forEach((message, index) => {
+          if (restoreIds.has(message.id) && !present.has(message.id)) {
+            target.splice(Math.min(index, target.length), 0, message);
+            present.add(message.id);
+          }
+        });
+      });
+      return { ...current, pages };
+    });
   }
 }

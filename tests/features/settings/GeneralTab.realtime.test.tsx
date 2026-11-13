@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import GeneralTab from "../../../src/features/settings/GeneralTab";
 import { showTestNotification } from "../../../src/lib/api";
+import { readEmailLinkMode, saveEmailLinkMode } from "../../../src/lib/emailLinkPreference";
 import { useUIStore } from "../../../src/stores/ui.store";
 
 vi.mock("../../../src/features/settings/MailImportSection", () => ({
@@ -74,6 +75,17 @@ describe("GeneralTab realtime mode", () => {
 
   it("defaults to realtime mode", () => {
     expect(useUIStore.getState().realtimeMode).toBe("realtime");
+  });
+
+  it("can reset a remembered email link opener from General settings", () => {
+    saveEmailLinkMode("browser");
+    render(<GeneralTab />);
+
+    const selector = screen.getByRole<HTMLSelectElement>("combobox", { name: "Open links from emails" });
+    expect(selector.value).toBe("browser");
+    fireEvent.change(selector, { target: { value: "ask" } });
+    expect(selector.value).toBe("ask");
+    expect(readEmailLinkMode()).toBe("ask");
   });
 
   it("shows realtime strategy choices and persists selection", () => {

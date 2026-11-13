@@ -9,7 +9,9 @@ use pebble_core::traits::MailProvider;
 use pebble_core::{HttpProxyConfig, PebbleError, ProviderType, Result};
 
 pub(crate) fn http_client_with_proxy(proxy: Option<&HttpProxyConfig>) -> Result<reqwest::Client> {
-    let mut builder = reqwest::ClientBuilder::new();
+    // Mail routing is explicit. Do not silently pick up HTTP(S)_PROXY from
+    // the process environment when the user selected direct mail access.
+    let mut builder = reqwest::ClientBuilder::new().no_proxy();
     if let Some(proxy) = proxy {
         let uri = proxy.socks5h_uri().map_err(PebbleError::Network)?;
         let reqwest_proxy = reqwest::Proxy::all(&uri)

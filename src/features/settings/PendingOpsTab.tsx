@@ -1,10 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useWorkspaceState } from '@/lib/workspaceState';
+import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, Clock, RefreshCw, Trash2 } from "lucide-react";
 import type { PendingMailOp } from "@/lib/api";
-import { dismissFailedPendingMailOps } from "@/lib/api";
+import { dismissFailedPendingMailOps, retryPendingSendOnce, retryPendingSendPostprocessing, confirmPendingSendDelivered, cancelWorkbenchSchedule } from "@/lib/api";
+import ConfirmDialog from "@/components/ConfirmDialog";
+import { mailAccountTitle, reportAppError, safeErrorMessage } from "@/lib/appErrors";
+import { useToastStore } from "@/stores/toast.store";
+import { SettingsFeedback, type SettingsNotice } from "./SettingsFeedback";
 import {
   pendingMailOpsQueryKey,
   pendingMailOpsSummaryQueryKey,
@@ -13,6 +18,7 @@ import {
   usePendingMailOpsSummary,
 } from "@/hooks/queries";
 import { useMailStore } from "@/stores/mail.store";
+import { useUIStore } from "@/stores/ui.store";
 
 const metricStyle: React.CSSProperties = {
   minWidth: "132px",
@@ -67,7 +73,53 @@ export default function PendingOpsTab() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const activeAccountId = useMailStore((s) => s.activeAccountId);
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(activeAccountId);
+  const [selectedAccountId, setSelectedAccountId] = useWorkspaceState<string | null>("src/features/settings/PendingOpsTab.tsx:PendingOpsTab:selectedAccountId", activeAccountId);
+  const [retryTarget, setRetryTarget] = useWorkspaceState<string | null>("src/features/settings/PendingOpsTab.tsx:PendingOpsTab:retryTarget", null);
+  const [retrying, setRetrying] = useWorkspaceState<string | null>("src/features/settings/PendingOpsTab.tsx:PendingOpsTab:retrying", null);
+  const [cancelTarget,setCancelTarget]=useWorkspaceState<PendingMailOp|null>("src/features/settings/PendingOpsTab.tsx:PendingOpsTab:cancelTarget", null);
+  const [confirmedTarget,setConfirmedTarget]=useWorkspaceState<PendingMailOp|null>("src/features/settings/PendingOpsTab.tsx:PendingOpsTab:confirmedTarget", null);
+  const [actionError, setActionError] = useWorkspaceState<(SettingsNotice & { id: string; scheduled?: boolean }) | null>("src/features/settings/PendingOpsTab.tsx:PendingOpsTab:actionError", null);
+
+  function showActionError(id: string, label: string, error: unknown, scheduled = false) {
+    setActionError({ id, scheduled, kind: "error", message: `${label}：${safeErrorMessage(error)}` });
+    reportAppError(error, label);
+  }
+
+  async function confirmSent() {
+    const target=confirmedTarget; if (!target || retrying) return;
+    setConfirmedTarget(null); setRetrying(target.id);
+    setActionError(null);
+    try { await confirmPendingSendDelivered(target.account_id,target.id); useToastStore.getState().addToast({type:'success',message:'已结束待发记录，没有发送任何邮件'}); await refresh(); }
+    catch(error) { showActionError(target.id, '确认已发送未完成', error); }
+    finally { setRetrying(null); }
+  }
+  async function continueArchive(id:string) {
+    if(retrying)return;setRetrying(id);
+    setActionError(null);
+    try {await retryPendingSendPostprocessing(id);useToastStore.getState().addToast({type:'info',message:'已安排继续归档和后续处理，不会重新发送邮件'});await refresh();}
+    catch(error){showActionError(id, '继续归档未提交', error);}
+    finally{setRetrying(null);}
+  }
+
+  async function cancelSchedule(){
+    const target=cancelTarget;if(!target||retrying)return;setCancelTarget(null);setRetrying(target.id);
+    setActionError(null);
+    try{await cancelWorkbenchSchedule(target.account_id,target.id);useToastStore.getState().addToast({type:'success',message:'已取消定时任务，邮件已恢复为草稿'});await refresh();}
+    catch(error){showActionError(target.id, '取消失败，请核对队列中的发送状态', error, true);}
+    finally{setRetrying(null);}
+  }
+
+  async function retryOne() {
+    if (!retryTarget || retrying) return;
+    const id = retryTarget; setRetryTarget(null); setRetrying(id);
+    setActionError(null);
+    try {
+      await retryPendingSendOnce(id);
+      useToastStore.getState().addToast({ type: "info", message: "已提交一次发送重试；若再失败将暂停，不会反复自动发送" });
+      await refresh();
+    } catch (e) { showActionError(id, "重试未提交", e); }
+    finally { setRetrying(null); }
+  }
 
   const accountsQuery = useAccountsQuery();
   const summaryQuery = usePendingMailOpsSummary(selectedAccountId);
@@ -220,7 +272,7 @@ export default function PendingOpsTab() {
               flexShrink: 0,
             }}
           >
-            <RefreshCw size={15} />
+            <RefreshCw size={15} className={summaryQuery.isFetching || opsQuery.isFetching ? "app-spin" : undefined} />
           </button>
         </div>
       </div>
@@ -289,8 +341,9 @@ export default function PendingOpsTab() {
         >
           <AlertCircle size={15} style={{ marginTop: "1px", flexShrink: 0 }} />
           <span>
+            <strong style={{ display: 'block', marginBottom: 4 }}>{mailAccountTitle(summary.last_error_account_id ?? selectedAccountId, accountsQuery.data ?? [])}</strong>
             <strong>{t("pendingOps.latestError", "Latest error")}: </strong>
-            {summary.last_error}
+            {safeErrorMessage(summary.last_error)}
           </span>
         </div>
       )}
@@ -358,18 +411,34 @@ export default function PendingOpsTab() {
                           whiteSpace: "nowrap",
                         }}
                       >
-                        {statusLabel(op.status)}
+                        {op.dismissed ? "已忽略" : statusLabel(op.status)}
                       </span>
                     </td>
-                    <td style={tableCellStyle}>{operationLabel(op.op_type)}</td>
-                    <td style={tableCellStyle}>{op.attempts}</td>
+                    <td style={tableCellStyle}>{operationLabel(op.op_type)}
+                      {op.workbench_schedule&&op.status==='pending'&&op.next_retry_at!=null&&<div style={{marginTop:6}}>计划：{formatTimestamp(op.next_retry_at)}
+                        {op.next_retry_at>Date.now()/1000&&op.attempts===0&&!op.server_accepted&&<button type="button" disabled={Boolean(retrying)} onClick={()=>setCancelTarget(op)}>取消定时并恢复草稿</button>}
+                      </div>}
+                      <SettingsFeedback notice={actionError?.id === op.id && actionError.scheduled ? actionError : null} />
+                    </td>
+                    <td style={tableCellStyle}>{op.op_type === "send" && op.status === "failed" && op.next_retry_at == null ? "已暂停" : op.attempts}</td>
                     <td style={{ ...tableCellStyle, fontFamily: "var(--font-mono, monospace)" }}>
-                      {op.message_id}
+                      <button type="button" onClick={() => {
+                        useMailStore.getState().setActiveAccountId(op.account_id);
+                        const ui = useUIStore.getState(); ui.openMessageInInbox(op.message_id);
+                        ui.setMessageDetailId(op.message_id); ui.setActiveView("messageDetail");
+                      }}>查看邮件</button>
                     </td>
                     <td style={tableCellStyle}>{accountLabel(op.account_id)}</td>
                     <td style={tableCellStyle}>{formatTimestamp(op.updated_at)}</td>
                     <td style={{ ...tableCellStyle, color: op.last_error ? "var(--color-warning, #d97706)" : "var(--color-text-secondary)" }}>
-                      {op.last_error ?? "-"}
+                      {op.last_error ? safeErrorMessage(op.last_error) : "-"}
+                      {op.op_type === "send" && op.status === "failed" && <div style={{ marginTop: 8 }}>
+                        <span style={{ display: "block", marginBottom: 6 }}>{op.duplicate_submission ? "已核实为重复待发副本，禁止从此任务重发。" : op.server_accepted ? "发件服务器已接受邮件，请勿重发；需要处理本地存档或后续操作。" : "自动发送重试已暂停，请先核对是否已经发出。"}</span>
+                        {!op.server_accepted && !op.duplicate_submission && <button type="button" disabled={Boolean(retrying)} onClick={() => setRetryTarget(op.id)}>核对后重试一次</button>}
+                        {op.server_accepted && <button type="button" disabled={Boolean(retrying)} onClick={() => void continueArchive(op.id)}>继续归档</button>}
+                        {!op.server_accepted && <button type="button" disabled={Boolean(retrying)} onClick={() => setConfirmedTarget(op)} style={{marginLeft:6}}>已发送，结束待发</button>}
+                      </div>}
+                      <SettingsFeedback notice={actionError?.id === op.id && !actionError.scheduled ? actionError : null} />
                     </td>
                   </tr>
                 );
@@ -378,6 +447,9 @@ export default function PendingOpsTab() {
           </table>
         </div>
       )}
+      {retryTarget && <ConfirmDialog title="确认重试发送？" message="发送失败有时只表示结果未确认。请先检查已发送及收件方，确保这不是已发出或重复提交的邮件。确认后仅重试一次；失败不会自动反复发送。" confirmLabel="已核对，重试一次" onConfirm={() => void retryOne()} onCancel={() => setRetryTarget(null)} />}
+      {confirmedTarget&&<ConfirmDialog title="确认这封邮件已经发送？" message="请先核对已发送记录或收件方。确认后只结束这条待发记录：已归类邮件保留原位置，重复待发副本在核验已发送原件后收起；不会发送任何邮件。" confirmLabel="我已确认发送，结束待发" onConfirm={()=>void confirmSent()} onCancel={()=>setConfirmedTarget(null)}/>}
+      {cancelTarget&&<ConfirmDialog title="取消此定时任务？" message="仅能取消尚未到期、尚未开始发送的任务；成功后邮件恢复为草稿，不会发送。" confirmLabel="确认取消并恢复草稿" onConfirm={()=>void cancelSchedule()} onCancel={()=>setCancelTarget(null)}/>}
     </div>
   );
 }

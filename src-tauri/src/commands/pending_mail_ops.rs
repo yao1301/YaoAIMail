@@ -25,7 +25,7 @@ async fn rebind_imap_destination_uid(
     message: &pebble_core::Message,
     target_remote_id: &str,
 ) -> std::result::Result<(), PebbleError> {
-    let Some(message_id_header) = message.message_id_header.as_deref() else {
+    let Some(message_id_header) = message.message_id_header.as_deref().filter(|value| !value.trim().is_empty()) else {
         return Ok(());
     };
     let destination_uid = imap
@@ -96,6 +96,9 @@ pub struct PendingMailOpsSummaryResponse {
     pub total_active_count: i64,
     pub last_error: Option<String>,
     pub updated_at: Option<i64>,
+    pub last_error_operation_id: Option<String>,
+    pub last_error_account_id: Option<String>,
+    pub last_error_op_type: Option<String>,
 }
 
 impl From<PendingMailOpsSummary> for PendingMailOpsSummaryResponse {
@@ -107,6 +110,9 @@ impl From<PendingMailOpsSummary> for PendingMailOpsSummaryResponse {
             total_active_count: value.total_active_count,
             last_error: value.last_error,
             updated_at: value.updated_at,
+            last_error_operation_id: value.last_error_operation_id,
+            last_error_account_id: value.last_error_account_id,
+            last_error_op_type: value.last_error_op_type,
         }
     }
 }
@@ -123,11 +129,26 @@ pub struct PendingMailOpResponse {
     pub created_at: i64,
     pub updated_at: i64,
     pub next_retry_at: Option<i64>,
+    pub server_accepted: bool,
+    pub dismissed: bool,
+    pub duplicate_submission: bool,
+    pub workbench_schedule: bool,
 }
 
 impl From<PendingMailOp> for PendingMailOpResponse {
     fn from(value: PendingMailOp) -> Self {
+        let workbench_schedule=serde_json::from_str::<Value>(&value.payload_json).ok()
+            .is_some_and(|v|v.get("workbench_schedule").and_then(Value::as_bool)==Some(true));
+        let server_accepted = serde_json::from_str::<Value>(&value.payload_json).ok()
+            .and_then(|v| v.get("provider_accepted").cloned())
+            .is_some_and(|v| v.as_i64() == Some(1) || v.as_bool() == Some(true));
         Self {
+            duplicate_submission: serde_json::from_str::<Value>(&value.payload_json).ok()
+                .is_some_and(|v|v.get("duplicate_submission").is_some_and(|v|v.as_i64()==Some(1)||v.as_bool()==Some(true))),
+            dismissed: serde_json::from_str::<Value>(&value.payload_json).ok()
+                .is_some_and(|v|v.get("dismissed_at").is_some()),
+            server_accepted,
+            workbench_schedule,
             id: value.id,
             account_id: value.account_id,
             message_id: value.message_id,
@@ -194,6 +215,9 @@ pub async fn run_pending_mail_ops_worker(app: tauri::AppHandle) {
         if let Err(e) = state.store.reset_in_progress_pending_mail_ops() {
             warn!("Failed to reset interrupted pending mail ops: {e}");
         }
+        if let Err(e) = state.store.retire_local_flag_retries() {
+            warn!("Failed to retire obsolete local flag retries: {e}");
+        }
     }
 
     loop {
@@ -220,15 +244,33 @@ pub async fn process_pending_mail_ops(
     let mut imap_connections: HashMap<String, pebble_mail::ImapProvider> = HashMap::new();
 
     for op in ops {
-        state.store.mark_pending_mail_op_in_progress(&op.id)?;
+        if !state.store.try_claim_pending_mail_op(&op.id)? { continue; }
         changed = true;
 
-        match replay_pending_mail_op(state, &op, &mut imap_connections).await {
+        let result = replay_pending_mail_op(state, &op, &mut imap_connections).await;
+        let result = if op.op_type == "send" { result.and_then(|_|state.store.mark_pending_mail_op_done(&op.id)) } else { result };
+        match result {
             Ok(()) => {
-                state.store.mark_pending_mail_op_done(&op.id)?;
+                if op.op_type != "send" { state.store.mark_pending_mail_op_done(&op.id)?; }
                 completed += 1;
             }
+            Err(e) if op.op_type == "send" => {
+                let accepted = serde_json::from_str::<Value>(&op.payload_json).ok()
+                    .and_then(|v|v.get("provider_accepted").cloned()).is_some_and(|v|v.as_i64()==Some(1)||v.as_bool()==Some(true));
+                // The replay may just have recorded acceptance; re-read through the store.
+                let accepted = accepted || state.store.send_was_accepted(&op.id)?;
+                let message = if accepted {format!("发件服务器已接受邮件，本地归档或规则未完成；只重试后处理，不会再次发送。原因：{e}")}
+                    else {format!("发送失败或结果未确认，自动重试已暂停。请先核对已发送及收件方，再手动重试。原因：{e}")};
+                state.store.hold_failed_send(&op.id, &message)?;
+                if let Some(app) = app {
+                    let _ = app.emit("mail:operation-error", serde_json::json!({"operation_id":op.id,"account_id":op.account_id,"op_type":"send","message":message}));
+                }
+                warn!("Pending send {} held for manual review", op.id);
+            }
             Err(ref e) if is_permanent_error(e) => {
+                if let Some(app) = app {
+                    let _ = app.emit("mail:operation-error", serde_json::json!({"operation_id":op.id,"account_id":op.account_id,"op_type":op.op_type,"message":e.to_string()}));
+                }
                 state.store.mark_pending_mail_op_done(&op.id)?;
                 warn!(
                     "Pending mail op {} permanently failed (non-retryable): {e}",
@@ -241,6 +283,9 @@ pub async fn process_pending_mail_ops(
                     .store
                     .mark_pending_mail_op_failed(&op.id, &e.to_string())?;
                 warn!("Pending mail op {} retry failed: {e}", op.id);
+                if let Some(app) = app {
+                    let _ = app.emit("mail:operation-error", serde_json::json!({"operation_id":op.id,"account_id":op.account_id,"op_type":op.op_type,"message":e.to_string()}));
+                }
             }
         }
     }
@@ -277,6 +322,37 @@ pub fn dismiss_failed_pending_mail_ops(
     Ok(dismissed)
 }
 
+#[tauri::command]
+pub fn retry_pending_send_once(state: State<'_, AppState>, app: tauri::AppHandle, operation_id: String) -> Result<(), PebbleError> {
+    state.store.retry_failed_send_once(&operation_id)?;
+    emit_pending_ops_changed(Some(&app));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn retry_pending_send_postprocessing(state: State<'_, AppState>, app: tauri::AppHandle, operation_id: String) -> Result<(), PebbleError> {
+    state.store.retry_send_postprocessing(&operation_id)?;
+    emit_pending_ops_changed(Some(&app)); Ok(())
+}
+
+#[tauri::command]
+pub fn confirm_pending_send_delivered(state: State<'_, AppState>, app: tauri::AppHandle, account_id: String, operation_id: String) -> Result<(), PebbleError> {
+    let op=state.store.list_pending_mail_ops(&account_id)?.into_iter().find(|op|op.id==operation_id&&op.op_type=="send")
+        .ok_or_else(||PebbleError::Validation("此账户没有对应待发任务".into()))?;
+    let payload:Value=serde_json::from_str(&op.payload_json).map_err(|e|PebbleError::Validation(e.to_string()))?;
+    if payload.get("duplicate_submission").and_then(Value::as_i64)!=Some(1) {
+        compose::ensure_local_outgoing_folder(&state.store,&account_id,LocalOutgoingState::Sent)?;
+    }
+    let duplicate=payload.get("duplicate_of_message_id").and_then(Value::as_str);
+    state.store.confirm_pending_send_delivered(&operation_id,duplicate)?;
+    emit_pending_ops_changed(Some(&app));
+    if let Err(error)=refresh_search_document(state.inner(),&op.message_id) {
+        warn!("Confirmed send resolved, search index still pending: {error}");
+        let _=app.emit("mail:operation-error",serde_json::json!({"operation_id":op.id,"account_id":op.account_id,"op_type":"index","message":format!("待发记录已结束，搜索索引尚未更新，已保留索引恢复任务：{error}")}));
+    }
+    Ok(())
+}
+
 fn emit_pending_ops_changed(app: Option<&tauri::AppHandle>) {
     if let Some(app) = app {
         let _ = app.emit(events::MAIL_PENDING_OPS_CHANGED, ());
@@ -288,21 +364,41 @@ async fn replay_pending_mail_op(
     op: &PendingMailOp,
     imap_connections: &mut HashMap<String, pebble_mail::ImapProvider>,
 ) -> std::result::Result<(), PebbleError> {
+    let _identity_guard = if op.op_type == "send" { Some(state.account_identity_lock.lock().await) } else { None };
     let Some(message) = state.store.get_message(&op.message_id)? else {
         debug!("Pending mail op {} skipped because message is gone", op.id);
         return Ok(());
     };
+    if op.op_type == "send" && message.is_deleted { return Ok(()); }
     let Some(account) = state.store.get_account(&op.account_id)? else {
         debug!("Pending mail op {} skipped because account is gone", op.id);
         return Ok(());
     };
+    let payload = op_payload(op);
+    let imap_sent_rule_move = account.provider == ProviderType::Imap
+        && op.op_type == "move_to_folder"
+        && message.remote_id.starts_with("local-sent-")
+        && message.message_id_header.as_deref().is_some_and(|value| !value.trim().is_empty())
+        && match payload.as_ref().ok().and_then(|payload| string_field(payload, "source_folder_id")) {
+            Some(id) => state.store.get_folder(&id)?.is_some_and(|folder| {
+                folder.account_id == op.account_id && folder.role == Some(FolderRole::Sent)
+                    && !folder.remote_id.starts_with("__local_")
+            }),
+            None => false,
+        };
 
     // Imported/local messages do not have a provider-side identifier. Older
     // builds queued remote flag/move operations for them anyway, which can
     // never succeed and caused an ever-growing "remote writes" counter.
     // Local state was already applied when the action was initiated, so the
     // safe recovery is to acknowledge the impossible remote replay.
-    if message.remote_id.trim().is_empty() {
+    if op.op_type != "send" && !imap_sent_rule_move
+        && pebble_store::local_messages::is_local_message_id(&message.remote_id)
+    {
+        if matches!(op.op_type.as_str(), "delete" | "delete_permanent") {
+            apply_pending_local_commit(&state.store, op)?;
+            refresh_after_pending_commit(state, op)?;
+        }
         debug!(
             "Pending mail op {} completed locally because message {} has no remote id",
             op.id, message.id
@@ -310,7 +406,21 @@ async fn replay_pending_mail_op(
         return Ok(());
     }
 
-    let payload = op_payload(op)?;
+    // A locally saved ID in an old flag request remains invalid even if the
+    // message now has a verified server ID.
+    if op.op_type == "update_flags"
+        && serde_json::from_str::<Value>(&op.payload_json)
+            .ok()
+            .and_then(|value| string_field(&value, "remote_id"))
+            .as_deref()
+            .is_some_and(pebble_store::local_messages::is_local_message_id)
+    {
+        return Ok(());
+    }
+
+    let payload = payload?;
+    let mut imap_move_committed = false;
+    let source_cleanup_account=(op.op_type=="send").then(||account.clone());
     match op.op_type.as_str() {
         "update_flags" => {
             let is_read = optional_bool(&payload, "is_read");
@@ -354,6 +464,11 @@ async fn replay_pending_mail_op(
                     Some(imap),
                 )
                 .await?;
+                // IMAP's reconciliation has already bound the destination.
+                // It may have retired the original row in favor of a complete
+                // copy. Applying the generic move would resurrect that row.
+                imap_move_committed = message.message_id_header.as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
             } else {
                 replay_remote_move_to_folder(
                     state,
@@ -366,7 +481,20 @@ async fn replay_pending_mail_op(
             }
         }
         "send" => {
-            replay_remote_send(state, account.provider.clone(), &account, &message).await?;
+            let root: Value = serde_json::from_str(&op.payload_json).map_err(|e|PebbleError::Internal(e.to_string()))?;
+            let accepted = root.get("provider_accepted").is_some_and(|v|v.as_i64()==Some(1)||v.as_bool()==Some(true));
+            if accepted {
+                // A receipt gates the transport stage. Postprocessing retries
+                // must never submit SMTP/API send a second time.
+                if message.remote_id.starts_with("local-outbox-") {
+                    let header = root.get("submitted_message_id").and_then(Value::as_str)
+                        .filter(|s|!s.is_empty()).ok_or_else(||PebbleError::Validation("发送回执缺少Message-ID，需要核对，未重新发送".into()))?;
+                    let body = pebble_mail::smtp::SentBody {html:Some(message.body_html_raw.clone()),inline_images:Vec::new()};
+                    compose::finalize_queued_smtp_send(&state.store,&message,header.into(),&body,&state.attachments_dir)?;
+                }
+            } else {
+                replay_remote_send(state, account.provider.clone(), &account, &message, &op.id).await?;
+            }
         }
         other => {
             return Err(PebbleError::Internal(format!(
@@ -375,8 +503,77 @@ async fn replay_pending_mail_op(
         }
     }
 
-    apply_pending_local_commit(&state.store, op)?;
-    refresh_after_pending_commit(state, op)?;
+    let stages: Value = serde_json::from_str(&op.payload_json).map_err(|e|PebbleError::Internal(e.to_string()))?;
+    let done = |name: &str| stages.get(name).and_then(Value::as_i64)==Some(1);
+    if !imap_move_committed && (op.op_type != "send" || !done("local_sent_committed")) {
+        apply_pending_local_commit(&state.store, op)?;
+        if op.op_type=="send" {state.store.record_send_completion_stage(&op.id,"local_sent_committed")?;}
+    }
+    if op.op_type == "send" && !done("send_rules_applied") {
+        if let Some(message) = state.store.get_message(&op.message_id)? {
+            super::rules::apply_rules_to_message_for_trigger(&state.store, &message, pebble_rules::RuleTrigger::Send)
+                .map_err(|error|PebbleError::Internal(format!("服务器已接受邮件，但发送后规则执行失败，请勿重复发送：{error}")))?;
+        }
+        state.store.record_send_completion_stage(&op.id,"send_rules_applied")?;
+    }
+    if !imap_move_committed && (op.op_type!="send" || !done("send_index_updated")) {
+        refresh_after_pending_commit(state, op)?;
+        if op.op_type=="send" {state.store.record_send_completion_stage(&op.id,"send_index_updated")?;}
+    }
+    if op.op_type == "send" && !done("source_draft_cleaned") {
+        cleanup_submitted_source_draft(state,source_cleanup_account.as_ref().expect("send account captured"),&stages).await
+            .map_err(|error|PebbleError::Internal(format!("服务器已接受邮件，原远端草稿清理失败；不要重复发送，请在草稿箱核对旧副本：{error}")))?;
+        state.store.record_send_completion_stage(&op.id,"source_draft_cleaned")?;
+    }
+    Ok(())
+}
+
+/// Same durable state machine for a user's immediate send and worker recovery.
+/// Once transport was attempted, do not return a generic error that leaves the
+/// editor's Send button appearing safe to press again.
+pub(crate) async fn submit_claimed_send(state: &AppState, op: &PendingMailOp, app: &tauri::AppHandle) -> compose::SendEmailResult {
+    let mut connections = HashMap::new();
+    let result = replay_pending_mail_op(state, op, &mut connections).await
+        .and_then(|_| state.store.mark_pending_mail_op_done(&op.id));
+    let result = match result {
+        Ok(()) => compose::SendEmailResult::sent(None),
+        Err(error) => {
+            let accepted = state.store.send_was_accepted(&op.id).unwrap_or(false);
+            let mut warning = if accepted { format!("服务器已接受邮件，归档或后续处理尚未完成；只会继续后处理，不会再次发送。原因：{error}") }
+                else { format!("发送失败或结果未确认，自动重试已暂停；请核对已发送或收件方后再处理。原因：{error}") };
+            if let Err(persist) = state.store.hold_failed_send(&op.id, &warning) {
+                warning.push_str(&format!("；记录后续状态失败：{persist}。请勿重复发送。"));
+            }
+            let _ = app.emit("mail:operation-error",serde_json::json!({"operation_id":op.id,"account_id":op.account_id,"op_type":"send","message":warning}));
+            compose::SendEmailResult { status: if accepted { "sent" } else { "queued" }, operation_id:Some(op.id.clone()),warning:Some(warning) }
+        }
+    };
+    emit_pending_ops_changed(Some(app));
+    result
+}
+
+/// Only after delivery acceptance/local Sent commit. This must never resubmit mail.
+async fn cleanup_submitted_source_draft(state:&AppState,account:&pebble_core::Account,payload:&Value)->Result<(),PebbleError>{
+    let Some(source)=payload.get("source_draft").filter(|value|value.is_object()) else{return Ok(());};
+    if payload.get("send_saved_draft").and_then(Value::as_bool)!=Some(true){return Err(PebbleError::Validation("远端草稿清理缺少对应发送标记".into()));}
+    let remote=source.get("remote_id").and_then(Value::as_str).filter(|s|!s.is_empty()).ok_or_else(||PebbleError::Validation("原草稿远端编号缺失".into()))?;
+    match account.provider {
+        ProviderType::Gmail=>{connect_gmail(state,&account.id).await?.trash_message(remote).await?;}
+        ProviderType::Outlook=>{connect_outlook(state,&account.id).await?.trash_message(remote).await?;}
+        ProviderType::Imap=>{
+            let folder=source.get("folder_remote_id").and_then(Value::as_str).ok_or_else(||PebbleError::Validation("原草稿文件夹缺失".into()))?;
+            let header=source.get("message_id_header").and_then(Value::as_str).filter(|s|!s.is_empty()).ok_or_else(||PebbleError::Validation("原远端草稿缺少Message-ID，未冒险删除服务器副本".into()))?;
+            let trash=state.store.find_folder_by_role(&account.id,FolderRole::Trash)?.ok_or_else(||PebbleError::Validation("未找到废纸篓，原远端草稿已保留".into()))?;
+            let imap=connect_imap(state,&account.id).await?;
+            let result=async {
+                // Resolve by the original Message-ID, not a possibly stale UID.
+                if let Some(uid)=imap.find_uid_by_message_id(folder,header).await? {imap.move_message(folder,uid,&trash.remote_id).await?;}
+                Ok::<(),PebbleError>(())
+            }.await;
+            let _=imap.disconnect().await;result?;
+        }
+        ProviderType::Pop3=>return Err(PebbleError::Validation("POP3不支持清理远端草稿，副本已保留".into())),
+    }
     Ok(())
 }
 
@@ -656,7 +853,8 @@ async fn replay_remote_delete(
 
 /// Locate the message by Message-ID before moving it. IMAP UIDs are scoped to
 /// a mailbox, and a locally moved row may still carry its old source UID.
-/// Returning `None` means the message is already present in the destination.
+/// Returning `None` means no server move is needed. The destination either
+/// already holds the copy, or an SMTP-only local Sent copy has no server UID.
 async fn locate_imap_move_source(
     state: &AppState,
     imap: &pebble_mail::ImapProvider,
@@ -686,6 +884,15 @@ async fn locate_imap_move_source(
             destination_uid,
         )?;
         return Ok(None);
+    }
+
+    if message.remote_id.starts_with("local-sent-") {
+        // A rule already filed the local Sent copy. The server may save a Sent
+        // copy independently. Only look in the recorded Sent folder so an
+        // actual self-delivery with the same Message-ID cannot be moved.
+        let source = source_folder_remote_id(state, message, payload)?;
+        return Ok(imap.find_uid_by_message_id(&source, message_id_header).await?
+            .map(|uid| (source, uid)));
     }
 
     let account = state.store.get_account(&message.account_id)?;
@@ -820,7 +1027,9 @@ async fn replay_remote_send(
     provider_type: ProviderType,
     account: &pebble_core::Account,
     message: &pebble_core::Message,
+    operation_id: &str,
 ) -> std::result::Result<(), PebbleError> {
+    super::sender_identity::validate_queued_sender(account, message)?;
     let attachment_paths = state
         .store
         .list_attachments_by_message(&message.id)?
@@ -831,29 +1040,32 @@ async fn replay_remote_send(
 
     match provider_type {
         ProviderType::Gmail => {
+            super::sender_identity::verify_oauth_sender(state, account).await?;
             connect_gmail(state, &account.id)
                 .await?
                 .send_message(&outgoing)
-                .await
+                .await?;
+            state.store.record_send_acceptance(operation_id, message.message_id_header.as_deref().unwrap_or(""))?;
+            Ok(())
         }
         ProviderType::Outlook => {
+            super::sender_identity::verify_oauth_sender(state, account).await?;
             connect_outlook(state, &account.id)
                 .await?
                 .send_message(&outgoing)
-                .await
+                .await?;
+            state.store.record_send_acceptance(operation_id, message.message_id_header.as_deref().unwrap_or(""))?;
+            Ok(())
         }
         ProviderType::Imap | ProviderType::Pop3 => {
             // 重试发送也用统一 Message-ID，成功后再存"已发送"副本时保持一致。
-            let message_id = compose::send_imap_smtp_message(state, account, &outgoing).await?;
-            let mut sent_outgoing = outgoing;
-            sent_outgoing.message_id = Some(message_id);
-            let _ = compose::save_outgoing_message_and_refresh_search(
-                state,
-                account,
-                &sent_outgoing,
-                compose::LocalOutgoingState::Sent,
-                &state.attachments_dir,
-            );
+            // 存档 HTML 用线上真实版本（data: 已换成 cid:），并保存内嵌图片附件记录。
+            let (message_id, sent_body) =
+                compose::send_imap_smtp_message(state, account, &outgoing).await?;
+            state.store.record_send_acceptance(operation_id, &message_id)
+                .map_err(|e| PebbleError::Internal(format!("服务器已接受邮件，但发送回执保存失败，请勿重复发送：{e}")))?;
+            compose::finalize_queued_smtp_send(&state.store, message, message_id, &sent_body, &state.attachments_dir)
+                .map_err(|e| PebbleError::Internal(format!("服务器已接受邮件，但本地存档失败，请勿重复发送：{e}")))?;
             Ok(())
         }
     }
@@ -933,7 +1145,7 @@ fn apply_pending_local_commit(
                 &op.account_id,
                 LocalOutgoingState::Sent,
             )?;
-            store.move_message_to_folder(&op.message_id, &sent.id)?;
+            store.commit_accepted_send_archive(&op.id, &sent.id)?;
         }
         other => {
             return Err(PebbleError::Internal(format!(
@@ -1040,6 +1252,42 @@ mod tests {
     use super::apply_pending_local_commit;
     use pebble_core::*;
     use pebble_store::Store;
+
+    #[tokio::test]
+    async fn accepted_send_recovers_after_restart_and_postprocessing_failure_without_any_credentials() {
+        for provider in [ProviderType::Gmail, ProviderType::Imap] {
+            let store = Store::open_in_memory().unwrap();
+            let mut account = test_account(); account.provider = provider; store.insert_account(&account).unwrap();
+            let mut outbox = test_folder(&account.id,FolderRole::Sent,"__local_outbox__","Outbox"); outbox.role=None; store.insert_folder(&outbox).unwrap();
+            let mut message = test_message(&account.id); message.remote_id=format!("local-outbox-{}",message.id); message.message_id_header=Some("<accepted@example.test>".into());
+            store.insert_message(&message,&[outbox.id]).unwrap();
+            let op = store.begin_immediate_send(&account.id,&message.id,r#"{"payload":{}}"#).unwrap();
+            store.record_send_acceptance(&op.id,"<accepted@example.test>").unwrap();
+            store.reset_in_progress_pending_mail_ops().unwrap();
+            // A broken filing rule fails AFTER local Sent commit. No SMTP/API
+            // credentials exist, so an accidental retransmission cannot pass.
+            let rule=Rule{id:new_id(),name:"Unavailable filing destination".into(),priority:0,conditions:r#"{"operator":"and","conditions":[]}"#.into(),actions:r#"[{"type":"MoveToFolder","value":"missing-fixture-folder"}]"#.into(),is_enabled:true,account_id:account.id.clone(),trigger_when:r#"["on_send"]"#.into(),created_at:now_timestamp(),updated_at:now_timestamp()};
+            store.insert_rule(&rule).unwrap();
+            let root = std::env::temp_dir().join(format!("pebble-send-recovery-{}",new_id())); std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("portable-key"),format!("PEBBLE-PORTABLE-KEY-V1\n{}\n","07".repeat(32))).unwrap();
+            let crypto=pebble_crypto::CryptoService::init_for_profile(&root).unwrap();
+            let (stop,_)=std::sync::mpsc::channel();
+            let state=crate::state::AppState::new(store,pebble_search::TantivySearch::open_in_memory().unwrap(),crypto,stop,root.join("attachments"));
+            assert_eq!(super::process_pending_mail_ops(&state,None).await.unwrap(),0);
+            assert!(state.store.send_was_accepted(&op.id).unwrap());
+            assert!(state.store.retry_failed_send_once(&op.id).is_err());
+            assert_eq!(state.store.get_message(&message.id).unwrap().unwrap().body_text,message.body_text);
+            state.store.delete_rule(&rule.id).unwrap();
+            state.store.reset_in_progress_pending_mail_ops().unwrap();
+            assert_eq!(state.store.list_pending_mail_ops(&account.id).unwrap().iter().find(|v|v.id==op.id).unwrap().attempts,1);
+            state.store.retry_send_postprocessing(&op.id).unwrap();
+            assert_eq!(super::process_pending_mail_ops(&state,None).await.unwrap(),1);
+            assert_eq!(super::process_pending_mail_ops(&state,None).await.unwrap(),0);
+            assert_eq!(state.store.list_message_ids_by_account(&account.id).unwrap(),vec![message.id]);
+            assert_eq!(state.store.pending_mail_ops_summary(Some(&account.id)).unwrap().total_active_count,0);
+            drop(state); assert!(root.starts_with(std::env::temp_dir())); std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     fn test_account() -> Account {
         let now = now_timestamp();

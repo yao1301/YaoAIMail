@@ -2,7 +2,7 @@ use pebble_core::{Folder, Message, PebbleError, Result};
 use rusqlite::{params, OptionalExtension};
 use serde_json::json;
 
-use crate::Store;
+use crate::{local_messages::is_local_message_id, Store};
 
 pub const MAX_PENDING_MAIL_OP_ATTEMPTS: i64 = 8;
 const BASE_RETRY_DELAY_SECS: i64 = 60;
@@ -69,9 +69,29 @@ pub struct PendingMailOpsSummary {
     pub total_active_count: i64,
     pub last_error: Option<String>,
     pub updated_at: Option<i64>,
+    pub last_error_operation_id: Option<String>,
+    pub last_error_account_id: Option<String>,
+    pub last_error_op_type: Option<String>,
 }
 
 impl Store {
+    pub fn send_was_accepted(&self, id: &str) -> Result<bool> {
+        self.with_read(|conn| Ok(conn.query_row("SELECT coalesce(json_extract(payload_json,'$.provider_accepted'),0)=1
+            FROM pending_mail_ops WHERE id=?1 AND op_type='send'",[id],|r|r.get(0)).optional()?.unwrap_or(false)))
+    }
+    pub fn record_send_completion_stage(&self, id: &str, stage: &str) -> Result<()> {
+        if !matches!(stage,"local_sent_committed"|"send_rules_applied"|"send_index_updated"|"source_draft_cleaned") {
+            return Err(PebbleError::Validation("Unknown send completion stage".into()));
+        }
+        self.with_write(|conn| {
+            if conn.execute("UPDATE pending_mail_ops SET payload_json=json_set(payload_json,?1,1),updated_at=?2
+                WHERE id=?3 AND op_type='send' AND status='in_progress' AND coalesce(json_extract(payload_json,'$.provider_accepted'),0)=1",
+                params![format!("$.{stage}"),pebble_core::now_timestamp(),id])? != 1 {
+                return Err(PebbleError::Validation("发送后处理阶段没有有效回执或任务已变化".into()));
+            }
+            Ok(())
+        })
+    }
     /// Commit a rule-generated local move and its remote outbox records in one
     /// SQLite transaction. A crash can therefore leave either both changes or
     /// neither change, but never a locally moved message with no server work.
@@ -461,25 +481,29 @@ impl Store {
                     COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
                     MAX(updated_at)
                  FROM pending_mail_ops
-                 WHERE status != 'done'
+                 WHERE status != 'done' AND json_extract(payload_json,'$.dismissed_at') IS NULL
                    AND (?1 IS NULL OR account_id = ?1)",
                 params![account_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
 
-            let last_error = conn
+            let failure = conn
                 .query_row(
-                    "SELECT last_error
+                    "SELECT last_error, id, account_id, op_type
                      FROM pending_mail_ops
-                     WHERE status = 'failed'
+                     WHERE status = 'failed' AND json_extract(payload_json,'$.dismissed_at') IS NULL
                        AND last_error IS NOT NULL
                        AND (?1 IS NULL OR account_id = ?1)
-                     ORDER BY updated_at DESC
+                     ORDER BY updated_at DESC, id DESC
                      LIMIT 1",
                     params![account_id],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
                 )
                 .optional()?;
+            let (last_error, last_error_operation_id, last_error_account_id, last_error_op_type) = match failure {
+                Some((error, id, account, op_type)) => (Some(error), Some(id), Some(account), Some(op_type)),
+                None => (None, None, None, None),
+            };
 
             Ok(PendingMailOpsSummary {
                 pending_count,
@@ -488,6 +512,9 @@ impl Store {
                 total_active_count: pending_count + in_progress_count + failed_count,
                 last_error,
                 updated_at,
+                last_error_operation_id,
+                last_error_account_id,
+                last_error_op_type,
             })
         })
     }
@@ -509,8 +536,78 @@ impl Store {
         })
     }
 
-    pub fn reset_in_progress_pending_mail_ops(&self) -> Result<()> {
+    /// A failed SMTP submission may already have been accepted remotely.
+    /// Never automatically resubmit it; retain the message for explicit review.
+    pub fn hold_failed_send(&self, id: &str, error: &str) -> Result<()> {
         self.with_write(|conn| {
+            let accepted: bool = conn.query_row("SELECT coalesce(json_extract(payload_json,'$.provider_accepted'),0)=1
+                FROM pending_mail_ops WHERE id=?1",[id],|r|r.get(0)).optional()?.unwrap_or(false);
+            if accepted {
+                // Retry only local completion; replay guards against another SMTP submission.
+                let attempts: i64 = conn.query_row("SELECT attempts FROM pending_mail_ops WHERE id=?1",[id],|r|r.get(0))?;
+                conn.execute("UPDATE pending_mail_ops SET status='failed',attempts=?1,last_error=?2,next_retry_at=?3,updated_at=?4 WHERE id=?5 AND status!='done'",
+                    params![attempts+1,error,if attempts+1<MAX_PENDING_MAIL_OP_ATTEMPTS {Some(pebble_core::now_timestamp()+60)} else {None},pebble_core::now_timestamp(),id])?;
+                return Ok(());
+            }
+            conn.execute("UPDATE pending_mail_ops SET status='failed', attempts=max(attempts,?1), last_error=?2, next_retry_at=NULL, updated_at=?3 WHERE id=?4 AND op_type='send' AND status!='done'",
+                params![MAX_PENDING_MAIL_OP_ATTEMPTS, error, pebble_core::now_timestamp(), id])?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_held_send(&self, account_id: &str, message_id: &str, payload: &str, error: &str) -> Result<String> {
+        self.with_write(|conn| {
+            let id = pebble_core::new_id();
+            let now = pebble_core::now_timestamp();
+            conn.execute("INSERT INTO pending_mail_ops (id,account_id,message_id,op_type,payload_json,status,attempts,last_error,created_at,updated_at,next_retry_at) VALUES (?1,?2,?3,'send',?4,'failed',?5,?6,?7,?7,NULL)",
+                params![id,account_id,message_id,payload,MAX_PENDING_MAIL_OP_ATTEMPTS,error,now])?;
+            Ok(id)
+        })
+    }
+
+    pub fn retry_failed_send_once(&self, id: &str) -> Result<()> {
+        self.with_write(|conn| {
+            let count = conn.execute("UPDATE pending_mail_ops SET status='pending',attempts=0,last_error=NULL,payload_json=json_remove(payload_json,'$.dismissed_at'),next_retry_at=?1,updated_at=?1 WHERE id=?2 AND op_type='send' AND status='failed' AND coalesce(json_extract(payload_json,'$.provider_accepted'),0)=0
+                AND coalesce(json_extract(payload_json,'$.duplicate_submission'),0)=0
+                AND EXISTS(SELECT 1 FROM messages m WHERE m.id=pending_mail_ops.message_id AND m.is_deleted=0
+                  AND NOT EXISTS(SELECT 1 FROM message_folders mf JOIN folders f ON f.id=mf.folder_id WHERE mf.message_id=m.id AND f.role='sent'))",
+                params![pebble_core::now_timestamp(), id])?;
+            if count != 1 { return Err(PebbleError::Validation("此邮件已发送、已被服务器接受、正在发送或已移除，不能重复提交；请刷新队列并核对已发送".into())); }
+            Ok(())
+        })
+    }
+
+    /// Safe repair for legacy terminal states; no claim or transport is run.
+    pub fn repair_legacy_outbox_states(&self) -> Result<()> {
+        self.with_write(|conn| {
+            // Older dismissal/permanent-error paths used done without a Sent
+            // commit. Surface those stranded copies for review, never send them.
+            conn.execute("UPDATE pending_mail_ops SET status='failed',attempts=?1,next_retry_at=NULL,
+                last_error=CASE WHEN coalesce(json_extract(payload_json,'$.provider_accepted'),0)=1
+                    THEN '服务商已接受邮件，本地归档未完成；只能补归档，不要重新发送。'
+                    ELSE '历史待发记录被标为完成，但没有已发送归档；发送结果需核对，未自动重发。' END,
+                updated_at=?2 WHERE op_type='send' AND status='done'
+                AND EXISTS(SELECT 1 FROM messages m JOIN message_folders mf ON mf.message_id=m.id
+                    JOIN folders f ON f.id=mf.folder_id WHERE m.id=pending_mail_ops.message_id
+                    AND m.is_deleted=0 AND f.remote_id='__local_outbox__')",
+                params![MAX_PENDING_MAIL_OP_ATTEMPTS,pebble_core::now_timestamp()])?;
+            Ok(())
+        })
+    }
+
+    pub fn reset_in_progress_pending_mail_ops(&self) -> Result<()> {
+        self.repair_legacy_outbox_states()?;
+        self.with_write(|conn| {
+            // Older versions retried failed sends silently. On upgrade, retain
+            // those messages but require review before any further submission.
+            conn.execute("UPDATE pending_mail_ops SET attempts=?1,next_retry_at=NULL WHERE op_type='send' AND status='failed' AND attempts<?1 AND coalesce(json_extract(payload_json,'$.provider_accepted'),0)!=1",
+                params![MAX_PENDING_MAIL_OP_ATTEMPTS])?;
+            // An acceptance receipt makes restart recovery postprocessing-only.
+            // Preserve its retry budget; never turn it back into a transport send.
+            conn.execute("UPDATE pending_mail_ops SET status='pending',next_retry_at=?1,updated_at=?1 WHERE status='in_progress' AND op_type='send' AND attempts<?2 AND coalesce(json_extract(payload_json,'$.provider_accepted'),0)=1",
+                params![pebble_core::now_timestamp(),MAX_PENDING_MAIL_OP_ATTEMPTS])?;
+            conn.execute("UPDATE pending_mail_ops SET status='failed',attempts=max(attempts,?1),next_retry_at=NULL,last_error='上次发送中断，结果未确认，自动重试已暂停；请核对已发送及收件方。',updated_at=?2 WHERE status='in_progress' AND op_type='send'",
+                params![MAX_PENDING_MAIL_OP_ATTEMPTS,pebble_core::now_timestamp()])?;
             conn.execute(
                 "UPDATE pending_mail_ops
                  SET status = ?1,
@@ -523,6 +620,59 @@ impl Store {
                     PendingMailOpStatus::InProgress.as_str(),
                 ],
             )?;
+            Ok(())
+        })
+    }
+
+    /// Retire flag retries created for messages that had no server target.
+    /// Do not replay their old values over newer local user changes.
+    pub fn retire_local_flag_retries(&self) -> Result<()> {
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let now = pebble_core::now_timestamp();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT p.id, m.remote_id, p.payload_json
+                     FROM pending_mail_ops p JOIN messages m
+                       ON m.id=p.message_id AND m.account_id=p.account_id
+                     WHERE p.op_type='update_flags' AND p.status IN ('pending','failed')",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?;
+                let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                for (id, current_remote_id, payload) in rows {
+                    let saved_remote_id = serde_json::from_str::<serde_json::Value>(&payload)
+                        .ok()
+                        .and_then(|value| value.get("remote_id")?.as_str().map(str::to_owned));
+                    if is_local_message_id(&current_remote_id)
+                        || saved_remote_id.as_deref().is_some_and(is_local_message_id)
+                    {
+                        tx.execute(
+                            "UPDATE pending_mail_ops SET status='done',last_error=NULL,
+                                 next_retry_at=NULL,updated_at=?2 WHERE id=?1",
+                            params![id, now],
+                        )?;
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn try_claim_pending_mail_op(&self, id: &str) -> Result<bool> {
+        self.with_write(|conn| {
+            Ok(conn.execute("UPDATE pending_mail_ops SET status='in_progress',updated_at=?1 WHERE id=?2 AND (status='pending' OR (status='failed' AND attempts<?3)) AND (next_retry_at IS NULL OR next_retry_at<=?1)",
+                params![pebble_core::now_timestamp(),id,MAX_PENDING_MAIL_OP_ATTEMPTS])? == 1)
+        })
+    }
+
+    pub fn record_send_acceptance(&self, operation_id: &str, header: &str) -> Result<()> {
+        self.with_write(|conn| {
+            let changed = conn.execute("UPDATE pending_mail_ops SET payload_json=json_set(payload_json,'$.provider_accepted',1,'$.submitted_message_id',?1),attempts=0,updated_at=?2 WHERE id=?3 AND op_type='send' AND status='in_progress'",
+                params![header,pebble_core::now_timestamp(),operation_id])?;
+            if changed != 1 { return Err(PebbleError::Validation("发送回执未能保存到对应任务，禁止重新发送".into())); }
             Ok(())
         })
     }
@@ -564,26 +714,30 @@ impl Store {
         })
     }
 
+    /// Acknowledging a failure is not delivery and must retain its audit trail.
     pub fn dismiss_failed_pending_mail_ops(&self, account_id: Option<&str>) -> Result<u64> {
         self.with_write(|conn| {
-            let now = pebble_core::now_timestamp();
-            let rows = conn.execute(
-                "UPDATE pending_mail_ops
-                 SET status = ?1,
-                     last_error = NULL,
-                     updated_at = ?2,
-                     next_retry_at = NULL
-                 WHERE status = 'failed'
-                   AND (?3 IS NULL OR account_id = ?3)",
-                params![PendingMailOpStatus::Done.as_str(), now, account_id],
-            )?;
-            Ok(rows as u64)
+            Ok(conn.execute("UPDATE pending_mail_ops SET payload_json=json_set(payload_json,'$.dismissed_at',?1),
+                attempts=max(attempts,?3),next_retry_at=NULL,updated_at=?1
+                WHERE status='failed' AND (?2 IS NULL OR account_id=?2)
+                AND json_extract(payload_json,'$.dismissed_at') IS NULL",
+                params![pebble_core::now_timestamp(),account_id,MAX_PENDING_MAIL_OP_ATTEMPTS])? as u64)
         })
     }
 
     pub fn mark_pending_mail_op_done(&self, id: &str) -> Result<()> {
         self.with_write(|conn| {
-            conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            let incomplete: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pending_mail_ops p JOIN messages m ON m.id=p.message_id WHERE p.id=?1 AND p.op_type='send' AND m.is_deleted=0 AND m.is_draft=0
+                AND coalesce(json_extract(p.payload_json,'$.user_confirmed_sent'),0)!=1
+                AND (coalesce(json_extract(p.payload_json,'$.provider_accepted'),0)!=1
+                    OR coalesce(json_extract(p.payload_json,'$.local_sent_committed'),0)!=1
+                    OR coalesce(json_extract(p.payload_json,'$.send_rules_applied'),0)!=1
+                    OR coalesce(json_extract(p.payload_json,'$.send_index_updated'),0)!=1
+                    OR coalesce(json_extract(p.payload_json,'$.source_draft_cleaned'),0)!=1
+                    OR EXISTS(SELECT 1 FROM message_folders mf JOIN folders f ON f.id=mf.folder_id WHERE mf.message_id=m.id AND f.remote_id='__local_outbox__')))",[id],|r|r.get(0))?;
+            if incomplete { return Err(PebbleError::Validation("发送凭据或本地归档尚未完成，不能将任务标为完成".into())); }
+            tx.execute(
                 "UPDATE pending_mail_ops
                  SET status = ?1,
                      last_error = NULL,
@@ -596,6 +750,7 @@ impl Store {
                     id,
                 ],
             )?;
+            tx.commit()?;
             Ok(())
         })
     }
@@ -616,6 +771,53 @@ impl Store {
 mod tests {
     use super::*;
     use pebble_core::*;
+    #[test]
+    fn a_confirmed_duplicate_cannot_be_resubmitted_from_the_old_queue() {
+        let s=Store::open_in_memory().unwrap();let a=test_account();s.insert_account(&a).unwrap();
+        let f=test_folder(&a.id);s.insert_folder(&f).unwrap();let m=test_message(&a.id);s.insert_message(&m,&[f.id]).unwrap();
+        let id=s.insert_held_send(&a.id,&m.id,r#"{"duplicate_submission":1}"#,"Confirmed duplicate").unwrap();
+        assert!(s.retry_failed_send_once(&id).is_err());assert!(s.list_retryable_pending_mail_ops(10).unwrap().is_empty());
+    }
+    #[test]
+    fn accepted_send_records_completion_stages_and_only_postprocessing_is_retryable() {
+        let s=Store::open_in_memory().unwrap();let a=test_account();s.insert_account(&a).unwrap();
+        let f=test_folder(&a.id);s.insert_folder(&f).unwrap();let m=test_message(&a.id);s.insert_message(&m,&[f.id]).unwrap();
+        let id=s.insert_pending_mail_op(&a.id,&m.id,"send","{}").unwrap();assert!(s.try_claim_pending_mail_op(&id).unwrap());
+        s.record_send_acceptance(&id,"<accepted@example.test>").unwrap();
+        s.record_send_completion_stage(&id,"local_sent_committed").unwrap();
+        assert!(s.record_send_completion_stage(&id,"not-a-stage").is_err());
+        s.hold_failed_send(&id,"Local index unavailable").unwrap();
+        assert!(s.send_was_accepted(&id).unwrap());assert!(s.retry_failed_send_once(&id).is_err());
+        s.force_pending_mail_op_retry_now_for_test(&id).unwrap();
+        let ops=s.list_retryable_pending_mail_ops(10).unwrap();assert_eq!(ops.len(),1);
+        let payload:serde_json::Value=serde_json::from_str(&ops[0].payload_json).unwrap();assert_eq!(payload["local_sent_committed"],1);
+        assert_eq!(ops[0].attempts,1);
+        s.dismiss_failed_pending_mail_ops(Some(&a.id)).unwrap();assert!(s.list_retryable_pending_mail_ops(10).unwrap().is_empty());
+    }
+    #[test]
+    fn dismissing_a_send_retains_failure_and_never_becomes_delivery() {
+        let s=Store::open_in_memory().unwrap();let a=test_account();s.insert_account(&a).unwrap();
+        let f=test_folder(&a.id);s.insert_folder(&f).unwrap();let m=test_message(&a.id);s.insert_message(&m,&[f.id]).unwrap();
+        let id=s.insert_pending_mail_op(&a.id,&m.id,"send","{}").unwrap();s.hold_failed_send(&id,"Original SMTP error").unwrap();
+        assert_eq!(s.dismiss_failed_pending_mail_ops(Some(&a.id)).unwrap(),1);
+        let ops=s.list_active_pending_mail_ops(Some(&a.id),10).unwrap();assert_eq!(ops[0].status,PendingMailOpStatus::Failed);
+        assert_eq!(ops[0].last_error.as_deref(),Some("Original SMTP error"));assert!(ops[0].payload_json.contains("dismissed_at"));
+        assert_eq!(s.pending_mail_ops_summary(Some(&a.id)).unwrap().failed_count,0);
+        assert!(s.list_retryable_pending_mail_ops(10).unwrap().is_empty());assert!(!s.send_was_accepted(&id).unwrap());
+    }
+    #[test]
+    fn historical_done_outbox_is_held_for_review_without_resubmission() {
+        let s=Store::open_in_memory().unwrap();let a=test_account();s.insert_account(&a).unwrap();
+        let mut f=test_folder(&a.id);f.remote_id="__local_outbox__".into();f.role=None;s.insert_folder(&f).unwrap();
+        let mut m=test_message(&a.id);m.remote_id="local-outbox-fixture".into();s.insert_message(&m,&[f.id]).unwrap();
+        let id=s.insert_pending_mail_op(&a.id,&m.id,"send","{}").unwrap();
+        // Recreate the OLD on-disk bug; the current completion API rejects it.
+        s.with_write(|c|{c.execute("UPDATE pending_mail_ops SET status='done' WHERE id=?1",[&id])?;Ok(())}).unwrap();
+        s.reset_in_progress_pending_mail_ops().unwrap();
+        let ops=s.list_active_pending_mail_ops(Some(&a.id),10).unwrap();assert_eq!(ops[0].status,PendingMailOpStatus::Failed);
+        assert!(ops[0].last_error.as_deref().unwrap().contains("历史待发"));assert!(s.list_retryable_pending_mail_ops(10).unwrap().is_empty());
+        assert_eq!(s.get_message(&m.id).unwrap().unwrap().remote_id,"local-outbox-fixture");
+    }
 
     fn test_account() -> Account {
         let now = now_timestamp();
@@ -678,6 +880,44 @@ mod tests {
     }
 
     #[test]
+    fn local_flag_retries_retire_without_replaying_stale_values_or_touching_other_ops() {
+        let store = Store::open_in_memory().unwrap();
+        let mut account = test_account();
+        account.provider = ProviderType::Imap;
+        store.insert_account(&account).unwrap();
+        let folder = test_folder(&account.id);
+        store.insert_folder(&folder).unwrap();
+        let mut cached = test_message(&account.id);
+        cached.remote_id = "__local_imap_cache__:fixture".into();
+        cached.is_read = true;
+        store.insert_message(&cached, &[folder.id.clone()]).unwrap();
+        let mut rebound = test_message(&account.id);
+        rebound.remote_id = "42".into();
+        store.insert_message(&rebound, &[folder.id]).unwrap();
+
+        let queue = |message: &Message, op, payload| {
+            store.insert_pending_mail_op(&account.id, &message.id, op, payload).unwrap()
+        };
+        let old_cached = queue(&cached, "update_flags", r#"{"is_read":false}"#);
+        let old_rebound = queue(&rebound, "update_flags",
+            r#"{"remote_id":"__local_history__:fixture","payload":{"is_read":true}}"#);
+        store.mark_pending_mail_op_failed(&old_rebound, "Invalid IMAP UID").unwrap();
+        let valid = queue(&rebound, "update_flags", r#"{"remote_id":"42","is_read":true}"#);
+        let unrelated = queue(&cached, "move_to_folder", "{}");
+
+        store.retire_local_flag_retries().unwrap();
+
+        let active = store.list_active_pending_mail_ops(Some(&account.id), 10).unwrap();
+        let active_ids: Vec<_> = active.iter().map(|op| op.id.as_str()).collect();
+        assert!(!active_ids.contains(&old_cached.as_str()));
+        assert!(!active_ids.contains(&old_rebound.as_str()));
+        assert!(active_ids.contains(&valid.as_str()));
+        assert!(active_ids.contains(&unrelated.as_str()));
+        assert!(store.get_message(&cached.id).unwrap().unwrap().is_read);
+        assert!(!store.get_message(&rebound.id).unwrap().unwrap().is_read);
+    }
+
+    #[test]
     fn pending_mail_ops_insert_list_mark_failed_and_done() {
         let store = Store::open_in_memory().unwrap();
         let account = test_account();
@@ -708,6 +948,67 @@ mod tests {
         store.mark_pending_mail_op_done(&op_id).unwrap();
         let done = store.list_pending_mail_ops(&account.id).unwrap();
         assert_eq!(done[0].status, PendingMailOpStatus::Done);
+    }
+
+    #[test]
+    fn held_sends_require_explicit_retry_and_never_restart_automatically() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account(); store.insert_account(&account).unwrap();
+        let folder = test_folder(&account.id); store.insert_folder(&folder).unwrap();
+        let message = test_message(&account.id); store.insert_message(&message, &[folder.id]).unwrap();
+        let id = store.insert_held_send(&account.id, &message.id, "{}", "result unknown").unwrap();
+        assert!(store.list_retryable_pending_mail_ops(100).unwrap().is_empty());
+        store.reset_in_progress_pending_mail_ops().unwrap();
+        assert!(store.list_retryable_pending_mail_ops(100).unwrap().is_empty());
+        store.retry_failed_send_once(&id).unwrap();
+        assert_eq!(store.list_retryable_pending_mail_ops(100).unwrap().len(), 1);
+        assert!(store.retry_failed_send_once(&id).is_err());
+        store.mark_pending_mail_op_in_progress(&id).unwrap();
+        store.hold_failed_send(&id, "failed again").unwrap();
+        assert!(store.list_retryable_pending_mail_ops(100).unwrap().is_empty());
+        assert!(store.get_message(&message.id).unwrap().is_some());
+        store.retry_failed_send_once(&id).unwrap();
+        assert!(store.mark_pending_mail_op_done(&id).is_err());
+        store.hold_failed_send(&id,"Confirmed by fixture user").unwrap();
+        store.confirm_pending_send_delivered(&id,None).unwrap();
+        assert!(store.retry_failed_send_once(&id).is_err());
+        let other = store.insert_pending_mail_op(&account.id, &message.id, "move_to_folder", "{}").unwrap();
+        assert!(store.retry_failed_send_once(&other).is_err());
+    }
+
+    #[test]
+    fn interrupted_or_smtp_accepted_sends_are_not_automatically_submitted_again() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account(); store.insert_account(&account).unwrap();
+        let folder = test_folder(&account.id); store.insert_folder(&folder).unwrap();
+        let message = test_message(&account.id); store.insert_message(&message, &[folder.id]).unwrap();
+        let id = store.insert_pending_mail_op(&account.id, &message.id, "send", "{}").unwrap();
+        assert!(store.try_claim_pending_mail_op(&id).unwrap());
+        assert!(!store.try_claim_pending_mail_op(&id).unwrap());
+        store.record_send_acceptance(&id, "<accepted@example.test>").unwrap();
+        store.reset_in_progress_pending_mail_ops().unwrap();
+        let retryable = store.list_retryable_pending_mail_ops(100).unwrap();
+        assert_eq!(retryable.len(),1);
+        assert!(store.send_was_accepted(&retryable[0].id).unwrap());
+        assert!(store.retry_failed_send_once(&id).is_err());
+        assert!(store.try_claim_pending_mail_op(&id).unwrap());
+        assert!(!store.try_claim_pending_mail_op(&id).unwrap());
+    }
+
+    #[test]
+    fn legacy_failed_sends_are_held_when_worker_starts() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account(); store.insert_account(&account).unwrap();
+        let folder = test_folder(&account.id); store.insert_folder(&folder).unwrap();
+        let message = test_message(&account.id); store.insert_message(&message, &[folder.id]).unwrap();
+        let id = store.insert_pending_mail_op(&account.id, &message.id, "send", "{}").unwrap();
+        store.mark_pending_mail_op_failed(&id, "legacy network error").unwrap();
+        store.reset_in_progress_pending_mail_ops().unwrap();
+        let ops = store.list_active_pending_mail_ops(Some(&account.id), 10).unwrap();
+        assert_eq!(ops[0].attempts, MAX_PENDING_MAIL_OP_ATTEMPTS);
+        assert!(ops[0].next_retry_at.is_none());
+        assert_eq!(ops[0].last_error.as_deref(), Some("legacy network error"));
+        assert!(store.list_retryable_pending_mail_ops(100).unwrap().is_empty());
     }
 
     #[test]
@@ -826,12 +1127,42 @@ mod tests {
         assert_eq!(summary.failed_count, 1);
         assert_eq!(summary.total_active_count, 2);
         assert_eq!(summary.last_error.as_deref(), Some("network unavailable"));
+        assert_eq!(summary.last_error_operation_id.as_deref(), Some(failed_id.as_str()));
+        assert_eq!(summary.last_error_account_id.as_deref(), Some(account.id.as_str()));
+        assert_eq!(summary.last_error_op_type.as_deref(), Some("update_flags"));
 
         let retryable_after_claim = store.list_retryable_pending_mail_ops(10).unwrap();
         assert!(retryable_after_claim.is_empty());
         let failed = store.list_pending_mail_ops(&account.id).unwrap();
         let failed = failed.iter().find(|op| op.id == failed_id).unwrap();
         assert!(failed.next_retry_at.unwrap() > now_timestamp());
+    }
+
+    #[test]
+    fn pending_error_identity_follows_its_own_account_and_survives_identical_messages() {
+        let store = Store::open_in_memory().unwrap();
+        let first = test_account();
+        let mut second = test_account(); second.email = "second@example.test".into();
+        let mut ids = Vec::new();
+        for account in [&first, &second] {
+            store.insert_account(account).unwrap();
+            let folder = test_folder(&account.id); store.insert_folder(&folder).unwrap();
+            let message = test_message(&account.id); store.insert_message(&message, &[folder.id]).unwrap();
+            let id = store.insert_pending_mail_op(&account.id, &message.id, "send", "{}").unwrap();
+            store.mark_pending_mail_op_failed(&id, "Same connection failure").unwrap(); ids.push(id);
+        }
+        for (account, id) in [(&first, &ids[0]), (&second, &ids[1])] {
+            let summary = store.pending_mail_ops_summary(Some(&account.id)).unwrap();
+            assert_eq!(summary.last_error_account_id.as_deref(), Some(account.id.as_str()));
+            assert_eq!(summary.last_error_operation_id.as_deref(), Some(id.as_str()));
+        }
+        store.dismiss_failed_pending_mail_ops(Some(&second.id)).unwrap();
+        let all = store.pending_mail_ops_summary(None).unwrap();
+        assert_eq!(all.last_error_account_id.as_deref(), Some(first.id.as_str()));
+        assert_eq!(all.last_error_operation_id.as_deref(), Some(ids[0].as_str()));
+        store.dismiss_failed_pending_mail_ops(Some(&first.id)).unwrap();
+        let empty = store.pending_mail_ops_summary(None).unwrap();
+        assert!(empty.last_error.is_none() && empty.last_error_account_id.is_none() && empty.last_error_operation_id.is_none());
     }
 
     #[test]

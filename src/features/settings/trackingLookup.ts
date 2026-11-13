@@ -1,4 +1,6 @@
-export type TrackingLookupKind = "container" | "vessel" | "shipment";
+import { FOREIGN_TOOL_SOURCES, trackTraceLookupUrl } from "./foreignToolSources";
+
+export type TrackingLookupKind = "container" | "billOfLading" | "vessel" | "shipment" | "aircargo";
 
 export interface TrackingLookup {
   kind: TrackingLookupKind;
@@ -37,9 +39,18 @@ export function identifyTrackingLookup(input: string): TrackingLookup | null {
       kind: "container",
       normalized,
       label: "集装箱号",
-      provider: "SeaRates 集装箱追踪",
-      url: `https://www.searates.com/container/tracking/?number=${encodeURIComponent(normalized)}`,
+      provider: "Track-Trace 集装箱查询",
+      url: trackTraceLookupUrl("container", normalized),
     };
+  }
+
+  // A separated AWB or explicit label is strong evidence. Do not classify every
+  // bare 11-digit courier number as air freight, since those formats overlap.
+  const awb = trimmed.match(/^(?:AWB\s*[:：]?\s*)?(\d{3})[-\s]+(\d{8})$/i)
+    ?? trimmed.match(/^AWB\s*[:：]?\s*(\d{3})(\d{8})$/i);
+  if (awb) {
+    const number = `${awb[1]}-${awb[2]}`;
+    return { kind: "aircargo", normalized: number, label: "空运提单号（AWB）", provider: "Track-Trace 空运查询", url: trackTraceLookupUrl("aircargo", number) };
   }
 
   const explicitImo = trimmed.match(/^\s*IMO[\s:-]*(\d{7})\s*$/i)?.[1];
@@ -52,7 +63,7 @@ export function identifyTrackingLookup(input: string): TrackingLookup | null {
       normalized: vesselId,
       label: explicitMmsi ? "船舶 MMSI" : "船舶 IMO 号",
       provider: "VesselFinder 船舶查询",
-      url: `https://www.vesselfinder.com/vessels?name=${encodeURIComponent(vesselId)}`,
+      url: `${FOREIGN_TOOL_SOURCES.vessel}?name=${encodeURIComponent(vesselId)}`,
     };
   }
 
@@ -61,6 +72,6 @@ export function identifyTrackingLookup(input: string): TrackingLookup | null {
     normalized,
     label: "物流 / 快递单号",
     provider: "17TRACK 国际物流查询",
-    url: `https://www.17track.net/zh-cn?nums=${encodeURIComponent(normalized)}`,
+    url: `${FOREIGN_TOOL_SOURCES.shipment}?nums=${encodeURIComponent(normalized)}`,
   };
 }

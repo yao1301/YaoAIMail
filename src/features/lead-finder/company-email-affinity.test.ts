@@ -11,13 +11,20 @@ describe("strict company email affinity", () => {
   });
 
   it("keeps a genuine branded alias but rejects an unrelated repeated domain", () => {
-    expect(emailStrictlyMatchesCompany({ email: "info@ocambiance.com", companyName: "Ambiance Home", website: "ambiancehome.com" })).toBe(true);
+    expect(emailStrictlyMatchesCompany({ email: "info@ocambiance.com", companyName: "Ambiance Home", website: "ambiancehome.com", websiteStatus:'已核验',evidenceSource:'官网同站深挖',evidenceSourceUrl:'https://ambiancehome.com/contact' })).toBe(true);
     expect(emailStrictlyMatchesCompany({ email: "sales@unrelated-example.com", companyName: "Ambiance Home", website: "ambiancehome.com" })).toBe(false);
   });
 
   it("accepts public mail only as first-party evidence on a verified website", () => {
     const base = { email: "owner@gmail.com", companyName: "Nordic Bloom", website: "nordicbloom.se", websiteStatus: "已核验" };
-    expect(emailStrictlyMatchesCompany({ ...base, evidenceSource: "官网同站深挖" })).toBe(true);
+    expect(emailStrictlyMatchesCompany({ ...base, evidenceSource: "官网同站深挖", evidenceSourceUrl:'https://nordicbloom.se/contact' })).toBe(true);
     expect(emailStrictlyMatchesCompany({ ...base, evidenceSource: "第三方目录" })).toBe(false);
+  });
+  it('rejects same-name companies and forged first-party labels on another domain',()=>{
+    const base={companyName:'Example Botanical',website:'https://example-botanical.com',websiteStatus:'已核验',email:'info@examplebotanical-albums.com'};
+    expect(emailStrictlyMatchesCompany({...base,evidenceSource:'公司匹配检索',evidenceSourceUrl:'https://examplebotanical-albums.com/contact'})).toBe(false);
+    expect(emailStrictlyMatchesCompany({...base,evidenceSource:'官网同站深挖',evidenceSourceUrl:'https://examplebotanical-albums.com/contact'})).toBe(false);
+    expect(emailStrictlyMatchesCompany({...base,evidenceSource:'官网同站深挖',evidenceSourceUrl:'https://example-botanical.com/contact'})).toBe(true);
+    expect(emailStrictlyMatchesCompany({...base,email:'info@example-botanical.com',websiteStatus:'身份不匹配'})).toBe(false);
   });
 });

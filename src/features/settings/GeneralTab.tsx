@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
+import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import {
   showTestNotification,
@@ -19,6 +20,8 @@ import {
   type UndoSendDelaySeconds,
 } from "@/features/compose/undoSend";
 import MailImportSection from "./MailImportSection";
+import { showOnboardingGuide } from "@/lib/onboarding";
+import { saveEmailLinkMode, useEmailLinkMode, type EmailLinkMode } from "@/lib/emailLinkPreference";
 
 const REALTIME_OPTIONS: Array<{
   mode: RealtimePreference;
@@ -60,10 +63,10 @@ const REALTIME_OPTIONS: Array<{
 export default function GeneralTab() {
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
-  const [testingNotification, setTestingNotification] = useState(false);
-  const [profileLocation, setProfileLocation] = useState<ProfileLocationInfo | null>(null);
-  const [schedulingMigration, setSchedulingMigration] = useState(false);
-  const [undoSendDelay, setUndoSendDelay] = useState<UndoSendDelaySeconds>(() => readUndoSendDelay());
+  const [testingNotification, setTestingNotification] = useWorkspaceState("src/features/settings/GeneralTab.tsx:GeneralTab:testingNotification", false);
+  const [profileLocation, setProfileLocation] = useWorkspaceState<ProfileLocationInfo | null>("src/features/settings/GeneralTab.tsx:GeneralTab:profileLocation", null);
+  const [schedulingMigration, setSchedulingMigration] = useWorkspaceState("src/features/settings/GeneralTab.tsx:GeneralTab:schedulingMigration", false);
+  const [undoSendDelay, setUndoSendDelay] = useWorkspaceState<UndoSendDelaySeconds>("src/features/settings/GeneralTab.tsx:GeneralTab:undoSendDelay", () => readUndoSendDelay());
   const realtimeMode = useUIStore((s) => s.realtimeMode);
   const setRealtimeMode = useUIStore((s) => s.setRealtimeMode);
   const notificationsEnabled = useUIStore((s) => s.notificationsEnabled);
@@ -72,6 +75,15 @@ export default function GeneralTab() {
   const setKeepRunningInBackground = useUIStore((s) => s.setKeepRunningInBackground);
   const startHiddenToTray = useUIStore((s) => s.startHiddenToTray);
   const setStartHiddenToTray = useUIStore((s) => s.setStartHiddenToTray);
+  const emailLinkMode = useEmailLinkMode();
+
+  function changeEmailLinkMode(mode: EmailLinkMode) {
+    try {
+      saveEmailLinkMode(mode);
+    } catch {
+      addToast({ type: "error", message: t("emailLinks.saveFailed", "Could not save the link opening preference.") });
+    }
+  }
 
   const toggleNotifications = useCallback(() => {
     setNotificationsEnabled(!notificationsEnabled);
@@ -106,9 +118,9 @@ export default function GeneralTab() {
 
   // Launch-at-startup state lives in the OS (registry / LaunchAgent / .desktop),
   // not in app storage, so read the real value from the backend on mount.
-  const [launchAtStartup, setLaunchAtStartup] = useState(false);
+  const [launchAtStartup, setLaunchAtStartup] = useWorkspaceState("src/features/settings/GeneralTab.tsx:GeneralTab:launchAtStartup", false);
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/GeneralTab.tsx:", () => {
     let active = true;
     getAutostartEnabled()
       .then((enabled) => {
@@ -122,7 +134,7 @@ export default function GeneralTab() {
     };
   }, []);
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/GeneralTab.tsx:", () => {
     if (typeof getProfileLocation === "function") {
       getProfileLocation()
         .then(setProfileLocation)
@@ -175,6 +187,23 @@ export default function GeneralTab() {
 
   return (
     <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 22 }}>
+        <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>重新查看邮箱、AI 模型和数据保存位置的设置说明。</span>
+        <button type="button" onClick={() => void showOnboardingGuide().catch(error => addToast({ message: `无法打开新手引导：${error instanceof Error ? error.message : String(error)}`, type: "error" }))}
+          style={{ flexShrink: 0, padding: "7px 12px", border: "1px solid var(--color-border)", borderRadius: 6, background: "transparent", color: "var(--color-text-primary)", cursor: "pointer", fontSize: 12 }}>新手引导</button>
+      </div>
+      <label style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "8px 16px", marginBottom: 24 }}>
+        <span style={{ fontSize: 14, fontWeight: 600 }}>{t("emailLinks.setting", "Open links from emails")}</span>
+        <select
+          value={emailLinkMode}
+          onChange={(event) => changeEmailLinkMode(event.target.value as EmailLinkMode)}
+          style={{ maxWidth: "100%", padding: "6px 10px", border: "1px solid var(--color-border)", borderRadius: 6, background: "var(--color-bg)", color: "var(--color-text-primary)", fontSize: 13 }}
+        >
+          <option value="ask">{t("emailLinks.ask", "Ask each time")}</option>
+          <option value="browser">{t("emailLinks.browser", "Open in default browser")}</option>
+          <option value="inApp">{t("emailLinks.inApp", "Open in YaoAIMail")}</option>
+        </select>
+      </label>
       <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "8px" }}>
         用户数据存放位置
       </h3>

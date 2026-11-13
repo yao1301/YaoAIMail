@@ -1,4 +1,21 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as nativeInvoke, Channel } from "@tauri-apps/api/core";
+import { reportAppError } from "./appErrors";
+import { forgetMailFailure } from './mailErrorNotifications';
+import { announceSavedSettings } from "./settingsChangeSignal";
+
+// Report before a caller's catch/fallback can silently discard an IPC failure.
+function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  return nativeInvoke<T>(command, args).then((result) => {
+    announceSavedSettings(command);
+    return result;
+  }).catch((error: unknown) => {
+    reportAppError(error, "操作未完成");
+    throw error;
+  });
+}
+import type { EmailResearchEvidence } from "./researchEvidence";
+import type { ResearchContact, BuyingSignal } from "./researchEvidence";
+export type { ResearchContact, BuyingSignal } from "./researchEvidence";
 
 // Re-export all IPC types so existing `import { Foo } from "@/lib/api"` keeps working.
 export type {
@@ -133,13 +150,54 @@ export interface PublicCompanyMatch {
   recommendationReason?: string;
   discoveryBasis?: string[];
   companyIntroduction?: string;
-  emailEvidence?: Array<{
+  emailEvidence?: Array<EmailResearchEvidence & {
     email: string; source: string; sourceUrl: string; confidence?: number;
     verification: string; emailType?: string; person?: string; suitability?: string;
   }>;
   contactStatus?: "可联系" | "待补全" | string;
   websiteStatus?: "已核验" | "待核验" | "无法访问" | "身份不匹配" | string;
   websiteStatusReason?: string;
+  contacts?: ResearchContact[];
+  buyingSignals?: BuyingSignal[];
+}
+
+export interface CompanyProfileField {
+  key: string;
+  label: string;
+  value: string;
+  url: string;
+  quote: string;
+  /** published=官网披露；reported=第三方披露；confirmed=官方接口或旧版原文记录 */
+  level: string;
+}
+
+export interface CompanyFinding {
+  text: string;
+  url: string;
+  quote: string;
+  /** 只有风险条目有：high / medium / low */
+  severity?: string;
+}
+
+export interface CompanyDossier {
+  profile: CompanyProfileField[];
+  findings: CompanyFinding[];
+  risks: CompanyFinding[];
+  gaps: string[];
+  summary: string;
+  /** low / medium / high / unknown */
+  riskLevel: string;
+  /** 没有原文依据、被过滤掉的模型结论数量 */
+  dropped: number;
+}
+
+export interface CompanyRegistryCheck {
+  name: string;
+  /** checked / candidate / screened / skipped / no_match / not_configured / error */
+  status: string;
+  summary: string;
+  url: string;
+  items: string[];
 }
 
 export interface CompanyResearchReport {
@@ -150,19 +208,47 @@ export interface CompanyResearchReport {
   websiteTitle: string;
   websiteDescription: string;
   publicEmails: string[];
+  contacts?: ResearchContact[];
+  buyingSignals?: BuyingSignal[];
+  emailEvidence?: PublicCompanyMatch['emailEvidence'];
   legalMatches: PublicCompanyMatch[];
   sources: ResearchSource[];
   warnings: string[];
   analysis: string;
   createdAt: number;
+  /** 旧报告没有这些字段 */
+  dossier?: CompanyDossier;
+  registries?: CompanyRegistryCheck[];
+  registryLinks?: ResearchSource[];
+  pagesRead?: number;
+  /** 2–3 为结构化报告；4 起恢复完整叙述；5 起记录多源取证覆盖。 */
+  structureVersion?: number;
+  investigation?: {
+    officialPages: number;
+    externalPages: number;
+    externalSites: number;
+    duplicatePages: number;
+    followUpQueries: number;
+    areas: Array<{key: string; label: string; status: string; documents: number}>;
+  };
 }
 
 export async function researchCompany(
   companyName: string,
   website: string,
   country: string,
+  vat?: string,
+  onProgress?: (stage: string) => void,
 ): Promise<CompanyResearchReport> {
-  return invoke<CompanyResearchReport>("research_company", { companyName, website, country });
+  const channel = onProgress ? new Channel<string>() : undefined;
+  if (channel && onProgress) channel.onmessage = onProgress;
+  return invoke<CompanyResearchReport>("research_company", {
+    companyName,
+    website,
+    country,
+    vat: vat && vat.trim() ? vat.trim() : null,
+    onProgress: channel ?? null,
+  });
 }
 
 export async function listCompanyResearch(): Promise<CompanyResearchReport[]> {
@@ -227,6 +313,18 @@ export async function readAppLog(maxBytes: number): Promise<AppLogSnapshot> {
 
 export async function getGlobalProxy(): Promise<HttpProxyConfig | null> {
   return invoke<HttpProxyConfig | null>("get_global_proxy");
+}
+
+export async function getMailProxy(): Promise<HttpProxyConfig | null> {
+  return invoke<HttpProxyConfig | null>("get_mail_proxy");
+}
+
+export async function saveSharedProxySettings(proxyHost: string | undefined, proxyPort: number | undefined, mailUseProxy: boolean): Promise<void> {
+  return invoke<void>("save_shared_proxy_settings", { proxyHost, proxyPort, mailUseProxy });
+}
+
+export async function updateMailProxy(proxyHost?: string, proxyPort?: number): Promise<void> {
+  return invoke<void>("update_mail_proxy", { proxyHost, proxyPort });
 }
 
 export async function getAccountProxy(accountId: string): Promise<HttpProxyConfig | null> {
@@ -300,8 +398,30 @@ export async function addAccount(request: AddAccountRequest): Promise<Account> {
   return invoke<Account>("add_account", { request });
 }
 
-export async function testAccountConnection(accountId: string): Promise<string> {
-  return invoke<string>("test_account_connection", { accountId });
+export async function testAccountConnection(accountId: string, strictTls?: boolean): Promise<string> {
+  return nativeInvoke<string>("test_account_connection", { accountId, strictTls });
+}
+
+export async function testSmtpConnection(request: {
+  smtp_host: string; smtp_port: number; smtp_security: ConnectionSecurity;
+  username: string; password: string; email: string;
+  proxy_host?: string; proxy_port?: number; accept_invalid_certs?: boolean; allow_plaintext?: boolean;
+}): Promise<string> {
+  return nativeInvoke<string>("test_smtp_connection", { request });
+}
+
+export async function retryPendingSendOnce(operationId: string): Promise<void> {
+  await invoke<void>("retry_pending_send_once", { operationId });
+  forgetMailFailure(operationId);
+}
+
+export async function retryPendingSendPostprocessing(operationId: string): Promise<void> {
+  await invoke<void>('retry_pending_send_postprocessing', { operationId });
+  forgetMailFailure(operationId);
+}
+
+export async function confirmPendingSendDelivered(accountId: string, operationId: string): Promise<void> {
+  await invoke<void>('confirm_pending_send_delivered', { accountId, operationId });
 }
 
 export async function testImapConnection(
@@ -316,7 +436,7 @@ export async function testImapConnection(
   email?: string,
   allowPlaintext?: boolean,
 ): Promise<string> {
-  return invoke<string>("test_imap_connection", {
+  return nativeInvoke<string>("test_imap_connection", {
     request: {
       imap_host: imapHost,
       imap_port: imapPort,
@@ -343,7 +463,7 @@ export async function testPop3Connection(
   password?: string,
   allowPlaintext?: boolean,
 ): Promise<string> {
-  return invoke<string>("test_pop3_connection", {
+  return nativeInvoke<string>("test_pop3_connection", {
     request: {
       pop3_host: pop3Host,
       pop3_port: pop3Port,
@@ -377,11 +497,15 @@ export async function updateAccount(
   proxyHost?: string,
   proxyPort?: number,
   accountColor?: string,
+  imapUsername?: string,
+  smtpUsername?: string,
+  senderName?: string,
+  certificateExceptions?: { incoming?: boolean; outgoing?: boolean },
 ): Promise<void> {
   return invoke<void>("update_account", {
     accountId, email, displayName, password,
     imapHost, imapPort, smtpHost, smtpPort, imapSecurity, smtpSecurity,
-    acceptInvalidCerts, proxyHost, proxyPort, accountColor,
+    acceptInvalidCerts, proxyHost, proxyPort, accountColor, imapUsername, smtpUsername, senderName, certificateExceptions,
   });
 }
 
@@ -390,6 +514,7 @@ export async function deleteAccount(accountId: string): Promise<void> {
 }
 
 export interface AccountDetails {
+  senderName?: string;
   email: string;
   displayName: string;
   color: string | null;
@@ -407,6 +532,7 @@ export interface AccountDetails {
   proxyMode: string;
   proxyHost: string;
   proxyPort: number;
+  passwordConfigured: boolean;
 }
 
 export async function getAccountDetails(accountId: string): Promise<AccountDetails> {
@@ -481,6 +607,7 @@ export async function listMessages(
   offset: number,
   folderIds?: string[],
   cursor?: { date: number; id: string } | null,
+  senderAscending?: boolean,
 ): Promise<MessageSummary[]> {
   return invoke<MessageSummary[]>("list_messages", {
     folderId,
@@ -489,6 +616,7 @@ export async function listMessages(
     offset,
     cursorDate: cursor?.date ?? null,
     cursorId: cursor?.id ?? null,
+    ...(senderAscending === undefined ? {} : { senderAscending }),
   });
 }
 
@@ -501,6 +629,63 @@ export async function searchLeadCompanies(
   return invoke<PublicCompanyMatch[]>("search_lead_companies", {
     product, market, buyerType, batchMode,
   });
+}
+
+export interface LeadQuality {
+  level: "source_matched" | "channel_candidate" | "needs_review";
+  score: number;
+  productMatch: boolean;
+  buyerMatch: boolean;
+  channelMatch?: boolean;
+  evidence: Array<{ url: string; quote: string; kind: string }>;
+  unknowns: string[];
+  checkedPages: number;
+}
+
+export interface LeadDiscoveryRequest {
+  sessionId?: string;
+  scopeId?: string;
+  pageSize?: number;
+  useCases?: string[];
+  productPositioning?: string;
+  product: string;
+  market: string;
+  buyerType: string;
+  aliases: string[];
+  channels?: string[];
+  localQueries?: Array<{ language: string; query: string }>;
+  qualifiers: string[];
+  exclusions: string[];
+  requirements: string;
+  excludeWebsites: string[];
+  page: number;
+  batchMode: boolean;
+}
+
+export interface LeadDiscoveryResponse {
+  items: Array<{ company: PublicCompanyMatch; quality: LeadQuality }>;
+  report: {
+    queries: number; searchHits: number; directoriesRead: number;
+    sitesRead: number; pagesRead: number; unreadSites: number; warnings: string[];
+    outcome?: "candidates" | "no_usable_sources" | "no_company_candidates" | "research_incomplete";
+    reviewedCompanies?: number; rejectedCompanies?: number; pendingCompanies?: number; modelSeeds?: number;
+    matchedCompanies?: number; constraintPendingCompanies?: number;
+    pageSize?: number; planReused?: boolean; targetReached?: boolean;
+    stopReason?: 'target_reached' | 'time_limit' | 'no_progress' | 'source_exhausted' | 'service_error';
+    reviewIssues?: Record<string, number>;
+    taskPlan?: { constraints: Array<{ id: string; mode: "must" | "exclude" | "prefer"; instruction: string; sourceQuote: string }>; nonRestrictiveNotes?: Array<{instruction: string; sourceQuote: string}>; searchQueries: string[]; incomplete?: boolean } | null;
+    queryDetails?: Array<{ channel: string; query: string; hits: number; warning: string;
+      attempts: Array<{ provider: string; status: string; elapsedMs: number; results: number }> }>;
+  };
+}
+
+export async function discoverLeads(request: LeadDiscoveryRequest, onProgress?: (response: LeadDiscoveryResponse) => void): Promise<LeadDiscoveryResponse> {
+  const channel = new Channel<LeadDiscoveryResponse>();
+  channel.onmessage = onProgress ?? (() => undefined);
+  return invoke<LeadDiscoveryResponse>("discover_leads", { request, onProgress: channel });
+}
+export async function forgetLeadTask(sessionId: string, scopeId: string): Promise<void> {
+  return invoke<void>('forget_lead_task',{sessionId,scopeId});
 }
 
 export async function aiFindCompanyBatch(
@@ -540,8 +725,13 @@ export async function saveLeadFinderData(data: LeadFinderPersistedData): Promise
 export async function listUnreadMessages(
   limit: number,
   offset: number,
+  senderAscending?: boolean,
+  visibleIds?: string[],
 ): Promise<MessageSummary[]> {
-  return invoke<MessageSummary[]>("list_unread_messages", { limit, offset });
+  return invoke<MessageSummary[]>("list_unread_messages", {
+    limit, offset, ...(senderAscending === undefined ? {} : { senderAscending }),
+    ...(visibleIds?.length ? { visibleIds } : {}),
+  });
 }
 
 export async function listStarredMessages(
@@ -574,6 +764,11 @@ export async function getMessageWithHtml(
   privacyMode: PrivacyMode,
 ): Promise<[Message, RenderedHtml] | null> {
   return invoke<[Message, RenderedHtml] | null>("get_message_with_html", { messageId, privacyMode });
+}
+
+/** Re-fetch one remote message and rebuild its body, HTML, attachments and search entry. */
+export async function redownloadMessage(messageId: string): Promise<Message> {
+  return invoke<Message>("redownload_message", { messageId });
 }
 
 export async function updateMessageFlags(
@@ -847,6 +1042,36 @@ export async function applyRulesToFolder(
 
 // ─── Compose API ─────────────────────────────────────────────────────────────
 
+export interface WorkbenchDraftItem {
+  key: string; to: string[]; cc: string[]; bcc: string[]; subject: string; bodyText: string; bodyHtml?: string;
+}
+export interface WorkbenchDraftPreview {
+  accountId: string; sourceId: string; sourceUpdatedAt: number; sourceTitle: string;
+  items: WorkbenchDraftItem[]; warnings: string[];
+}
+export interface WorkbenchDraftReceipt { key: string; draftId: string; created: boolean; exists: boolean }
+export async function previewWorkbenchMailtoDrafts(accountId: string, messageId: string): Promise<WorkbenchDraftPreview> {
+  return invoke('preview_workbench_mailto_drafts', { accountId, messageId });
+}
+export async function commitWorkbenchDrafts(args: {
+  accountId: string; sourceId?: string; sourceUpdatedAt?: number; requestId: string; items: WorkbenchDraftItem[]; replyToMessageId?: string; replyUpdatedAt?: number;
+}): Promise<WorkbenchDraftReceipt[]> { return invoke('commit_workbench_drafts', args); }
+export async function scheduleWorkbenchDraft(accountId: string, draftId: string, expectedUpdatedAt: number, sendAt: number): Promise<string> {
+  return invoke('schedule_workbench_draft', { accountId, draftId, expectedUpdatedAt, sendAt });
+}
+export async function sendSavedDraft(accountId: string, draftId: string, expectedUpdatedAt: number): Promise<string> {
+  return invoke('send_saved_draft', { accountId, draftId, expectedUpdatedAt });
+}
+export async function cancelWorkbenchSchedule(accountId: string, operationId: string): Promise<string> {
+  return invoke('cancel_workbench_schedule', { accountId, operationId });
+}
+
+export interface SendEmailResult {
+  status: "sent" | "queued";
+  operationId: string | null;
+  warning: string | null;
+}
+
 export async function sendEmail(
   accountId: string,
   to: string[],
@@ -857,8 +1082,8 @@ export async function sendEmail(
   bodyHtml?: string,
   inReplyTo?: string,
   attachmentPaths?: string[],
-): Promise<void> {
-  return invoke<void>("send_email", {
+): Promise<SendEmailResult> {
+  return invoke<SendEmailResult>("send_email", {
     accountId, to, cc, bcc, subject, bodyText, bodyHtml, inReplyTo, attachmentPaths,
   });
 }
@@ -919,8 +1144,16 @@ export async function saveTranslateConfig(providerType: string, config: string, 
 export async function testTranslateConnection(config: string): Promise<string> {
   return invoke<string>("test_translate_connection", { config });
 }
+export async function listLlmModels(config: string): Promise<string[]> {
+  return invoke<string[]>('list_llm_models', { config });
+}
+
+export type ExternalServiceProvider = "tavily" | "brave" | "firecrawl" | "hunter" | "deepseek";
 
 export interface ExternalServiceKeyStatus {
+  deepseekConfigured?: boolean;
+  deepseekSearchEnabled?: boolean;
+  deepseekKeyCount?: number;
   tavilyConfigured: boolean;
   braveConfigured: boolean;
   firecrawlConfigured: boolean;
@@ -932,7 +1165,7 @@ export interface ExternalServiceKeyStatus {
 }
 
 export interface ExternalServiceUsage {
-  provider: "tavily" | "brave" | "firecrawl" | "hunter";
+  provider: ExternalServiceProvider;
   supported: boolean;
   valid: boolean;
   used?: number | null;
@@ -956,13 +1189,55 @@ export async function getExternalServiceKeyStatus(): Promise<ExternalServiceKeyS
   return invoke<ExternalServiceKeyStatus>("get_external_service_key_status");
 }
 
-export async function saveExternalServiceApiKey(provider: "tavily" | "brave" | "firecrawl" | "hunter", apiKey: string): Promise<ExternalServiceKeyStatus> {
+export function setDeepseekSearchEnabled(enabled: boolean): Promise<ExternalServiceKeyStatus> {
+  return invoke<ExternalServiceKeyStatus>("set_deepseek_search_enabled", { enabled });
+}
+
+export interface ResearchEmailScreen { email:string; status:'passed'|'invalid'|'unknown'; reason:string; checkedAt:number }
+export interface ResearchEmailVerification { email:string; deliveryStatus:import('./researchEvidence').EmailDeliveryStatus; verificationProvider:string; checkedAt:number; providerDate?:string|null; reason:string; reasonCode?:string }
+export type ResearchFeedbackKind='replied'|'hard_bounce'|'soft_bounce'|'unsubscribe'|'cleared';
+export interface ResearchEmailCheck { screen?:ResearchEmailScreen|null; verification?:ResearchEmailVerification|null; feedback?:{kind:ResearchFeedbackKind;recordedAt:number;source?:string|null;sourceMessageId?:string|null;accountId?:string|null;sentMessageId?:string|null;reason?:string|null}|null }
+export const loadResearchEmailChecks=(emails:string[])=>invoke<Record<string,ResearchEmailCheck>>('load_research_email_checks',{emails});
+export const prescreenResearchEmails=(emails:string[])=>invoke<Record<string,ResearchEmailCheck>>('prescreen_research_emails',{emails});
+export const verifyResearchEmail=(email:string,refresh=false)=>invoke<ResearchEmailVerification>('verify_research_email',{email,refresh});
+export const recordResearchEmailFeedback=(email:string,kind:ResearchFeedbackKind)=>invoke<NonNullable<ResearchEmailCheck['feedback']>>('record_research_email_feedback',{email,kind});
+export const checkResearchContactAllowed=(email:string)=>invoke<void>('check_research_contact_allowed',{email});
+export interface ResearchProfile {id:string;scopeId:string;name:string;product:string;market:string;buyerType:string;requirements:string}
+export const listResearchProfiles=(scopeId:string)=>invoke<ResearchProfile[]>('list_research_profiles',{scopeId});
+export const saveResearchProfile=(profile:ResearchProfile)=>invoke<void>('save_research_profile',{profile});
+export const deleteResearchProfile=(id:string,scopeId:string)=>invoke<void>('delete_research_profile',{id,scopeId});
+
+export async function saveExternalServiceApiKey(provider: ExternalServiceProvider, apiKey: string): Promise<ExternalServiceKeyStatus> {
   return invoke<ExternalServiceKeyStatus>("save_external_service_api_key", { provider, apiKey });
 }
 
-export async function deleteExternalServiceApiKey(provider: "tavily" | "brave" | "firecrawl" | "hunter"): Promise<ExternalServiceKeyStatus> {
-  return invoke<ExternalServiceKeyStatus>("delete_external_service_api_key", { provider });
+export interface ExternalServiceKeyEntry { id: string; maskedKey: string }
+
+export function listExternalServiceApiKeys(provider: ExternalServiceProvider): Promise<ExternalServiceKeyEntry[]> {
+  return invoke<ExternalServiceKeyEntry[]>("list_external_service_api_keys", { provider });
 }
+
+export async function deleteExternalServiceApiKey(provider: ExternalServiceProvider, keyId: string): Promise<ExternalServiceKeyStatus> {
+  return invoke<ExternalServiceKeyStatus>("delete_external_service_api_key", { provider, keyId });
+}
+
+export interface AiSearchConfig {
+  openserpEnabled: boolean; openserpUrl: string;
+  tinyfishSearchEnabled: boolean; tinyfishFetchEnabled: boolean;
+  paidSearchEnabled: boolean; maxQueries: number; maxRequests: number;
+  maxPaidRequests: number; cacheMinutes: number;
+  tinyfishSearchDailyLimit: number; tinyfishFetchDailyLimit: number;
+}
+export interface AiSearchSettings { config: AiSearchConfig; tinyfishConfigured: boolean }
+export interface AiSearchResult {
+  items: Array<{title: string; url: string; description: string; provider: string}>;
+  attempts: Array<{provider: string; status: string; elapsedMs: number; results: number}>;
+  cacheHit: boolean; warning: string;
+}
+export const getAiSearchSettings = () => invoke<AiSearchSettings>("get_ai_search_settings");
+export const saveAiSearchSettings = (config: AiSearchConfig, apiKey: string | null, deleteKey = false) =>
+  invoke<AiSearchSettings>("save_ai_search_settings", {config, apiKey, deleteKey});
+export const testAiSearch = (query: string) => invoke<AiSearchResult>("test_ai_search", {query});
 
 // ─── AI (外贸 AI 邮件客户端) API ────────────────────────────────────────────
 
@@ -974,6 +1249,11 @@ export interface ChatTurn {
 /** Single-shot AI completion. `system` sets the persona/instructions, `user` is the prompt. */
 export async function aiPrompt(system: string, user: string): Promise<string> {
   return invoke<string>("ai_prompt", { system, user });
+}
+
+/** Bounded product planning only; ordinary chat/writing is unchanged. */
+export async function leadResearchPrompt(system: string, user: string): Promise<string> {
+  return invoke<string>("lead_research_prompt", { system, user });
 }
 
 /** Multi-turn AI chat for iterative draft/reply refinement. */
@@ -991,6 +1271,80 @@ export async function agentRun(
     system,
     user,
   });
+}
+
+export interface AssistantEvidenceReport {
+  discoveredMailCount: number;
+  readMailCount: number;
+  completeMailCount: number;
+  resources: Array<{ kind: 'mail' | 'knowledge' | 'customer'; id: string; label: string; totalChars: number; readChars: number; complete: boolean; bodyStatus: string }>;
+  warnings: string[];
+  trace: Array<{ tool: string; status: 'ok' | 'failed' }>;
+  budgetExhausted: boolean;
+  toolFallback: boolean;
+}
+export interface MailAssistantRequest {
+  accountId: string; system: string; user: string;
+  allowMail: boolean; allowKnowledge: boolean; allowWeb: boolean;
+  explicitMessageIds: string[]; relatedMessageIds: string[]; knowledgeIds: string[];
+}
+export interface MailAssistantResult {
+  content: string; sources: string[]; toolCalls: number;
+  mailReferences: Array<{ id: string; accountId: string; label: string; subtitle: string; folderId: string | null }>;
+  knowledgeReferences: Array<{ id: string; label: string; locator: string }>;
+  customerReferences: Array<{ id: string; label: string; email: string }>;
+  evidenceReport: AssistantEvidenceReport;
+}
+/** Read-only, account-bound mail/knowledge evidence loop (also supports web tools). */
+export async function mailAssistantRun(request: MailAssistantRequest): Promise<MailAssistantResult> {
+  return invoke<MailAssistantResult>('mail_assistant_run', { request });
+}
+
+export type OverviewBucket = 'needs_action' | 'waiting' | 'risk';
+export interface AccountOverviewProof {
+  messageId: string; label: string; sender: string; date: number; quote: string; folderId: string | null;
+}
+export interface AccountOverviewItem {
+  id: string; revision: string; bucket: OverviewBucket; title: string; summary: string; nextAction: string;
+  dueText: string | null; needsVerification: boolean; latestDate: number; proofs: AccountOverviewProof[];
+}
+export interface AccountOverviewFeedback {
+  id: string; label: string; sourceMessageId: string; pinned: boolean; ignoredThrough: number | null; updatedAt: number;
+  ignoredRevision?: string | null;
+}
+export interface AccountOverviewSnapshot {
+  accountId: string; generatedAt: number; revision: string;
+  scope: { windowDays: number; from: number; to: number; scanned: number; filteredBulk: number; ignored: number;
+    selected: number; pinnedOutsideWindow: number; scanLimited: boolean; selectionLimited: boolean };
+  items: AccountOverviewItem[]; evidenceReport: AssistantEvidenceReport; warnings: string[];
+}
+export interface AccountOverviewData {
+  accountId: string; snapshot: AccountOverviewSnapshot | null; feedback: AccountOverviewFeedback[]; stale: boolean;
+  settings?: AccountOverviewSettings;
+  nextAutoAt?: number | null;
+  autoError?: string | null;
+  lastAttempt?: number | null;
+}
+export interface AccountOverviewSettings { autoGenerate: boolean; windowDays: number }
+export async function openMailWindow(messageId: string): Promise<void> {
+  return invoke<void>('open_mail_window', { messageId });
+}
+export async function setAccountOverviewSettings(accountId: string, settings: AccountOverviewSettings): Promise<AccountOverviewData> {
+  return invoke<AccountOverviewData>('account_overview_settings', { accountId, settings });
+}
+export async function autoRefreshAccountOverview(accountId: string): Promise<AccountOverviewData> {
+  return invoke<AccountOverviewData>('account_overview_auto_refresh', { accountId });
+}
+/** Local encrypted cache/settings only. Automatic generation is a separate command. */
+export async function getAccountOverview(accountId: string): Promise<AccountOverviewData> {
+  return invoke<AccountOverviewData>('account_overview_get', { accountId });
+}
+/** Explicit user action; uses the user's configured model and its normal charges. */
+export async function generateAccountOverview(accountId: string, windowDays: number): Promise<AccountOverviewData> {
+  return invoke<AccountOverviewData>('account_overview_generate', { accountId, windowDays });
+}
+export async function setAccountOverviewFeedback(accountId: string, itemId: string, action: 'pin' | 'unpin' | 'ignore' | 'restore'): Promise<AccountOverviewData> {
+  return invoke<AccountOverviewData>('account_overview_feedback', { accountId, itemId, action });
 }
 
 // ─── AI 写作风格 (Style Engine) API ────────────────────────────────────────
@@ -1134,6 +1488,9 @@ export interface CustomerMemory {
   followUps: FollowUpEntry[];
   /** 接触过该客户的账号（生成记忆时从往来邮件记录；空 = 旧数据/未知） */
   accountIds?: string[];
+  profileSources?: string[];
+  generationWarnings?: string[];
+  previousProfile?: string;
   followUpSequence: FollowUpSequenceStep[];
   followUpSequencePaused: boolean;
   updatedAt: number;
@@ -1142,6 +1499,15 @@ export interface CustomerMemory {
 /** List all customer memories. */
 export async function listCustomerMemories(): Promise<CustomerMemory[]> {
   return invoke<CustomerMemory[]>("list_customer_memories");
+}
+
+/** One refresh reads scoped correspondence and current public sources, then saves atomically. */
+export async function refreshCustomerProfile(id: string): Promise<CustomerMemory> {
+  return invoke<CustomerMemory>("refresh_customer_profile", { id });
+}
+export type CustomerMailActivity = SearchHit & { account_id: string };
+export async function getCustomerProfileMail(id: string): Promise<CustomerMailActivity[]> {
+  return invoke<CustomerMailActivity[]>("get_customer_profile_mail", { id });
 }
 
 /** Create or update a customer memory (upserted by id / email). */

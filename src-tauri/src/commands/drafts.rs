@@ -78,6 +78,8 @@ pub async fn save_draft(
         &account_id,
         existing_draft_id.as_deref(),
     )?;
+    let local_existing = existing_draft_id.as_deref().map(|id| state.store.get_message(id))
+        .transpose()?.flatten().is_some_and(|message| pebble_store::local_messages::is_local_message_id(&message.remote_id));
     let draft = DraftMessage {
         id: existing_draft_id.clone(),
         to: to
@@ -109,6 +111,12 @@ pub async fn save_draft(
     };
 
     let provider_type = state.store.get_account(&account_id)?.map(|a| a.provider);
+
+    // IMAP/POP drafts are local-only here. Connecting to the server just to
+    // fall back to the local store stalls autosave and tab handoff on networks.
+    if local_existing || !requires_remote_draft_delete(provider_type.clone()) {
+        return save_draft_locally(&state, &account_id, &draft);
+    }
 
     match provider_type {
         Some(pt) => {
@@ -145,15 +153,16 @@ fn save_draft_locally(
     let id = draft.id.clone().unwrap_or_else(pebble_core::new_id);
     let attachment_records =
         stage_local_attachment_records(&state.attachments_dir, &id, &draft.attachment_paths)?;
+    let existing=draft.id.as_deref().map(|id|state.store.get_message(id)).transpose()?.flatten();
 
     let msg = pebble_core::Message {
         id: id.clone(),
         account_id: account_id.to_string(),
         remote_id: String::new(),
         message_id_header: None,
-        in_reply_to: draft.in_reply_to.clone(),
-        references_header: None,
-        thread_id: None,
+        in_reply_to: draft.in_reply_to.clone().or_else(||existing.as_ref().and_then(|m|m.in_reply_to.clone())),
+        references_header: existing.as_ref().and_then(|m|m.references_header.clone()),
+        thread_id: existing.as_ref().and_then(|m|m.thread_id.clone()),
         subject: draft.subject.clone(),
         snippet: draft.body_text.chars().take(200).collect(),
         from_address: String::new(),
@@ -197,6 +206,11 @@ pub async fn delete_draft(
     account_id: String,
     draft_id: String,
 ) -> std::result::Result<(), PebbleError> {
+    validate_existing_local_draft_account(&state.store,&account_id,Some(&draft_id))?;
+    if state.store.get_message(&draft_id)?.is_some_and(|message|pebble_store::local_messages::is_local_message_id(&message.remote_id)) {
+        state.store.hard_delete_messages(&[draft_id])?;
+        return Ok(());
+    }
     let provider_type = state.store.get_account(&account_id)?.map(|a| a.provider);
 
     if should_delete_local_draft(provider_type.clone(), false) {

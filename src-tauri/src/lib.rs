@@ -5,6 +5,7 @@ mod profile;
 mod realtime;
 mod snooze_watcher;
 mod state;
+pub mod research_server;
 
 use serde::Serialize;
 use std::io::Write;
@@ -81,9 +82,18 @@ fn get_index_path(app_data: &std::path::Path) -> Result<PathBuf, Box<dyn std::er
 fn restore_main_window<R: Runtime>(app: &AppHandle<R>) {
     commands::notifications::clear_attention_indicator(app);
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        if let Err(error) = window.show() {
+            tracing::warn!("Failed to show main window: {error}");
+        }
+        if let Err(error) = window.unminimize() {
+            tracing::warn!("Failed to unminimize main window: {error}");
+        }
+        if let Err(error) = window.set_focus() {
+            tracing::warn!("Failed to focus main window: {error}");
+        }
+        tracing::info!("Main window restore requested");
+    } else {
+        tracing::warn!("Cannot restore main window because it does not exist");
     }
 }
 
@@ -248,6 +258,9 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_drag::init())
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                commands::workspace_windows::forget_window(window.app_handle(), window.label());
+            }
             if window.label() == "main" && matches!(event, WindowEvent::Focused(true)) {
                 commands::notifications::clear_attention_indicator(window.app_handle());
             }
@@ -264,6 +277,23 @@ pub fn run() {
                     app_data.display()
                 )
             })?;
+            // Keep WebView2 localStorage/session storage beside the portable
+            // profile so profile-scoped UI settings travel with the same
+            // folder as the database and encrypted user data.
+            if app.get_webview_window("main").is_none() {
+                let window_config = app
+                    .config()
+                    .app
+                    .windows
+                    .iter()
+                    .find(|window| window.label == "main")
+                    .ok_or("main window configuration is missing")?;
+                let window_builder = tauri::WebviewWindowBuilder::from_config(app.handle(), window_config)?
+                    .data_directory(app_data.join("webview"));
+                #[cfg(debug_assertions)]
+                let window_builder = window_builder.visible(true);
+                window_builder.build()?;
+            }
             app.manage(profile_paths);
             let backgrounds_dir = app_data.join("backgrounds");
             std::fs::create_dir_all(&backgrounds_dir)?;
@@ -296,6 +326,9 @@ pub fn run() {
                         location
                     );
                 }
+                if cfg!(debug_assertions) {
+                    eprintln!("[panic] thread={thread_name} location={location}: {info}");
+                }
             }));
             // Keep a direct startup marker even if another library has
             // already installed a global tracing subscriber. This makes it
@@ -314,25 +347,51 @@ pub fn run() {
                     std::time::SystemTime::now()
                 );
             }
-            let file_appender =
-                tracing_appender::rolling::never(&log_dir, commands::diagnostics::LOG_FILE_NAME);
-            let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+            // Keep the debug appender separate from the installed release
+            // appender. The release instance may still hold pebble.log while
+            // a developer build is being started against the same profile.
+            let log_file_name = if cfg!(debug_assertions) {
+                "pebble-dev.log"
+            } else {
+                commands::diagnostics::LOG_FILE_NAME
+            };
             let env_filter =
                 tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                     "pebble=info,pebble_store=info,pebble_mail=info,pebble_search=info,pebble_translate=info,pebble_crypto=info,pebble_oauth=info".into()
                 });
-            let stdout_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
-            let file_layer = tracing_subscriber::fmt::layer()
-                .with_writer(file_writer)
-                .with_ansi(false);
-            if tracing_subscriber::registry()
-                .with(env_filter)
-                .with(stdout_layer)
-                .with(file_layer)
-                .try_init()
-                .is_ok()
-            {
-                let _ = LOG_GUARD.set(guard);
+            // Logging must not prevent the desktop app from opening. A
+            // profile directory can be writable for existing files while a
+            // stale/locked log prevents a new appender from being created.
+            // Keep stdout logging as a safe fallback for dev and recovery.
+            let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::NEVER)
+                .filename_prefix(log_file_name)
+                .build(&log_dir);
+            match file_appender {
+                Ok(file_appender) => {
+                    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+                    let stdout_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+                    let file_layer = tracing_subscriber::fmt::layer()
+                        .with_writer(file_writer)
+                        .with_ansi(false);
+                    if tracing_subscriber::registry()
+                        .with(env_filter.clone())
+                        .with(stdout_layer)
+                        .with(file_layer)
+                        .try_init()
+                        .is_ok()
+                    {
+                        let _ = LOG_GUARD.set(guard);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Failed to initialize file logging in {}: {error}", log_dir.display());
+                    let stdout_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+                    let _ = tracing_subscriber::registry()
+                        .with(env_filter)
+                        .with(stdout_layer)
+                        .try_init();
+                }
             }
 
             let startup_start = Instant::now();
@@ -351,6 +410,7 @@ pub fn run() {
                     .set_background_color(Some(tauri::window::Color(0xf8, 0xf7, 0xf5, 0xff)));
             }
             app.manage(PendingMailtoUrls::default());
+            app.manage(commands::workspace_windows::WorkspaceWindows::default());
 
             let db_path = get_db_path(&app_data)?;
             tracing::info!("Database path: {}", db_path.display());
@@ -383,7 +443,7 @@ pub fn run() {
             // runs inside the background reindex task below, so startup can
             // proceed without waiting on a full-table scan.
 
-            let crypto = pebble_crypto::CryptoService::init()?;
+            let crypto = pebble_crypto::CryptoService::init_for_profile(&app_data)?;
             tracing::info!("Crypto service initialized successfully");
             log_startup_phase(startup_start, &mut startup_phase, "crypto service initialized");
 
@@ -398,6 +458,7 @@ pub fn run() {
 
             // Start snooze watcher on the Tauri async runtime
             let state: tauri::State<AppState> = app.state();
+            commands::research_service::start_optional_api(&state);
             let store_clone = state.store.clone();
             let app_handle = app.handle().clone();
             let app_for_deep_link = app_handle.clone();
@@ -424,6 +485,14 @@ pub fn run() {
             let search_for_reindex = state.search.clone();
             let app_for_reindex = app_handle.clone();
             let reindex_handle = tauri::async_runtime::spawn_blocking(move || {
+                match store_for_reindex.reconcile_completed_sent_rule_copies() {
+                    Ok(accounts) => {
+                        for account_id in accounts {
+                            let _ = app_for_reindex.emit(events::MAIL_MESSAGES_CHANGED, serde_json::json!({ "account_id": account_id }));
+                        }
+                    }
+                    Err(error) => tracing::warn!("Could not reconcile completed Sent rule copies: {error}"),
+                }
                 // 1. Process any pending search ops left over from a previous crash.
                 let pending = store_for_reindex.list_search_pending().unwrap_or_default();
                 if !pending.is_empty() {
@@ -496,11 +565,16 @@ pub fn run() {
             // check (no rebuild), so this ordering adds latency only on
             // schema-upgrade launches.
             let app_for_workers = app_handle.clone();
+            tauri::async_runtime::spawn(commands::account_overview::run_auto_worker(app_handle.clone()));
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = reindex_handle.await {
                     tracing::error!("Background reindex task join failed: {e}");
                 }
                 let app_for_sync = app_for_workers.clone();
+                let app_for_feedback = app_for_workers.clone();
+                tauri::async_runtime::spawn(async move {
+                    commands::email_checks::run_feedback_worker(app_for_feedback).await;
+                });
                 tauri::async_runtime::spawn(async move {
                     commands::sync_cmd::resume_all_syncs(app_for_sync).await;
                 });
@@ -521,7 +595,8 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler({
+            let handle_app_command: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             set_tray_menu_labels,
             take_pending_mailto_urls,
             profile::get_profile_storage_namespace,
@@ -532,23 +607,36 @@ pub fn run() {
             commands::autostart::get_autostart_enabled,
             commands::autostart::set_autostart_enabled,
             commands::health::health_check,
-            commands::health::check_for_update,
             commands::health::open_external_url,
             commands::health::open_default_mail_settings,
             commands::health::sync_titlebar_theme,
             commands::diagnostics::read_app_log,
             commands::dashboard::get_dashboard_data,
             commands::company_intel::research_company,
+            commands::email_checks::load_research_email_checks,
+            commands::email_checks::prescreen_research_emails,
+            commands::email_checks::verify_research_email,
+            commands::email_checks::record_research_email_feedback,
+            commands::email_checks::check_research_contact_allowed,
+            commands::email_checks::list_research_profiles,
+            commands::email_checks::save_research_profile,
+            commands::email_checks::delete_research_profile,
             commands::company_intel::list_company_research,
             commands::company_intel::delete_company_research,
             commands::company_intel::save_company_research_analysis,
             commands::company_intel::search_public_companies,
             commands::company_intel::ai_find_companies,
             commands::company_intel::search_lead_companies,
+            commands::lead_discovery::discover_leads,
+            commands::lead_discovery::lead_research_prompt,
+            commands::lead_discovery::forget_lead_task,
             commands::company_intel::ai_find_company_batch,
             commands::company_intel::enrich_lead_candidate,
             commands::company_intel::summarize_lead_candidates,
             commands::web_research::get_web_search_health,
+            commands::search_router::get_ai_search_settings,
+            commands::search_router::save_ai_search_settings,
+            commands::search_router::test_ai_search,
             commands::company_intel::find_companies_agent,
             commands::company_intel::research_company_agent,
             commands::appearance::import_background_image,
@@ -564,6 +652,7 @@ pub fn run() {
             commands::accounts::delete_account,
             commands::accounts::test_imap_connection,
             commands::accounts::test_pop3_connection,
+            commands::accounts::test_smtp_connection,
             commands::accounts::test_account_connection,
             commands::address_book::list_address_book_contacts,
             commands::address_book::save_address_book_contact,
@@ -584,6 +673,7 @@ pub fn run() {
             commands::messages::query::get_messages_batch,
             commands::messages::rendering::get_rendered_html,
             commands::messages::rendering::get_message_with_html,
+            commands::messages::rendering::redownload_message,
             commands::messages::flags::update_message_flags,
             commands::messages::rendering::is_trusted_sender,
             commands::messages::lifecycle::archive_message,
@@ -594,7 +684,18 @@ pub fn run() {
             commands::messages::lifecycle::empty_drafts,
             commands::messages::lifecycle::move_to_folder,
             commands::network::get_global_proxy,
+            commands::workbench_actions::preview_workbench_mailto_drafts,
+            commands::workbench_actions::commit_workbench_drafts,
+            commands::workbench_schedule::schedule_workbench_draft,
+            commands::workbench_schedule::send_saved_draft,
+            commands::workbench_schedule::cancel_workbench_schedule,
             commands::network::update_global_proxy,
+            commands::network::save_shared_proxy_settings,
+            commands::network::get_mail_proxy,
+            commands::pending_mail_ops::retry_pending_send_once,
+            commands::pending_mail_ops::retry_pending_send_postprocessing,
+            commands::pending_mail_ops::confirm_pending_send_delivered,
+            commands::network::update_mail_proxy,
             commands::search::search_messages,
             commands::sync_cmd::start_sync,
             commands::sync_cmd::trigger_sync,
@@ -630,7 +731,10 @@ pub fn run() {
             commands::translate::get_translate_config,
             commands::translate::save_translate_config,
             commands::translate::test_translate_connection,
+            commands::translate::list_llm_models,
             commands::external_services::get_external_service_key_status,
+            commands::external_services::list_external_service_api_keys,
+            commands::external_services::set_deepseek_search_enabled,
             commands::external_services::save_external_service_api_key,
             commands::external_services::delete_external_service_api_key,
             commands::external_services::validate_external_service_api_key,
@@ -638,6 +742,12 @@ pub fn run() {
             commands::ai::ai_prompt,
             commands::ai::ai_chat,
             commands::agent::agent_run,
+            commands::mail_assistant::mail_assistant_run,
+            commands::account_overview::account_overview_get,
+            commands::account_overview::account_overview_settings,
+            commands::account_overview::account_overview_auto_refresh,
+            commands::account_overview::account_overview_generate,
+            commands::account_overview::account_overview_feedback,
             commands::ai_style::list_style_profiles,
             commands::ai_style::save_style_profile,
             commands::ai_style::delete_style_profile,
@@ -646,6 +756,8 @@ pub fn run() {
             commands::customer_memory::save_customer_memory,
             commands::customer_memory::delete_customer_memory,
             commands::customer_memory::build_customer_memory,
+            commands::customer_profile::refresh_customer_profile,
+            commands::customer_profile::get_customer_profile_mail,
             commands::knowledge_base::list_knowledge_items,
             commands::knowledge_base::save_knowledge_item,
             commands::knowledge_base::delete_knowledge_item,
@@ -691,6 +803,14 @@ pub fn run() {
             commands::mail_import::cancel_mail_import,
             commands::system_icons::get_system_file_icon,
             commands::windows::open_compose_window,
+            commands::windows::open_mail_window,
+            commands::windows::open_mail_link_window,
+            commands::workspace_windows::open_workspace_window,
+            commands::workspace_windows::cancel_workspace_window,
+            commands::workspace_windows::read_workspace_window,
+            commands::workspace_windows::show_workspace_window,
+            commands::workspace_windows::ready_workspace_window,
+            commands::workspace_windows::update_workspace_window,
             commands::cloud_sync::test_webdav_connection,
             commands::cloud_sync::backup_to_webdav,
             commands::cloud_sync::export_backup_file,
@@ -727,7 +847,15 @@ pub fn run() {
             commands::company_intel::save_lead_finder_data,
             commands::company_intel::load_lead_dev_records,
             commands::company_intel::save_lead_dev_records,
-        ])
+            ];
+            move |request: tauri::ipc::Invoke<_>| {
+                if request.message.webview().label().starts_with(commands::windows::LINK_PREVIEW_PREFIX) {
+                    request.resolver.reject("Mail commands are not available in website previews");
+                    return true;
+                }
+                handle_app_command(request)
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import {
   inputStyle as baseInputStyle,
@@ -20,6 +21,7 @@ import {
   type BackupPreview,
 } from "../../lib/api";
 import { extractErrorMessage as errorMessage } from "@/lib/extractErrorMessage";
+import { SettingsFeedback } from "./SettingsFeedback";
 import { profileLocalStorage } from "@/lib/profileStorage";
 
 const LAST_BACKUP_KEY = "pebble-cloud-sync-last-backup";
@@ -53,27 +55,27 @@ export default function CloudSyncTab() {
   const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const [url, setUrl] = useState("");
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [includeSecrets, setIncludeSecrets] = useState(false);
-  const [secretPassphrase, setSecretPassphrase] = useState("");
+  const [url, setUrl] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:url", "");
+  const [username, setUsername] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:username", "");
+  const [password, setPassword] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:password", "");
+  const [includeSecrets, setIncludeSecrets] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:includeSecrets", false);
+  const [secretPassphrase, setSecretPassphrase] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:secretPassphrase", "");
 
-  const [statusMsg, setStatusMsg] = useState("");
-  const [statusType, setStatusType] = useState<"success" | "error" | "">("");
-  const [testing, setTesting] = useState(false);
-  const [backing, setBacking] = useState(false);
-  const [restoring, setRestoring] = useState(false);
+  const [statusMsg, setStatusMsg] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:statusMsg", "");
+  const [statusType, setStatusType] = useWorkspaceState<"success" | "error" | "">("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:statusType", "");
+  const [testing, setTesting] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:testing", false);
+  const [backing, setBacking] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:backing", false);
+  const [restoring, setRestoring] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:restoring", false);
 
-  const [lastBackup, setLastBackup] = useState<string | null>(() =>
+  const [lastBackup, setLastBackup] = useWorkspaceState<string | null>("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:lastBackup", () =>
     profileLocalStorage.getItem(LAST_BACKUP_KEY),
   );
 
-  const [autoEnabled, setAutoEnabled] = useState(false);
-  const [autoInterval, setAutoInterval] = useState(60);
-  const [autoLoaded, setAutoLoaded] = useState(false);
+  const [autoEnabled, setAutoEnabled] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:autoEnabled", false);
+  const [autoInterval, setAutoInterval] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:autoInterval", 60);
+  const [autoLoaded, setAutoLoaded] = useWorkspaceState("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:autoLoaded", false);
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/CloudSyncTab.tsx:", () => {
     loadAutoBackupConfig().then((config) => {
       if (config) {
         setUrl(config.url);
@@ -171,8 +173,8 @@ export default function CloudSyncTab() {
     }
   }
 
-  const [restoreRequest, setRestoreRequest] = useState<RestoreRequest | null>(null);
-  const [pendingFileImport, setPendingFileImport] = useState<RestoreRequest | null>(null);
+  const [restoreRequest, setRestoreRequest] = useWorkspaceState<RestoreRequest | null>("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:restoreRequest", null);
+  const [pendingFileImport, setPendingFileImport] = useWorkspaceState<RestoreRequest | null>("src/features/settings/CloudSyncTab.tsx:CloudSyncTab:pendingFileImport", null);
 
   useEffect(() => {
     if (!pendingFileImport || restoreRequest || !secretPassphrase.trim()) return;
@@ -574,6 +576,7 @@ export default function CloudSyncTab() {
           {restoring ? t("common.loading") : t("cloudSync.restore", "Restore Settings Backup")}
         </button>
       </div>
+      <SettingsFeedback notice={statusMsg && statusType ? { message: statusMsg, kind: statusType } : null} />
 
       <div
         style={{
@@ -658,30 +661,6 @@ export default function CloudSyncTab() {
         </div>
       )}
 
-      {/* Status message */}
-      {statusMsg && (
-        <div
-          role={statusType === "error" ? "alert" : "status"}
-          aria-live="polite"
-          style={{
-            marginTop: "14px",
-            padding: "10px 14px",
-            borderRadius: "6px",
-            fontSize: "13px",
-            background:
-              statusType === "success"
-                ? "var(--color-bg-hover)"
-                : "rgba(220, 53, 69, 0.1)",
-            color:
-              statusType === "success"
-                ? "var(--color-text-primary)"
-                : "#dc3545",
-            border: `1px solid ${statusType === "success" ? "var(--color-border)" : "rgba(220, 53, 69, 0.3)"}`,
-          }}
-        >
-          {statusMsg}
-        </div>
-      )}
     </div>
   );
 }

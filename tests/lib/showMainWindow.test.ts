@@ -11,6 +11,7 @@ const mockGetCurrentWindow = vi.mocked(getCurrentWindow);
 
 describe("showMainWindow", () => {
   afterEach(() => {
+    window.history.replaceState(null, '', '/');
     delete (window as unknown as { __splashStart?: number }).__splashStart;
     localStorage.clear();
     vi.clearAllMocks();
@@ -24,7 +25,7 @@ describe("showMainWindow", () => {
     (window as unknown as { __splashStart: number }).__splashStart = 1_000;
     vi.spyOn(Date, "now").mockReturnValue(1_180);
 
-    await showMainWindow();
+    await showMainWindow(false);
 
     expect(mockGetCurrentWindow).toHaveBeenCalledOnce();
     expect(show).toHaveBeenCalledOnce();
@@ -39,10 +40,26 @@ describe("showMainWindow", () => {
     (window as unknown as { __splashStart: number }).__splashStart = 1_000;
     vi.spyOn(Date, "now").mockReturnValue(1_220);
 
-    await showMainWindow();
+    await showMainWindow(false);
 
     expect(mockGetCurrentWindow).not.toHaveBeenCalled();
     expect(show).not.toHaveBeenCalled();
     expect(info).toHaveBeenCalledWith("[startup] main window left hidden for tray startup: 220ms since splash start");
+  });
+
+  it("forces the Dev window visible even when the shared profile starts to tray", async () => {
+    const show = vi.fn().mockResolvedValue(undefined);
+    mockGetCurrentWindow.mockReturnValue({ show } as never);
+    localStorage.setItem("pebble-start-hidden-to-tray", "true");
+
+    await showMainWindow(true);
+
+    expect(mockGetCurrentWindow).toHaveBeenCalledOnce();
+    expect(show).toHaveBeenCalledOnce();
+  });
+  it('keeps a receiving workspace hidden even in Dev until native handoff acknowledgement', async () => {
+    window.history.replaceState(null, '', '/?workspaceWindow=1&transfer=fixture');
+    await showMainWindow(true);
+    expect(mockGetCurrentWindow).not.toHaveBeenCalled();
   });
 });

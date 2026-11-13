@@ -9,6 +9,17 @@ vi.mock("react-i18next", () => ({
 }));
 
 describe("ConfirmDialog", () => {
+  it('offers a third save choice and disables dismissal while saving', () => {
+    const save = vi.fn();
+    const cancel = vi.fn();
+    const { rerender } = render(<ConfirmDialog title="Save?" message="Unsaved" confirmLabel="Discard" cancelLabel="Keep editing" alternateLabel="Save and exit" onConfirm={vi.fn()} onCancel={cancel} onAlternate={save} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Save and exit' }));
+    expect(save).toHaveBeenCalledOnce();
+    rerender(<ConfirmDialog title="Save?" message="Unsaved" confirmLabel="Discard" cancelLabel="Keep editing" alternateLabel="Save and exit" onConfirm={vi.fn()} onCancel={cancel} onAlternate={save} busy />);
+    expect(screen.getByRole('button', { name: 'Discard' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(cancel).not.toHaveBeenCalled();
+  });
   it("keeps focus inside the dialog and restores the previous focus on close", () => {
     const opener = document.createElement("button");
     document.body.appendChild(opener);

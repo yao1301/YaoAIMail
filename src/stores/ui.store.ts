@@ -28,7 +28,8 @@ export interface NavTab {
 }
 export type RightPanelTool = "aiWriting" | "aiAssistant" | "foreignTools";
 export type SettingsTab = "accounts" | "general" | "proxy" | "appearance" | "privacy" | "rules" | "remoteWrites" | "translation" | "aiWriting" | "workRole" | "knowledgeBase" | "aiAssistant" | "customerMemory" | "foreignTools" | "externalServices" | "sendGuard" | "shortcuts" | "cloudSync" | "about";
-export type Theme = "light" | "dark" | "warm" | "ocean" | "forest" | "highContrast" | "system";
+/** Themes change both the palette and the component geometry. */
+export type Theme = "light" | "macos" | "minimal" | "studio";
 export type AppFontFamily = "system" | "yahei" | "songti" | "rounded" | "mono";
 export type { Language } from "@/lib/language";
 export type NetworkStatus = "online" | "offline";
@@ -57,6 +58,7 @@ const REALTIME_PREFERENCE_KEY = "pebble-realtime-mode";
 const REALTIME_PREFERENCES = new Set<RealtimePreference>(["realtime", "balanced", "battery", "manual"]);
 const NOTIFICATIONS_KEY = "pebble-notifications-enabled";
 const KEEP_RUNNING_BACKGROUND_KEY = "pebble-keep-running-background";
+const FONT_FAMILIES: readonly AppFontFamily[] = ["system", "yahei", "songti", "rounded", "mono"];
 export const BACKGROUND_IMAGE_STORAGE_KEY = "pebble-background-image-settings";
 const BACKGROUND_IMAGE_FITS = new Set<BackgroundImageFit>(["cover", "contain", "repeat"]);
 const DEFAULT_BACKGROUND_IMAGE_FIT: BackgroundImageFit = "cover";
@@ -137,20 +139,80 @@ const initialStartHiddenToTray = readStartHiddenToTrayPreference();
 const initialLanguage = getInitialLanguage();
 const initialBackgroundImage = readBackgroundImageSettings();
 
-/** Resolve "system" theme to an actual "dark" | "light" value. */
+const THEMES: readonly Theme[] = ["light", "macos", "minimal", "studio"];
+
+function readThemePreference(): Theme {
+  const stored = profileLocalStorage.getItem("pebble-theme");
+  // Older versions stored color-only themes. Treat all of them as the default
+  // rather than leaving a user on a design which is no longer offered.
+  return THEMES.includes(stored as Theme) ? stored as Theme : "light";
+}
+
+function readFontFamily(): AppFontFamily {
+  const family = profileLocalStorage.getItem("pebble-font-family") as AppFontFamily;
+  return FONT_FAMILIES.includes(family) ? family : "system";
+}
+
+function readFontScale(): number {
+  const scale = Number(profileLocalStorage.getItem("pebble-font-scale") ?? "1");
+  return Number.isFinite(scale) ? Math.max(0.9, Math.min(1.35, scale)) : 1;
+}
+
+function readPollInterval(mode: RealtimePreference): number {
+  const stored = profileLocalStorage.getItem("pebble-poll-interval");
+  const interval = stored === null ? NaN : Number(stored);
+  return Number.isFinite(interval) && interval >= 0 ? interval : realtimePreferenceToPollInterval(mode);
+}
+
+/** Resolve the active visual style to the OS titlebar appearance. */
 export function resolveTheme(theme: Theme): "dark" | "light" {
-  if (theme === "system") {
-    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-  }
-  return theme === "dark" || theme === "highContrast" ? "dark" : "light";
+  return theme === "studio" ? "dark" : "light";
 }
 
 /** Apply the resolved theme to the DOM immediately (no React effect needed). */
 export function applyThemeToDom(theme: Theme) {
   document.documentElement.setAttribute(
     "data-theme",
-    theme === "system" ? resolveTheme(theme) : theme,
+    theme,
   );
+}
+
+export const PROFILE_UI_PREFERENCE_KEYS = new Set([
+  "pebble-theme", "pebble-font-family", "pebble-font-scale", BACKGROUND_IMAGE_STORAGE_KEY,
+  LANGUAGE_STORAGE_KEY, REALTIME_PREFERENCE_KEY, "pebble-poll-interval", NOTIFICATIONS_KEY,
+  KEEP_RUNNING_BACKGROUND_KEY, START_HIDDEN_TO_TRAY_KEY, "pebble-show-unread-count",
+]);
+
+export function readProfileUiPreferences() {
+  const realtimeMode = readRealtimePreference();
+  return {
+    theme: readThemePreference(),
+    fontFamily: readFontFamily(),
+    fontScale: readFontScale(),
+    backgroundImage: readBackgroundImageSettings(),
+    language: getInitialLanguage(),
+    realtimeMode,
+    pollInterval: readPollInterval(realtimeMode),
+    notificationsEnabled: readNotificationsEnabledPreference(),
+    keepRunningInBackground: readKeepRunningInBackgroundPreference(),
+    startHiddenToTray: readStartHiddenToTrayPreference(),
+    showFolderUnreadCount: profileLocalStorage.getItem("pebble-show-unread-count") !== "false",
+  };
+}
+
+export function refreshProfileUiPreferences() {
+  const previous = useUIStore.getState();
+  const next = readProfileUiPreferences();
+  if (JSON.stringify(previous.backgroundImage) === JSON.stringify(next.backgroundImage)) {
+    next.backgroundImage = previous.backgroundImage;
+  }
+  if (Object.entries(next).some(([key, value]) => previous[key as keyof typeof next] !== value)) {
+    useUIStore.setState(next);
+  }
+  // Applies to every window, including the standalone compose entry point.
+  applyThemeToDom(next.theme);
+  applyTypographyToDom(next.fontFamily, next.fontScale);
+  if (i18n.language !== next.language) void i18n.changeLanguage(next.language);
 }
 
 export function applyTypographyToDom(fontFamily: AppFontFamily, fontScale: number) {
@@ -238,15 +300,15 @@ interface UIState {
   removeNavTab: (key: string) => void;
   setNavTabs: (tabs: NavTab[]) => void;
   /** AI 后台生成完成但写信页已关闭时暂存的结果，回写信页时自动应用 */
-  pendingAiDraft: string | null;
-  setPendingAiDraft: (draft: string | null) => void;
+  pendingAiDraft: { body: string; signature?: string; subject?: string } | null;
+  setPendingAiDraft: (draft: { body: string; signature?: string; subject?: string } | null) => void;
   /** 内联筛选下拉注入的搜索条件：SearchView 挂载时消费后清空。 */
   pendingSearchFilters: AdvancedSearchQuery | null;
   setPendingSearchFilters: (filters: AdvancedSearchQuery | null) => void;
   /** AI 写作后台生成任务（全局，不随组件卸载丢失）：
    *  running 时标签页/右侧面板显示进行中；done 后 result 供各处提醒/应用。 */
-  aiBgTask: { running: boolean; source: "compose" | "panel"; result: string | null } | null;
-  setAiBgTask: (task: { running: boolean; source: "compose" | "panel"; result: string | null } | null) => void;
+  aiBgTask: { running: boolean; source: "compose" | "panel"; result: string | null; signature?: string; subject?: string; targetTabId?: string } | null;
+  setAiBgTask: (task: { running: boolean; source: "compose" | "panel"; result: string | null; signature?: string; subject?: string; targetTabId?: string } | null) => void;
   /** 写信页与右侧/悬浮 AI 写作共用的同一条对话历史（不含 system）。
    *  两边读写同一份，避免各自独立导致上下文脱节。 */
   aiWritingTurns: { role: "user" | "assistant"; content: string }[];
@@ -260,8 +322,8 @@ interface UIState {
   leadFinderDraft: { product: string; market: string; buyerType: string; query: string } | null;
   setLeadFinderDraft: (d: { product: string; market: string; buyerType: string; query: string } | null) => void;
   /** 资信调研输入保留 */
-  companyResearchDraft: { company: string; website: string; country: string } | null;
-  setCompanyResearchDraft: (d: { company: string; website: string; country: string } | null) => void;
+  companyResearchDraft: { company: string; website: string; country: string; vat?: string } | null;
+  setCompanyResearchDraft: (d: { company: string; website: string; country: string; vat?: string } | null) => void;
   /** 客户管理搜索/筛选保留 */
   customerProfileSearch: string;
   customerProfileFilter: string;
@@ -334,9 +396,9 @@ export const useUIStore = create<UIState>((set) => ({
       rightPanelTool: rightPanelTools[rightPanelTools.length - 1] ?? "aiWriting",
     };
   }),
-  theme: (profileLocalStorage.getItem("pebble-theme") as Theme) || "light",
-  fontFamily: (profileLocalStorage.getItem("pebble-font-family") as AppFontFamily) || "system",
-  fontScale: Number(profileLocalStorage.getItem("pebble-font-scale") || "1"),
+  theme: readThemePreference(),
+  fontFamily: readFontFamily(),
+  fontScale: readFontScale(),
   setFontFamily: (fontFamily) => {
     profileLocalStorage.setItem("pebble-font-family", fontFamily);
     applyTypographyToDom(fontFamily, useUIStore.getState().fontScale);
@@ -481,7 +543,7 @@ export const useUIStore = create<UIState>((set) => ({
       pollInterval,
     });
   },
-  pollInterval: realtimePreferenceToPollInterval(initialRealtimeMode),
+  pollInterval: readPollInterval(initialRealtimeMode),
   setPollInterval: (secs) => {
     profileLocalStorage.setItem("pebble-poll-interval", String(secs));
     set({ pollInterval: secs });

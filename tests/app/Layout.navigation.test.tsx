@@ -109,7 +109,7 @@ vi.mock("../../src/features/compose/ComposeView", () => ({
 }));
 
 vi.mock("../../src/features/search/SearchView", () => ({
-  default: () => <div>Search panel</div>,
+  default: ({ isActive }: { isActive: boolean }) => <div data-testid="search-panel" data-active={isActive}>Search panel<input aria-label="Saved search" defaultValue="" /></div>,
 }));
 
 vi.mock("../../src/features/snoozed/SnoozedView", () => ({
@@ -172,6 +172,7 @@ describe("Layout navigation", () => {
     });
     useUIStore.setState({
       activeView: "inbox",
+      navTabs: [],
       theme: "light",
       notificationsEnabled: true,
       networkStatus: "online",
@@ -185,8 +186,26 @@ describe("Layout navigation", () => {
     expect(await screen.findByText("Compose panel")).toBeTruthy();
     act(() => useUIStore.getState().setActiveView("inbox"));
 
-    expect(screen.getByText("Inbox panel")).toBeTruthy();
+    expect(await screen.findByText("Inbox panel")).toBeTruthy();
     expect(screen.getByText("Compose panel")).toBeTruthy();
+  });
+
+  it("preserves a search tab while switching views and releases it when closed", async () => {
+    useUIStore.setState({ activeView: "search" });
+    render(<Layout />);
+    const search = await screen.findByRole<HTMLInputElement>("textbox", { name: "Saved search" });
+    fireEvent.change(search, { target: { value: "purchase order" } });
+    expect(useUIStore.getState().navTabs.some(tab => tab.view === "search")).toBe(true);
+    act(() => useUIStore.getState().navigateToView("inbox"));
+    expect(screen.getByTestId("search-panel").getAttribute("data-active")).toBe("false");
+    act(() => useUIStore.getState().navigateToView("search"));
+    expect(screen.getByRole<HTMLInputElement>("textbox", { name: "Saved search" })).toBe(search);
+    expect(search.value).toBe("purchase order");
+    act(() => {
+      useUIStore.getState().removeNavTab("feature:search");
+      useUIStore.getState().navigateToView("inbox");
+    });
+    expect(screen.queryByTestId("search-panel")).toBeNull();
   });
 
   it("shows the loading fallback instead of leaving stale inbox content when a lazy view is pending", async () => {

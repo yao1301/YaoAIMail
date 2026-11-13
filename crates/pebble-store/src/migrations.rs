@@ -482,7 +482,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             .unchecked_transaction()
             .map_err(|e| PebbleError::Storage(format!("Migration V17 begin failed: {e}")))?;
         // 修复历史 bug：IMAP 文件夹发现曾把文件夹一律硬编码 is_system=1，
-        // 导致用户自定义文件夹（Alibaba/RSG/WASH GEC/Trash 子文件夹等）
+        // 导致用户自定义文件夹（客户分类、项目分类、废纸子文件夹等）
         // 被当成系统文件夹，右键菜单无法删除/重命名。
         // 只有带系统角色（inbox/sent/trash 等）的文件夹才算系统文件夹。
         tx.execute_batch("UPDATE folders SET is_system = 0 WHERE is_system = 1 AND role IS NULL;")

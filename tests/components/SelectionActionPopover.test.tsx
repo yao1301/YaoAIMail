@@ -38,7 +38,7 @@ describe("SelectionActionPopover", () => {
     expect(screen.getByRole("button", { name: "Copied selected text" })).toBeTruthy();
   });
 
-  it("keeps translate behind the secondary actions menu", () => {
+  it("offers copy and translate together, with search and rules in More", () => {
     const onTranslate = vi.fn();
     const onSearch = vi.fn();
     const onCreateRule = vi.fn();
@@ -62,7 +62,7 @@ describe("SelectionActionPopover", () => {
     expect(screen.getByRole("menuitem", { name: "Search selected text" })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: "Create rule from selected text" })).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("menuitem", { name: "Translate selected text" }));
+    fireEvent.click(screen.getByRole("button", { name: "Translate selected text" }));
 
     expect(onTranslate).toHaveBeenCalledWith("selected email text", { x: 100, y: 120 });
     expect(onSearch).not.toHaveBeenCalled();

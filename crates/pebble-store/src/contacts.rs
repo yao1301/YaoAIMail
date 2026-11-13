@@ -28,6 +28,13 @@ impl Store {
                      FROM messages
                      WHERE account_id = ?1
                        AND is_deleted = 0
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM message_folders mf
+                           JOIN folders f ON f.id = mf.folder_id
+                           WHERE mf.message_id = messages.id
+                             AND f.role IN ('spam', 'trash', 'drafts')
+                       )
                        AND (from_address LIKE ?2 ESCAPE '\\' OR from_name LIKE ?2 ESCAPE '\\')
                      LIMIT ?3",
             )?;
@@ -60,6 +67,13 @@ impl Store {
                          FROM messages
                          WHERE account_id = ?1
                            AND is_deleted = 0
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM message_folders mf
+                               JOIN folders f ON f.id = mf.folder_id
+                               WHERE mf.message_id = messages.id
+                                 AND f.role IN ('spam', 'trash', 'drafts')
+                           )
                            AND to_list LIKE ?2 ESCAPE '\\'
                          LIMIT ?3",
                 )?;
@@ -264,6 +278,57 @@ mod tests {
         let results = store
             .list_known_contacts(&account_id, "zzzznotfound", 10)
             .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_list_known_contacts_excludes_spam_folder() {
+        let (store, account_id) = setup_store_with_contacts();
+        let spam = Folder {
+            id: new_id(),
+            account_id: account_id.clone(),
+            remote_id: "Junk".to_string(),
+            name: "Spam".to_string(),
+            folder_type: FolderType::Folder,
+            role: Some(FolderRole::Spam),
+            parent_id: None,
+            color: None,
+            is_system: true,
+            sort_order: 9,
+        };
+        store.insert_folder(&spam).unwrap();
+        let now = now_timestamp();
+        let message = Message {
+            id: new_id(),
+            account_id: account_id.clone(),
+            remote_id: "spam-1".to_string(),
+            message_id_header: None,
+            in_reply_to: None,
+            references_header: None,
+            thread_id: None,
+            subject: "Urgent".to_string(),
+            snippet: "verify".to_string(),
+            from_address: "fraud@unrelated.example".to_string(),
+            from_name: "Fake Company".to_string(),
+            to_list: vec![EmailAddress { name: None, address: "me@example.com".to_string() }],
+            cc_list: vec![],
+            bcc_list: vec![],
+            body_text: "Verify your account".to_string(),
+            body_html_raw: "<p>Verify your account</p>".to_string(),
+            has_attachments: false,
+            is_read: false,
+            is_starred: false,
+            is_draft: false,
+            date: now,
+            remote_version: None,
+            is_deleted: false,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.insert_message(&message, &[spam.id]).unwrap();
+
+        let results = store.list_known_contacts(&account_id, "fraud", 10).unwrap();
         assert!(results.is_empty());
     }
 }

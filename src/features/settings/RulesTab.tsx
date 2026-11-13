@@ -1,4 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
+import { useSavedSettingsRevision } from '@/lib/settingsChangeSignal';
+import { useEffect, useMemo } from "react";
 import {
   Pencil, Play, Plus, Settings2, Trash2, X,
 } from "lucide-react";
@@ -16,6 +18,7 @@ import { useAccountsQuery, useFoldersForAccountsQuery } from "@/hooks/queries";
 import { listen } from "@tauri-apps/api/event";
 import { useUIStore } from "@/stores/ui.store";
 import { useToastStore } from "@/stores/toast.store";
+import { SettingsFeedback, type SettingsNotice } from "./SettingsFeedback";
 import { useMailStore } from "@/stores/mail.store";
 import {
   parseRuleActions,
@@ -151,19 +154,24 @@ function actionsSummary(rule: Rule): string {
 export default function RulesTab() {
   const { data: accounts = [] } = useAccountsQuery();
   const activeAccountId = useMailStore((state) => state.activeAccountId);
-  const [selectedAccountId, setSelectedAccountId] = useState(activeAccountId ?? "");
+  const [selectedAccountId, setSelectedAccountId] = useWorkspaceState("src/features/settings/RulesTab.tsx:RulesTab:selectedAccountId", activeAccountId ?? "");
   const { data: folders = [] } = useFoldersForAccountsQuery(
     selectedAccountId ? [selectedAccountId] : [],
   );
-  const [rules, setRules] = useState<Rule[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [rules, setRules] = useWorkspaceState<Rule[]>("src/features/settings/RulesTab.tsx:RulesTab:rules", []);
+  const [loading, setLoading] = useWorkspaceState("src/features/settings/RulesTab.tsx:RulesTab:loading", false);
 
-  const [editing, setEditing] = useState<{ rule: Rule | null; form: RuleFormData } | null>(null);
-  const [execTarget, setExecTarget] = useState<{ rule: Rule | null } | null>(null);
-  const [execFolderId, setExecFolderId] = useState("");
-  const [execRunning, setExecRunning] = useState(false);
-  const [execProgress, setExecProgress] = useState<{ processed: number; matched: number } | null>(null);
-  const [execReport, setExecReport] = useState<ApplyRulesReport | null>(null);
+  const [editing, setEditing] = useWorkspaceState<{ rule: Rule | null; form: RuleFormData } | null>("src/features/settings/RulesTab.tsx:RulesTab:editing", null);
+  const [execTarget, setExecTarget] = useWorkspaceState<{ rule: Rule | null } | null>("src/features/settings/RulesTab.tsx:RulesTab:execTarget", null);
+  const [execFolderId, setExecFolderId] = useWorkspaceState("src/features/settings/RulesTab.tsx:RulesTab:execFolderId", "");
+  const [execRunning, setExecRunning] = useWorkspaceState("src/features/settings/RulesTab.tsx:RulesTab:execRunning", false);
+  const [execProgress, setExecProgress] = useWorkspaceState<{ processed: number; matched: number } | null>("src/features/settings/RulesTab.tsx:RulesTab:execProgress", null);
+  const [execReport, setExecReport] = useWorkspaceState<ApplyRulesReport | null>("src/features/settings/RulesTab.tsx:RulesTab:execReport", null);
+  const [feedback, setFeedback] = useWorkspaceState<Record<string, SettingsNotice | undefined>>("src/features/settings/RulesTab.tsx:RulesTab:feedback", {});
+
+  function showFeedback(action: string, message?: string) {
+    setFeedback((current) => ({ ...current, [action]: message ? { message, kind: "error" } : undefined }));
+  }
 
   // 后台执行规则：监听进度与完成事件（apply_rules_to_folder 已改为后台分批执行，
   // 命令立即返回，不再长时间阻塞弹窗）。
@@ -179,13 +187,14 @@ export default function RulesTab() {
       (event) => {
         setExecRunning(false);
         setExecProgress(null);
-        setExecTarget(null);
         if (event.payload.phase === "error") {
+          showFeedback("execute", `执行失败：${event.payload.error ?? "未知错误"}`);
           useToastStore.getState().addToast({ message: `执行失败：${event.payload.error ?? "未知错误"}`, type: "error" });
           return;
         }
         const report = event.payload.report;
         if (!report) {
+          showFeedback("execute", "规则执行完成，但没有收到报告。");
           useToastStore.getState().addToast({ message: "规则执行完成，但没有收到报告", type: "error" });
           return;
         }
@@ -249,7 +258,8 @@ export default function RulesTab() {
   }, [pendingDraft, selectedAccountId]);
 
   // 加载规则
-  useEffect(() => {
+  const rulesRevision = useSavedSettingsRevision("rules");
+  useWorkspaceInitEffect("src/features/settings/RulesTab.tsx:", () => {
     if (!selectedAccountId) {
       setRules([]);
       return;
@@ -267,15 +277,17 @@ export default function RulesTab() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [selectedAccountId]);
+  }, [selectedAccountId, rulesRevision]);
 
   const accountFolders = useMemo(() => folders, [folders]);
 
   function openNewRule() {
+    showFeedback("save");
     setEditing({ rule: null, form: { ...emptyForm, account_id: selectedAccountId } });
   }
 
   function openEditRule(rule: Rule) {
+    showFeedback("save");
     setEditing({
       rule,
       form: {
@@ -293,17 +305,18 @@ export default function RulesTab() {
 
   async function saveRule() {
     if (!editing) return;
+    showFeedback("save");
     const form = editing.form;
     if (!form.name.trim()) {
-      useToastStore.getState().addToast({ message: "请填写规则名称", type: "error" });
+      showFeedback("save", "请填写规则名称。");
       return;
     }
     if (form.conditionLogic !== "none" && form.conditions.length === 0) {
-      useToastStore.getState().addToast({ message: "请至少添加一个条件，或选择“无条件限制”", type: "error" });
+      showFeedback("save", "请至少添加一个条件，或选择“无条件限制”。");
       return;
     }
     if (form.actions.length === 0) {
-      useToastStore.getState().addToast({ message: "请至少添加一个动作", type: "error" });
+      showFeedback("save", "请至少添加一个动作。");
       return;
     }
     const conditionsJson = buildConditionsJson(form);
@@ -339,15 +352,17 @@ export default function RulesTab() {
       const data = await listRules(selectedAccountId);
       setRules(data);
     } catch (err) {
-      useToastStore.getState().addToast({ message: `保存失败：${String(err)}`, type: "error" });
+      showFeedback("save", `保存失败：${String(err)}`);
     }
   }
 
   async function createMoveTargetFolder(actionIndex: number) {
     if (!editing) return;
+    const action = `folder:${actionIndex}`;
+    showFeedback(action);
     const accountId = editing.form.account_id || selectedAccountId;
     if (!accountId) {
-      useToastStore.getState().addToast({ message: "请先选择规则所属邮箱账号", type: "error" });
+      showFeedback(action, "请先选择规则所属邮箱账号。");
       return;
     }
     const name = window.prompt("请输入新邮件文件夹名称");
@@ -360,32 +375,35 @@ export default function RulesTab() {
       await queryClient.invalidateQueries({ queryKey: ["folders"] });
       useToastStore.getState().addToast({ message: `已新建文件夹「${folder.name}」并选中`, type: "success" });
     } catch (error) {
-      useToastStore.getState().addToast({ message: `新建文件夹失败：${String(error)}`, type: "error" });
+      showFeedback(action, `新建文件夹失败：${String(error)}`);
     }
   }
 
   async function removeRule(rule: Rule) {
+    showFeedback(`rule:${rule.id}`);
     try {
       await deleteRule(rule.id);
       setRules((old) => old.filter((item) => item.id !== rule.id));
       useToastStore.getState().addToast({ message: "规则已删除。", type: "success" });
     } catch (err) {
-      useToastStore.getState().addToast({ message: `删除失败：${String(err)}`, type: "error" });
+      showFeedback(`rule:${rule.id}`, `删除失败：${String(err)}`);
     }
   }
 
   async function toggleRuleEnabled(rule: Rule) {
+    showFeedback(`rule:${rule.id}`);
     try {
       await updateRule({ ...rule, is_enabled: !rule.is_enabled, updated_at: Date.now() });
       setRules((old) => old.map((item) => (item.id === rule.id ? { ...item, is_enabled: !item.is_enabled } : item)));
     } catch (err) {
-      useToastStore.getState().addToast({ message: `操作失败：${String(err)}`, type: "error" });
+      showFeedback(`rule:${rule.id}`, `操作失败：${String(err)}`);
     }
   }
 
   async function runExecute() {
+    showFeedback("execute");
     if (!execFolderId) {
-      useToastStore.getState().addToast({ message: "请选择要套用规则的文件夹", type: "error" });
+      showFeedback("execute", "请选择要套用规则的文件夹。");
       return;
     }
     setExecRunning(true);
@@ -401,7 +419,7 @@ export default function RulesTab() {
       useToastStore.getState().addToast({ message: "已在后台执行，请稍候…", type: "info" });
     } catch (err) {
       setExecRunning(false);
-      useToastStore.getState().addToast({ message: `启动失败：${String(err)}`, type: "error" });
+      showFeedback("execute", `启动失败：${String(err)}`);
     }
   }
 
@@ -477,7 +495,7 @@ export default function RulesTab() {
                 </div>
               </div>
               <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-                <button type="button" onClick={() => setExecTarget({ rule })} style={smallBtn} title="对该账号现有邮件套用此规则">
+                <button type="button" onClick={() => { showFeedback("execute"); setExecReport(null); setExecTarget({ rule }); }} style={smallBtn} title="对该账号现有邮件套用此规则">
                   <Play size={12} />执行
                 </button>
                 <button type="button" onClick={() => openEditRule(rule)} style={smallBtn} title="编辑规则">
@@ -487,6 +505,7 @@ export default function RulesTab() {
                   <Trash2 size={12} />
                 </button>
               </div>
+              {feedback[`rule:${rule.id}`] && <div style={{ width: "100%" }}><SettingsFeedback notice={feedback[`rule:${rule.id}`]} /></div>}
             </div>
           ))}
         </div>
@@ -667,6 +686,7 @@ export default function RulesTab() {
                         </button>
                       </div>
                     )}
+                    {action.type === "MoveToFolder" && feedback[`folder:${index}`] && <div style={{ width: "100%" }}><SettingsFeedback notice={feedback[`folder:${index}`]} /></div>}
                     {action.type === "AddLabel" && (
                       <input
                         value={action.value ?? ""}
@@ -711,6 +731,7 @@ export default function RulesTab() {
                 保存
               </button>
             </div>
+            <SettingsFeedback notice={feedback.save} />
           </div>
         </div>
       )}
@@ -784,6 +805,7 @@ export default function RulesTab() {
                 {execRunning ? "执行中…" : <><Play size={13} />开始执行</>}
               </button>
             </div>
+            <SettingsFeedback notice={feedback.execute} />
           </div>
         </div>
       )}

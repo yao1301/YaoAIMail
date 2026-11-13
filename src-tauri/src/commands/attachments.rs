@@ -38,7 +38,7 @@ fn resolve_attachment_file(attachments_dir: &Path, stored_path: &str) -> Result<
     Ok((relocated, true))
 }
 
-fn resolve_and_repair_attachment_path(state: &AppState, attachment: &Attachment) -> Result<PathBuf, PebbleError> {
+pub(crate) fn resolve_and_repair_attachment_path(state: &AppState, attachment: &Attachment) -> Result<PathBuf, PebbleError> {
     let stored_path = attachment.local_path.as_deref()
         .ok_or_else(|| PebbleError::Internal("Attachment file not available".to_string()))?;
     let (resolved, relocated) = resolve_attachment_file(&state.attachments_dir, stored_path)?;

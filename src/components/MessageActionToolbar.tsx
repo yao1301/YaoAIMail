@@ -1,10 +1,11 @@
-import { Reply, ReplyAll, Forward, Star, Archive, Trash2, RotateCcw } from "lucide-react";
+import { Reply, ReplyAll, Forward, Star, Archive, Trash2, RotateCcw, RefreshCw, Send } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useToastStore } from "@/stores/toast.store";
 import { useTranslation } from "react-i18next";
 import { useUpdateFlagsMutation } from "@/hooks/mutations/useUpdateFlagsMutation";
 import { useComposeStore } from "@/stores/compose.store";
-import { archiveMessage, deleteMessage, restoreMessage } from "@/lib/api";
+import { archiveMessage, deleteMessage, redownloadMessage, restoreMessage } from "@/lib/api";
+import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import type { Message } from "@/lib/api";
 import {
   patchMessagesCache,
@@ -13,6 +14,8 @@ import {
 } from "@/hooks/queries";
 import { useState } from "react";
 import ConfirmDialog from "./ConfirmDialog";
+import { useSendDrafts } from '@/hooks/useSendDrafts';
+import { usePrepareMessageDeletion } from "@/hooks/useMessageDeletionNavigation";
 
 interface Props {
   message: Message;
@@ -30,8 +33,11 @@ export default function MessageActionToolbar({
   const { t } = useTranslation();
   const openCompose = useComposeStore((s) => s.openCompose);
   const queryClient = useQueryClient();
+  const prepareDeletion = usePrepareMessageDeletion();
+  const { sendDrafts, sending } = useSendDrafts();
   const flagsMutation = useUpdateFlagsMutation();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [redownloading, setRedownloading] = useState(false);
 
   function invalidateMessageViews(includeUnreadCounts = false) {
     queryClient.invalidateQueries({ queryKey: ["messages"] });
@@ -48,9 +54,34 @@ export default function MessageActionToolbar({
     active?: boolean;
     disabled?: boolean;
   }> = [
+    ...(message.is_draft ? [{ icon: Send, label: '发送草稿', action: () => { void sendDrafts([message.id]); }, disabled: sending }] : []),
     { icon: Reply, label: t("messageActions.reply"), action: () => openCompose("reply", message) },
     { icon: ReplyAll, label: t("messageActions.replyAll"), action: () => openCompose("reply-all", message) },
     { icon: Forward, label: t("messageActions.forward"), action: () => openCompose("forward", message) },
+    {
+      icon: RefreshCw,
+      label: t("messageActions.redownload", "重新下载邮件"),
+      action: async () => {
+        if (redownloading) return;
+        setRedownloading(true);
+        try {
+          const updated = await redownloadMessage(message.id);
+          onMessageUpdate(updated);
+          useToastStore.getState().addToast({
+            message: t("messageActions.redownloadSuccess", "邮件已重新下载并修复"),
+            type: "success",
+          });
+        } catch (error) {
+          useToastStore.getState().addToast({
+            message: `${t("messageActions.redownloadFailed", "重新下载邮件失败")}: ${extractErrorMessage(error)}`,
+            type: "error",
+          });
+        } finally {
+          setRedownloading(false);
+        }
+      },
+      disabled: redownloading,
+    },
     {
       icon: Star,
       label: message.is_starred ? t("messageActions.unstar") : t("messageActions.star"),
@@ -129,12 +160,12 @@ export default function MessageActionToolbar({
 
   return (
     <>
-      <div style={{ display: "flex", gap: "2px", padding: "4px 16px 4px 48px", position: "relative" }}>
+      <div style={{ display: "flex", flexWrap: 'wrap', alignItems: 'center', gap: "2px", padding: "4px 16px 4px 48px", position: "relative" }}>
         {actions.map(({ icon: Icon, label, action, active, disabled }, i) => (
           <button
             key={i}
             onClick={disabled ? undefined : action}
-            title={disabled ? label + " (coming soon)" : label}
+            title={label}
             aria-label={label}
             style={{
               background: "none",
@@ -165,6 +196,7 @@ export default function MessageActionToolbar({
           onCancel={() => setShowDeleteConfirm(false)}
           onConfirm={async () => {
             setShowDeleteConfirm(false);
+            const completeDeletion = prepareDeletion([message.id]);
             const previousLists = snapshotMessagesCache(queryClient);
             patchMessagesCache(queryClient, (page) => page.filter((m) => m.id !== message.id));
             try {
@@ -174,9 +206,10 @@ export default function MessageActionToolbar({
                 message: t("messageActions.deleteSuccess", "Message deleted"),
                 type: "success",
               });
-              onBack();
+              if (!completeDeletion([message.id])) onBack();
             } catch {
-              restoreMessagesCache(queryClient, previousLists);
+              restoreMessagesCache(queryClient, previousLists, [message.id]);
+              completeDeletion([]);
               useToastStore.getState().addToast({
                 message: t("messageActions.deleteFailed", "Failed to delete message"),
                 type: "error",

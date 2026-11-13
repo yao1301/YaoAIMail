@@ -377,6 +377,16 @@ impl Store {
             .iter()
             .filter(|folder| !folder.remote_id.starts_with("__local_"))
             .map(|folder| {
+                // System folders (inbox/drafts/sent/spam/trash …) always sit at
+                // the top level of the sidebar, never nested. Some servers
+                // (e.g. Dovecot) expose them under an `INBOX.` namespace
+                // prefix; on those servers `INBOX.Sent` is a sibling of INBOX,
+                // not a child mailbox, so the prefix inference below must not
+                // attach it to INBOX. Passing None also self-heals rows that a
+                // previous version wrongly re-parented.
+                if folder.role.is_some() || folder.is_system {
+                    return (folder.id.clone(), None);
+                }
                 let mut best_parent: Option<(&str, &str)> = None;
                 for (candidate_path, candidate_id) in &remote_to_id {
                     if *candidate_path == folder.remote_id || candidate_path.is_empty() {
@@ -861,6 +871,56 @@ mod tests {
             .unwrap();
         assert_eq!(store.get_folder(&beta.id).unwrap().unwrap().sort_order, 0);
         assert_eq!(store.get_folder(&alpha.id).unwrap().unwrap().sort_order, 1);
+    }
+
+    #[test]
+    fn hierarchy_repair_keeps_system_folders_top_level_and_heals_prefix_nesting() {
+        let store = Store::open_in_memory().unwrap();
+        let account = account();
+        store.insert_account(&account).unwrap();
+
+        // Dovecot-style namespace: system folders carry the `INBOX.` prefix.
+        let inbox = folder(&account.id, "folder-inbox", "INBOX", Some(FolderRole::Inbox));
+        let mut sent = folder(&account.id, "folder-sent", "INBOX.Sent", Some(FolderRole::Sent));
+        let mut drafts = folder(
+            &account.id,
+            "folder-drafts",
+            "INBOX.Drafts",
+            Some(FolderRole::Drafts),
+        );
+        // A previous version wrongly re-parented them under INBOX.
+        sent.parent_id = Some(inbox.id.clone());
+        drafts.parent_id = Some(inbox.id.clone());
+        // A custom folder under the same prefix genuinely nests.
+        let mut notes = folder(&account.id, "folder-notes", "INBOX.Notes", None);
+        notes.is_system = false;
+
+        store.insert_folder(&inbox).unwrap();
+        store.insert_folder(&sent).unwrap();
+        store.insert_folder(&drafts).unwrap();
+        store.insert_folder(&notes).unwrap();
+
+        let repaired = store
+            .repair_folder_hierarchy_from_remote_ids(&account.id)
+            .unwrap();
+        assert!(repaired >= 2, "system folders must be re-parented to top");
+        assert_eq!(store.get_folder(&sent.id).unwrap().unwrap().parent_id, None);
+        assert_eq!(
+            store.get_folder(&drafts.id).unwrap().unwrap().parent_id,
+            None
+        );
+        assert_eq!(
+            store.get_folder(&notes.id).unwrap().unwrap().parent_id,
+            Some(inbox.id.clone())
+        );
+
+        // Re-running converges: nothing left to repair.
+        assert_eq!(
+            store
+                .repair_folder_hierarchy_from_remote_ids(&account.id)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

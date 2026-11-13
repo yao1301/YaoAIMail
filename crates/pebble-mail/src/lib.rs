@@ -10,6 +10,7 @@ pub mod provider;
 pub mod realtime_policy;
 pub mod reconcile;
 pub mod smtp;
+pub mod sender;
 pub mod sync;
 pub mod thread;
 

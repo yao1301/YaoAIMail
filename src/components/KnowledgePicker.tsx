@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FileText, Library, X } from "lucide-react";
 import { listKnowledgeItems, type KnowledgeItem } from "@/lib/api";
+import { useClickOutside } from "@/hooks/useClickOutside";
 
 export default function KnowledgePicker({
   accountId,
@@ -16,6 +17,16 @@ export default function KnowledgePicker({
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<KnowledgeItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  // 引用资料的浮层属于"临时选择"，用户点到别处就应当自己收起。
+  // 之前在 AI 写作、搜客、首页工作台都要手动点右上角 ✕ 才能关，很别扭。
+  useClickOutside(rootRef, open, () => setOpen(false));
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
   useEffect(() => { setItems([]); setOpen(false); }, [accountId]);
   async function toggle() {
     if (!open && items.length === 0) {
@@ -28,8 +39,8 @@ export default function KnowledgePicker({
     onChange(selectedIds.includes(id) ? selectedIds.filter((value) => value !== id) : [...selectedIds, id]);
   }
   return (
-    <div style={{ position: "relative", display: "inline-block" }}>
-      <button type="button" onClick={() => void toggle()} style={pickerButton}><Library size={13} />{label}{selectedIds.length > 0 ? `（${selectedIds.length}）` : ""}</button>
+    <div ref={rootRef} style={{ position: "relative", display: "inline-block" }}>
+      <button type="button" onClick={() => void toggle()} title="选择供本次 AI 任务参考的资料。所选资料不会自动成为邮件附件。" style={pickerButton}><Library size={13} />{label}{selectedIds.length > 0 ? `（${selectedIds.length}）` : ""}</button>
       {open && <div style={pickerPanel}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, padding: "7px 9px", borderBottom: "1px solid var(--color-border)" }}>
           <span style={{ fontSize: 11, color: "var(--color-text-secondary)", flex: 1, minWidth: 0 }}>只会把勾选的资料片段提供给本次 AI 任务</span>

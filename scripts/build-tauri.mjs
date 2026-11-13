@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 
 const BUNDLE_TARGETS_BY_PLATFORM = {
@@ -27,6 +27,15 @@ function isEntrypoint() {
 }
 
 if (isEntrypoint()) {
+  if (process.platform === "win32") {
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL("./build-windows.mjs", import.meta.url)), ...process.argv.slice(2)], {
+      stdio: "inherit",
+      env: existsSync("D:\\tools\\mingw64\\bin")
+        ? { ...process.env, PATH: `D:\\tools\\mingw64\\bin;${process.env.PATH ?? ""}` }
+        : process.env,
+    });
+    process.exit(result.status ?? 1);
+  }
   let args;
   try {
     args = tauriBuildArgsForPlatform(process.platform, process.argv.slice(2));

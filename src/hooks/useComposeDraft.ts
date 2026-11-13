@@ -1,7 +1,11 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import { useComposeStore } from "@/stores/compose.store";
 import { saveDraft } from "@/lib/api";
 import { hasComposeDraft, type ComposeAttachment } from "@/features/compose/compose-draft";
+import { registerDraftSaver } from '@/features/compose/draftPersistence';
+import { useConfirmStore } from '@/stores/confirm.store';
+import { useToastStore } from '@/stores/toast.store';
+import i18n from '@/lib/i18n';
 
 import type { EditorMode } from "./useComposeEditor";
 
@@ -54,120 +58,112 @@ interface UseComposeDraftArgs {
    * falsely report the compose as dirty. */
   editorReady: boolean;
   existingDraftId?: string;
+  initialDirty?: boolean;
+  inReplyTo?: string;
   /** 写信标签 id（多标签模式）：dirty 标记只写回对应标签。 */
   tabId?: string;
+  onSaved?: () => void;
 }
 
-export function useComposeDraft({
-  to, cc, bcc, subject, rawSource, richTextHtml, editorMode, composeMode, fromAccountId, attachments, editorReady,
-  existingDraftId,
-  tabId,
-}: UseComposeDraftArgs) {
-  // Snapshot the initial compose state so pre-populated reply/forward
-  // fields don't immediately trigger the "unsaved draft" guard.
-  // Deferred until the editor has rendered its initial content - taken once,
-  // in an effect that runs after the first render post-editorReady.
-  const initialSnapshot = useRef<{
-    to: string[]; cc: string[]; bcc: string[]; subject: string;
-    rawSource: string; richTextHtml: string; attachments: ComposeAttachment[];
-  } | null>(null);
-  useEffect(() => {
-    if (!editorReady || initialSnapshot.current) return;
-    initialSnapshot.current = {
-      to: [...to], cc: [...cc], bcc: [...bcc], subject,
-      rawSource, richTextHtml, attachments: attachments.map((a) => ({ ...a })),
-    };
-    // Only depend on editorReady - we want this to run once after mount, not
-    // each time the user edits.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editorReady]);
+function draftFingerprint(input: UseComposeDraftArgs) {
+  return JSON.stringify([input.fromAccountId, input.to, input.cc, input.bcc, input.subject,
+    input.editorMode, input.editorMode === 'rich' ? input.richTextHtml : input.rawSource,
+    input.attachments, input.inReplyTo]);
+}
 
-  const arraysEqual = useCallback(
-    (a: string[], b: string[]) => a.length === b.length && a.every((v, i) => v === b[i]),
-    [],
-  );
-  const attachmentsEqual = useCallback(
-    (a: ComposeAttachment[], b: ComposeAttachment[]) =>
-      a.length === b.length &&
-      a.every((v, i) => v.name === b[i]?.name && v.path === b[i]?.path && v.size === b[i]?.size),
-    [],
-  );
-
-  // Ref to track the server-side draft ID across saves.
-  // Scoped per account: when the user switches From, the prior draft_id
-  // belongs to a different account and must not be reused.
+export function useComposeDraft(args: UseComposeDraftArgs) {
+  const { existingDraftId, fromAccountId, editorReady, tabId } = args;
+  const latest = useRef(args);
+  latest.current = args;
+  const [isSaving, setIsSaving] = useState(false);
+  const pendingCount = useRef(0);
+  const stopped = useRef(false);
+  const leaveDialogOpen = useComposeStore(s => s.showComposeLeaveConfirm);
+  const confirmOpen = useConfirmStore(s => s.isOpen);
+  const initial = useRef<{ account: string | null; fingerprint: string } | null>(null);
+  const savedFingerprints = useRef<Record<string, string>>({});
+  const pending = useRef<Record<string, Promise<string>>>({});
   const draftIdRef = useRef<string | null>(existingDraftId ?? null);
-  const draftAccountRef = useRef<string | null>(null);
   const draftIdsByAccountRef = useRef<Record<string, string>>(
     existingDraftId && fromAccountId ? { [fromAccountId]: existingDraftId } : {},
   );
-  const saveGenerationByAccountRef = useRef<Record<string, number>>({});
-  if (draftAccountRef.current !== fromAccountId) {
-    draftAccountRef.current = fromAccountId;
-    draftIdRef.current = fromAccountId ? draftIdsByAccountRef.current[fromAccountId] ?? null : null;
-  }
+  draftIdRef.current = fromAccountId ? draftIdsByAccountRef.current[fromAccountId] ?? null : null;
+  const fingerprint = draftFingerprint(args);
+  const hasUnsavedChanges = useCallback(() => {
+    const input = latest.current;
+    const saved = input.fromAccountId ? savedFingerprints.current[input.fromAccountId] : undefined;
+    const baseline = saved ?? (existingDraftId && !args.initialDirty && initial.current?.account === input.fromAccountId
+      ? initial.current.fingerprint : undefined);
+    return baseline !== undefined ? draftFingerprint(input) !== baseline : hasComposeDraft(input);
+  }, [existingDraftId, args.initialDirty]);
 
-  // Track dirty state for leave-protection.
-  // Skip until the initial snapshot is captured (i.e. editor ready).
   useEffect(() => {
-    const init = initialSnapshot.current;
-    if (!init) return;
-    const userChanged =
-      !arraysEqual(to, init.to) ||
-      !arraysEqual(cc, init.cc) ||
-      !arraysEqual(bcc, init.bcc) ||
-      subject !== init.subject ||
-      rawSource !== init.rawSource ||
-      richTextHtml !== init.richTextHtml ||
-      !attachmentsEqual(attachments, init.attachments);
-    useComposeStore.getState().setComposeDirty(userChanged, tabId);
-  }, [arraysEqual, attachments, attachmentsEqual, bcc, cc, rawSource, richTextHtml, subject, to, editorReady, tabId]);
+    if (!editorReady) return;
+    if (!initial.current) initial.current = { account: fromAccountId, fingerprint };
+    useComposeStore.getState().setComposeDirty(hasUnsavedChanges(), tabId);
+  }, [fingerprint, editorReady, existingDraftId, fromAccountId, tabId, hasUnsavedChanges]);
 
-  // Auto-save draft to backend (debounced 3s). Do not persist plaintext draft
-  // data in WebView storage.
-  useEffect(() => {
-    if (!composeMode || !editorReady || !initialSnapshot.current) return;
-    const timer = setTimeout(() => {
-      const draftAttachments = attachments.filter((attachment) =>
-        attachment.path.trim().length > 0 || attachment.name.trim().length > 0,
-      );
-      const hasDraft = hasComposeDraft({
-        to, cc, bcc, subject, rawSource, richTextHtml, attachments: draftAttachments,
-      });
-      if (hasDraft && fromAccountId) {
-        const accountIdAtSave = fromAccountId;
-        const generation = (saveGenerationByAccountRef.current[accountIdAtSave] ?? 0) + 1;
-        saveGenerationByAccountRef.current[accountIdAtSave] = generation;
-        // Save to backend under the current From account.
-        {
-          // Pick body source based on current editor mode to avoid stale content.
-          // For rich text, strip HTML tags to produce a plain-text fallback.
-          const bodyText = editorMode === "rich"
-            ? richTextHtml.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim()
-            : rawSource;
-          const bodyHtml = editorMode === "rich" ? richTextHtml : (editorMode === "html" ? rawSource : undefined);
-          saveDraft({
-            accountId: accountIdAtSave,
-            to, cc, bcc, subject,
-            bodyText,
-            bodyHtml: bodyHtml || undefined,
-            attachmentPaths: draftAttachments.map((attachment) => attachment.path).filter(Boolean),
-            existingDraftId: draftIdsByAccountRef.current[accountIdAtSave] || undefined,
-          }).then((id) => {
-            if (saveGenerationByAccountRef.current[accountIdAtSave] === generation) {
-              draftIdsByAccountRef.current[accountIdAtSave] = id;
-              if (draftAccountRef.current === accountIdAtSave) {
-                draftIdRef.current = id;
-              }
-            }
-          }).catch((err) => {
-            console.warn("Backend draft save failed:", err);
-          });
+  const saveNow = useCallback((): Promise<string> => {
+    const input = latest.current;
+    const account = input.fromAccountId;
+    if (!account || !input.editorReady) return Promise.reject(new Error(i18n.t('compose.saveUnavailable', '编辑器尚未准备好，请继续编辑后再保存。')));
+    if (input.attachments.some(file => !file.path.trim())) return Promise.reject(new Error(i18n.t('compose.attachmentsPending', '附件尚未准备好，请稍后保存。')));
+    const key = draftFingerprint(input);
+    const run = async () => {
+      if (stopped.current) throw new Error('Draft session has ended');
+      const priorId = draftIdsByAccountRef.current[account];
+      if (priorId && savedFingerprints.current[account] === key) return priorId;
+      pendingCount.current++;
+      setIsSaving(true);
+      try {
+        const id = await saveDraft({
+          accountId: account, to: input.to, cc: input.cc, bcc: input.bcc, subject: input.subject,
+          bodyText: input.editorMode === 'rich'
+            ? input.richTextHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() : input.rawSource,
+          bodyHtml: (input.editorMode === 'rich' ? input.richTextHtml : input.editorMode === 'html' ? input.rawSource : undefined) || undefined,
+          inReplyTo: input.inReplyTo,
+          attachmentPaths: input.attachments.map(file => file.path).filter(Boolean),
+          existingDraftId: priorId || undefined,
+        });
+        draftIdsByAccountRef.current[account] = id;
+        savedFingerprints.current[account] = key;
+        if (latest.current.fromAccountId === account) {
+          draftIdRef.current = id;
+          useComposeStore.getState().setComposeDirty(draftFingerprint(latest.current) !== key, tabId);
         }
+        input.onSaved?.();
+        return id;
+      } finally {
+        pendingCount.current--;
+        setIsSaving(pendingCount.current > 0);
       }
+    };
+    // Serialize within each account, including manual saves during autosave.
+    // Always retain the resulting ID before the next write starts.
+    const previous = pending.current[account];
+    const task = previous ? previous.catch(() => undefined).then(run) : run();
+    pending.current[account] = task;
+    return task;
+  }, [tabId]);
+
+  useEffect(() => registerDraftSaver(tabId, saveNow), [tabId, saveNow]);
+  const stopSaving = useCallback(async () => {
+    stopped.current = true;
+    await Promise.allSettled(Object.values(pending.current));
+  }, []);
+  const resumeSaving = useCallback(() => { stopped.current = false; }, []);
+  useEffect(() => {
+    if (!args.composeMode || !editorReady || leaveDialogOpen || confirmOpen) return;
+    const timer = setTimeout(() => {
+      if (stopped.current || !latest.current.fromAccountId) return;
+      if (!hasComposeDraft(latest.current) && !draftIdsByAccountRef.current[latest.current.fromAccountId]) return;
+      void saveNow().catch(error => {
+        if (stopped.current) return;
+        useToastStore.getState().addToast({ type: 'error', message: `${i18n.t('compose.saveFailed', '草稿保存失败，内容仍保留在编辑器中')}: ${String(error)}` });
+      });
     }, 3000);
     return () => clearTimeout(timer);
-  }, [attachments, to, cc, bcc, subject, rawSource, richTextHtml, editorMode, composeMode, fromAccountId, editorReady]);
+  }, [fingerprint, args.composeMode, editorReady, leaveDialogOpen, confirmOpen, saveNow]);
 
-  return { draftIdRef, draftIdsByAccountRef };
+  return { draftIdRef, draftIdsByAccountRef, saveNow, isSaving, stopSaving, resumeSaving, hasUnsavedChanges };
 }

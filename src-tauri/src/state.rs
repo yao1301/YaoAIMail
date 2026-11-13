@@ -15,6 +15,7 @@ pub struct SyncHandle {
 }
 
 pub struct AppState {
+    pub account_identity_lock: Arc<Mutex<()>>,
     pub store: Arc<Store>,
     pub search: Arc<TantivySearch>,
     pub crypto: Arc<CryptoService>,
@@ -32,6 +33,7 @@ pub struct AppState {
 impl Clone for AppState {
     fn clone(&self) -> Self {
         AppState {
+            account_identity_lock: self.account_identity_lock.clone(),
             store: self.store.clone(),
             search: self.search.clone(),
             crypto: self.crypto.clone(),
@@ -55,6 +57,7 @@ impl AppState {
         attachments_dir: PathBuf,
     ) -> Self {
         Self {
+            account_identity_lock: Arc::new(Mutex::new(())),
             store: Arc::new(store),
             search: Arc::new(search),
             crypto: Arc::new(crypto),

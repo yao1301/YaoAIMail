@@ -1,5 +1,6 @@
 use crate::commands::send_guard::{
-    delete_stored_contact_role, load_roles, set_manual_contact_role, ContactRole,
+    delete_stored_contact_role, load_roles, save_roles, set_manual_contact_role, ContactRole,
+    RoleSource,
 };
 use crate::state::AppState;
 use pebble_core::{new_id, now_timestamp, PebbleError};
@@ -60,6 +61,33 @@ fn save_contacts(state: &AppState, contacts: &[AddressBookContact]) -> Result<()
     state.store.set_secure_user_data(ADDRESS_BOOK_KEY, &encrypted)
 }
 
+fn role_tag(role: &str) -> Option<&'static str> {
+    match role {
+        "customer" => Some("客户"),
+        "supplier" => Some("供应商"),
+        "service" => Some("服务商"),
+        "neutral" => Some("内部联系人"),
+        "unknown" => Some("未分类"),
+        _ => None,
+    }
+}
+
+/// Contact type is a first-class field. Fixed type labels must never also live
+/// in the free-form tag list, otherwise a manual role correction can leave a
+/// contradictory old tag behind (for example role=supplier + tag=客户).
+fn normalize_custom_tags(tags: Vec<String>) -> Vec<String> {
+    let fixed = ["客户", "供应商", "服务商", "内部联系人", "未分类"];
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() || fixed.contains(&tag) || normalized.iter().any(|known| known == tag) {
+            continue;
+        }
+        normalized.push(tag.to_string());
+    }
+    normalized
+}
+
 fn parse_role(value: &str) -> ContactRole {
     match value {
         "customer" => ContactRole::Customer,
@@ -75,7 +103,46 @@ pub async fn list_address_book_contacts(
     state: State<'_, AppState>,
 ) -> Result<Vec<AddressBookContact>, PebbleError> {
     let mut contacts = load_contacts(&state)?;
-    let roles = load_roles(&state);
+    let mut roles = load_roles(&state);
+    let mut contacts_changed = false;
+    let mut roles_changed = false;
+
+    // Older builds appended a fixed role tag and then used the manual-save
+    // path, accidentally making automatic guesses permanent. A matching fixed
+    // tag identifies those records; restore them to stale inferred results so
+    // the next one-click recognition can reassess the correspondence.
+    for contact in &contacts {
+        let Some(expected_tag) = role_tag(&contact.role) else { continue };
+        if !contact.tags.iter().any(|tag| tag.trim() == expected_tag) {
+            continue;
+        }
+        if let Some(entry) = roles.iter_mut().find(|entry| {
+            entry.email.eq_ignore_ascii_case(&contact.email)
+                && entry.source == RoleSource::Manual
+                && entry.role.as_str() == contact.role
+        }) {
+            entry.source = RoleSource::Inferred;
+            entry.confidence = 0.0;
+            entry.inferred_at = 0;
+            entry.reasons = vec!["旧版自动识别结果，等待按往来邮件重新核验".to_string()];
+            roles_changed = true;
+        }
+    }
+
+    for contact in &mut contacts {
+        let old_tags = std::mem::take(&mut contact.tags);
+        let normalized = normalize_custom_tags(old_tags.clone());
+        if normalized != old_tags {
+            contacts_changed = true;
+        }
+        contact.tags = normalized;
+    }
+    if contacts_changed {
+        save_contacts(&state, &contacts)?;
+    }
+    if roles_changed {
+        save_roles(&state, &roles)?;
+    }
     for contact in &mut contacts {
         if let Some(entry) = roles
             .iter()
@@ -116,6 +183,22 @@ pub async fn save_address_book_contact(
                 .map(|contact| contact.id.clone())
         })
         .unwrap_or_else(new_id);
+    let existing_contact = contacts.iter().find(|contact| contact.id == id).cloned();
+    let stored_roles = load_roles(&state);
+    let stored_role = stored_roles.iter().find(|entry| {
+        entry.email.eq_ignore_ascii_case(&email)
+            || existing_contact
+                .as_ref()
+                .is_some_and(|contact| entry.email.eq_ignore_ascii_case(&contact.email))
+    });
+    let classification_changed = match existing_contact.as_ref() {
+        None => true,
+        Some(existing) => {
+            !existing.email.eq_ignore_ascii_case(&email)
+                || stored_role.is_none()
+                || stored_role.is_some_and(|entry| entry.role.as_str() != role)
+        }
+    };
     // 新建联系人必须关联具体账号（"全部账号"只是汇总，不是独立分类）。
     let account_id = input
         .account_id
@@ -137,13 +220,7 @@ pub async fn save_address_book_contact(
         job_title: input.job_title.unwrap_or_default().trim().to_string(),
         role: role.clone(),
         notes: input.notes.unwrap_or_default().trim().to_string(),
-        tags: input
-            .tags
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tag| tag.trim().to_string())
-            .filter(|tag| !tag.is_empty())
-            .collect(),
+        tags: normalize_custom_tags(input.tags.unwrap_or_default()),
         created_at: now,
         updated_at: now,
         account_id: account_id.clone(),
@@ -157,7 +234,12 @@ pub async fn save_address_book_contact(
         contacts.push(saved.clone());
     }
     save_contacts(&state, &contacts)?;
-    set_manual_contact_role(&state, &email, parse_role(&role))?;
+    // Editing a name, note, account or custom tag must not silently turn the
+    // current AI result into a permanent manual override. Only a new contact or
+    // a real classification change is an explicit manual judgment.
+    if classification_changed {
+        set_manual_contact_role(&state, &email, parse_role(&role))?;
+    }
     Ok(saved)
 }
 
@@ -220,4 +302,22 @@ pub async fn import_mail_contacts_to_address_book(
     }
     save_contacts(&state, &contacts)?;
     Ok(added)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_role_labels_are_removed_from_custom_tags() {
+        assert_eq!(
+            normalize_custom_tags(vec![
+                "客户".into(),
+                " 重点跟进 ".into(),
+                "供应商".into(),
+                "重点跟进".into(),
+            ]),
+            vec!["重点跟进"]
+        );
+    }
 }

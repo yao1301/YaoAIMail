@@ -1,12 +1,17 @@
-import { render, waitFor } from "@testing-library/react";
+import { act, render, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { startSync, stopSync } from "../../src/lib/api";
+import { useComposeStore } from '../../src/stores/compose.store';
+import { useConfirmStore } from '../../src/stores/confirm.store';
+import { registerDraftSaver } from '../../src/features/compose/draftPersistence';
+import { WorkspaceStateScope, trackWorkspaceSource } from '../../src/lib/workspaceState';
 
 const mocks = vi.hoisted(() => ({
   accounts: [{ id: "account-1" }, { id: "account-2" }],
   closeHandler: undefined as undefined | ((event: { preventDefault: () => void }) => void | Promise<void>),
   focusHandler: undefined as undefined | ((event: { payload: boolean }) => void),
   hide: vi.fn().mockResolvedValue(undefined),
+  destroy: vi.fn().mockResolvedValue(undefined),
   onCloseRequested: vi.fn((handler: (event: { preventDefault: () => void }) => void | Promise<void>) => {
     mocks.closeHandler = handler;
     return Promise.resolve(vi.fn());
@@ -25,6 +30,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     hide: mocks.hide,
+    destroy: mocks.destroy,
     onCloseRequested: mocks.onCloseRequested,
     onFocusChanged: mocks.onFocusChanged,
   }),
@@ -55,6 +61,8 @@ function Harness() {
 describe("useCloseToBackground", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    useComposeStore.setState({ tabs: [], tabsById: {}, activeTabId: null, composeMode: null, composeDirty: false });
+    useConfirmStore.setState({ isOpen: false, busy: false, resolve: null });
     mocks.closeHandler = undefined;
     mocks.focusHandler = undefined;
     mocks.accounts = [{ id: "account-1" }, { id: "account-2" }];
@@ -86,6 +94,23 @@ describe("useCloseToBackground", () => {
     expect(mocks.hide).toHaveBeenCalledOnce();
     expect(stopSync).not.toHaveBeenCalled();
   });
+  it('retains transferred task callbacks even when background mode is disabled', async () => {
+    const scope = new WorkspaceStateScope({'search:busy':true});
+    const release = trackWorkspaceSource(scope);
+    render(<Harness />);
+    await waitFor(() => expect(mocks.onCloseRequested).toHaveBeenCalledOnce());
+    vi.useFakeTimers();
+    try {
+      const preventDefault = vi.fn();
+      await mocks.closeHandler?.({preventDefault});
+      expect(preventDefault).toHaveBeenCalledOnce();
+      expect(mocks.hide).toHaveBeenCalledOnce();
+      expect(mocks.destroy).not.toHaveBeenCalled();
+      scope.write('search:busy',false);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+      expect(mocks.destroy).toHaveBeenCalledOnce();
+    } finally { release();vi.useRealTimers(); }
+  });
 
   it("resumes sync when the hidden window regains focus", async () => {
     render(<Harness />);
@@ -105,5 +130,21 @@ describe("useCloseToBackground", () => {
     mocks.focusHandler?.({ payload: true });
 
     expect(startSync).not.toHaveBeenCalled();
+  });
+
+  it('waits for save-and-exit before destroying a dirty window', async () => {
+    useComposeStore.setState({ composeMode: 'new', composeDirty: true });
+    const cleanup = registerDraftSaver(undefined, async () => { useComposeStore.getState().setComposeDirty(false); return 'draft'; });
+    try {
+      render(<Harness />);
+      await waitFor(() => expect(mocks.onCloseRequested).toHaveBeenCalledOnce());
+      const preventDefault = vi.fn();
+      const closing = mocks.closeHandler?.({ preventDefault });
+      expect(preventDefault).toHaveBeenCalledOnce();
+      expect(mocks.destroy).not.toHaveBeenCalled();
+      await useConfirmStore.getState().handleAlternate();
+      await closing;
+      expect(mocks.destroy).toHaveBeenCalledOnce();
+    } finally { cleanup(); }
   });
 });

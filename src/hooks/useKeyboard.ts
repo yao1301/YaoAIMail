@@ -3,7 +3,7 @@ import { useShortcutStore } from "@/stores/shortcut.store";
 import { useCommandStore } from "@/stores/command.store";
 import { useUIStore, type ActiveView } from "@/stores/ui.store";
 import { useComposeStore, isComposeDirty } from "@/stores/compose.store";
-import { useConfirmStore } from "@/stores/confirm.store";
+import { confirmComposeLeave as confirmLeaveCompose } from '@/features/compose/draftPersistence';
 import { useMailStore } from "@/stores/mail.store";
 import { useToastStore } from "@/stores/toast.store";
 import { updateMessageFlags, archiveMessage, getMessage } from "@/lib/api";
@@ -40,14 +40,6 @@ function getCachedThreads(): ThreadSummary[] {
   return [];
 }
 
-async function confirmLeaveCompose(): Promise<boolean> {
-  if (!isComposeDirty()) return true;
-  return useConfirmStore.getState().confirm({
-    title: i18n.t("compose.discardDraft", "Discard draft"),
-    message: i18n.t("compose.discardDraftConfirm", "You have an unsaved draft. Discard and leave?"),
-    destructive: true,
-  });
-}
 
 function navigateAfterComposeConfirm(view: ActiveView) {
   if (isComposeDirty()) {
@@ -91,6 +83,8 @@ export function useKeyboard() {
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
+      // Confirmation dialogs own their keys, especially Escape and Tab.
+      if (e.defaultPrevented || document.querySelector('[role="dialog"]')) return;
       // Don't interfere with shortcut recording
       if (useShortcutStore.getState().recording) return;
 

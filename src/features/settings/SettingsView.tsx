@@ -38,6 +38,16 @@ const TAB_LABEL_KEYS: Record<string, string> = {
   about: "settings.about",
 };
 
+// Explain only ambiguous destinations; keep the page's existing field help.
+const TAB_HELP: Partial<Record<SettingsTab, string>> = {
+  translation: "配置翻译和 AI 功能使用的模型、接口及密钥。写作风格在“AI 写作”设置中调整。",
+  aiWriting: "管理写作风格模板和学习设置。要生成邮件，请使用写信窗口或右侧的 AI 写作面板。",
+  workRole: "设置你的工作身份和业务范围，供 AI 理解指令。这些资料不是客户画像。",
+  knowledgeBase: "管理供 AI 参考的产品和业务资料。加入资料库不会自动把文件附到邮件中。",
+  externalServices: "配置联网搜索、网页读取和邮箱验证服务。DeepSeek 付费搜索需另外勾选开启。",
+  remoteWrites: "查看邮件操作和发送任务的处理状态，并处理暂停或失败的任务。",
+};
+
 export default function SettingsView() {
   const { t } = useTranslation();
   const activeTab = useUIStore((s) => s.settingsTab);
@@ -68,6 +78,7 @@ export default function SettingsView() {
             role="tab"
             aria-selected={activeTab === id}
             aria-controls={`settings-tabpanel-${id}`}
+            title={TAB_HELP[id]}
             tabIndex={activeTab === id ? 0 : -1}
             onClick={() => handleTabChange(id)}
             onKeyDown={(e) => {

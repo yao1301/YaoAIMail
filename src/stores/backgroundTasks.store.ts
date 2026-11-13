@@ -1,11 +1,14 @@
 import { create } from "zustand";
 import { useToastStore } from "./toast.store";
+import { reportAppError, safeErrorMessage } from "@/lib/appErrors";
 
 export type BackgroundTaskStatus = "running" | "success" | "error";
 
 export interface BackgroundTask<T = unknown> {
   id: string;
   label: string;
+  /** Lightweight native stage; retained when the originating view unmounts. */
+  progress?: string;
   status: BackgroundTaskStatus;
   /** Value returned by the runner when the task finishes. */
   result?: T;
@@ -65,7 +68,7 @@ export const useBackgroundTasksStore = create<BackgroundTasksState>((set) => ({
         }
       })
       .catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = safeErrorMessage(error);
         set((state) => ({
           tasks: {
             ...state.tasks,
@@ -77,10 +80,7 @@ export const useBackgroundTasksStore = create<BackgroundTasksState>((set) => ({
             },
           },
         }));
-        useToastStore.getState().addToast({
-          message: `${label}失败：${message}`,
-          type: "error",
-        });
+        reportAppError(error, `${label}失败`);
       });
   },
   clear: (id) =>

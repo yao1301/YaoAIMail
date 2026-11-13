@@ -7,12 +7,15 @@ import {
   addAccount,
   completeOAuthFlow,
   startSync,
+  testImapConnection,
   testPop3Connection,
+  testSmtpConnection,
 } from "../../src/lib/api";
 
 vi.mock("../../src/lib/i18n", () => ({
   default: {
-    t: (_key: string, fallback?: string) => fallback ?? _key,
+    t: (key: string, fallback?: string, values?: Record<string, string>) =>
+      (fallback ?? key).replace(/{{(\w+)}}/g, (_, name) => values?.[name] ?? ""),
   },
 }));
 
@@ -32,6 +35,7 @@ vi.mock("../../src/lib/api", () => ({
   startSync: vi.fn(),
   testImapConnection: vi.fn(),
   testPop3Connection: vi.fn(),
+  testSmtpConnection: vi.fn(),
 }));
 
 describe("AccountSetup OAuth", () => {
@@ -54,6 +58,8 @@ describe("AccountSetup OAuth", () => {
       updated_at: 1,
     });
     vi.mocked(testPop3Connection).mockResolvedValue("POP3 connection successful (0 messages)");
+    vi.mocked(testImapConnection).mockResolvedValue("IMAP connection successful");
+    vi.mocked(testSmtpConnection).mockResolvedValue("SMTP connection successful");
   });
 
   afterEach(() => {
@@ -107,6 +113,7 @@ describe("AccountSetup OAuth", () => {
       </QueryClientProvider>,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: "Advanced connection settings" }));
     fireEvent.change(screen.getByLabelText("SOCKS5 Proxy"), {
       target: { value: "127.0.0.1" },
     });
@@ -158,6 +165,7 @@ describe("AccountSetup OAuth", () => {
     fireEvent.change(screen.getByLabelText("Email address"), {
       target: { value: "legacy@example.com" },
     });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced connection settings" }));
     fireEvent.change(screen.getByLabelText("Display name"), {
       target: { value: "Legacy" },
     });
@@ -193,6 +201,7 @@ describe("AccountSetup OAuth", () => {
       );
     });
 
+    await screen.findByText(/SMTP connection successful/);
     fireEvent.click(screen.getByRole("button", { name: "Add Account & Sync" }));
 
     await waitFor(() => {
@@ -211,7 +220,7 @@ describe("AccountSetup OAuth", () => {
     });
   });
 
-  it("allows manual IMAP account submission with an empty username", async () => {
+  it("automatically fills and verifies a known mailbox using the email and password alone", async () => {
     const queryClient = new QueryClient({
       defaultOptions: {
         queries: { retry: false },
@@ -227,18 +236,12 @@ describe("AccountSetup OAuth", () => {
     fireEvent.change(screen.getByLabelText("Email address"), {
       target: { value: "user@hotmail.com" },
     });
-    fireEvent.change(screen.getByLabelText("Display name"), {
-      target: { value: "Hotmail" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Outlook" }));
-    fireEvent.change(screen.getByLabelText("Username"), {
-      target: { value: "" },
-    });
     fireEvent.change(screen.getByLabelText("Password / App password"), {
       target: { value: "app-password" },
     });
 
-    expect((screen.getByLabelText("Username") as HTMLInputElement).required).toBe(false);
+    expect(screen.queryByLabelText("Username")).toBeNull();
+    expect(screen.queryByLabelText("SMTP host")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Add Account & Sync" }));
 
@@ -246,15 +249,43 @@ describe("AccountSetup OAuth", () => {
       expect(addAccount).toHaveBeenCalledWith(
         expect.objectContaining({
           email: "user@hotmail.com",
-          display_name: "Hotmail",
+          display_name: "user",
           provider: "imap",
           imap_host: "outlook.office365.com",
           smtp_host: "smtp.office365.com",
           username: "",
           password: "app-password",
+          imap_accept_invalid_certs: false,
+          smtp_accept_invalid_certs: false,
         }),
       );
     });
+    expect(testSmtpConnection).toHaveBeenCalledWith(expect.objectContaining({
+      smtp_host: "smtp.office365.com", username: "user@hotmail.com", accept_invalid_certs: false,
+    }));
+  });
+
+  it("offers provider selection for a company domain and explains a certificate mismatch before saving", async () => {
+    vi.mocked(testSmtpConnection).mockRejectedValueOnce(new Error("TLS: invalid peer certificate: NotValidForName"));
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <AccountSetup onClose={vi.fn()} />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(screen.getByLabelText("Email address"), { target: { value: "staff@example.test" } });
+    fireEvent.change(screen.getByLabelText("Email provider"), { target: { value: "cecloud" } });
+    expect((screen.getByLabelText("Email provider") as HTMLSelectElement).value).toBe("cecloud");
+    fireEvent.change(screen.getByLabelText("Password / App password"), { target: { value: "example-pass" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add Account & Sync" }));
+    const report = await screen.findByRole("alert");
+    expect(report.textContent).toContain("收件：通过");
+    expect(report.textContent).toContain("The certificate does not match the server address.");
+    expect(report.textContent).toContain("smtp.cecloud.com:465");
+    expect(addAccount).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Email address"), { target: { value: "staff@qq.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced connection settings" }));
+    expect(screen.getByDisplayValue("smtp.qq.com")).toBeTruthy();
   });
 
   it("clears the plaintext opt-in when security switches back to encrypted", async () => {
@@ -274,6 +305,7 @@ describe("AccountSetup OAuth", () => {
     fireEvent.change(screen.getByLabelText("Email address"), {
       target: { value: "legacy@88.com" },
     });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced connection settings" }));
     fireEvent.change(screen.getByLabelText("Display name"), {
       target: { value: "Legacy" },
     });

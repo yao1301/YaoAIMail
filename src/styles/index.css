@@ -21,6 +21,11 @@
   --color-scrollbar-track: transparent;
   --color-scrollbar-thumb: rgba(26, 26, 26, 0.22);
   --color-scrollbar-thumb-hover: rgba(26, 26, 26, 0.38);
+  --theme-control-radius: 7px;
+  --theme-panel-radius: 10px;
+  --theme-border-width: 1px;
+  --theme-shadow: none;
+  --theme-transition: 150ms ease;
 }
 
 [data-theme="warm"] {
@@ -111,6 +116,238 @@
   --color-scrollbar-track: transparent;
   --color-scrollbar-thumb: rgba(255, 255, 255, 0.22);
   --color-scrollbar-thumb-hover: rgba(255, 255, 255, 0.38);
+}
+
+/* These are visual systems rather than palette swaps: each sets its own
+   surfaces, corner language, borders and response to interaction. */
+[data-theme="macos"] {
+  --app-font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+  --color-sidebar-bg: rgba(242, 244, 248, 0.82);
+  --color-sidebar-hover: rgba(221, 228, 238, 0.84);
+  --color-sidebar-active: rgba(187, 215, 255, 0.9);
+  --color-titlebar-bg: rgba(248, 249, 252, 0.84);
+  --color-main-bg: #f4f6fa;
+  --color-statusbar-bg: rgba(248, 249, 252, 0.84);
+  --color-border: rgba(91, 106, 128, 0.22);
+  --color-text-primary: #20242c;
+  --color-text-secondary: #697386;
+  --color-accent: #007aff;
+  --color-bg: rgba(255, 255, 255, 0.82);
+  --color-bg-primary: rgba(255, 255, 255, 0.86);
+  --color-bg-hover: rgba(0, 122, 255, 0.10);
+  --color-bg-secondary: rgba(89, 104, 128, 0.09);
+  --color-scrollbar-thumb: rgba(53, 67, 87, 0.24);
+  --color-scrollbar-thumb-hover: rgba(53, 67, 87, 0.42);
+  --theme-control-radius: 10px;
+  --theme-panel-radius: 16px;
+  --theme-shadow: 0 10px 28px rgba(31, 45, 67, 0.10);
+  --theme-transition: 180ms cubic-bezier(.2,.8,.2,1);
+}
+
+[data-theme="minimal"] {
+  --app-font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  --color-sidebar-bg: #fafafa;
+  --color-sidebar-hover: #f0f0f0;
+  --color-sidebar-active: #e7f2ff;
+  --color-titlebar-bg: #ffffff;
+  --color-main-bg: #ffffff;
+  --color-statusbar-bg: #ffffff;
+  --color-border: #dedede;
+  --color-text-primary: #171717;
+  --color-text-secondary: #767676;
+  --color-accent: #1769aa;
+  --color-bg: #ffffff;
+  --color-bg-primary: #ffffff;
+  --color-bg-hover: #f4f8fc;
+  --color-bg-secondary: #f7f7f7;
+  --theme-control-radius: 2px;
+  --theme-panel-radius: 2px;
+  --theme-border-width: 1px;
+  --theme-shadow: none;
+  --theme-transition: 100ms ease-out;
+}
+
+[data-theme="studio"] {
+  --app-font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  --color-sidebar-bg: #121826;
+  --color-sidebar-hover: #1d2739;
+  --color-sidebar-active: #2a3450;
+  --color-titlebar-bg: #121826;
+  --color-main-bg: #0b1020;
+  --color-statusbar-bg: #121826;
+  --color-border: #28344d;
+  --color-text-primary: #e9edff;
+  --color-text-secondary: #a8b3cb;
+  --color-accent: #8b5cf6;
+  --color-bg: #11192a;
+  --color-bg-primary: #151f33;
+  --color-bg-hover: rgba(139, 92, 246, 0.16);
+  --color-bg-secondary: rgba(151, 171, 210, 0.10);
+  --color-scrollbar-thumb: rgba(174, 149, 255, 0.38);
+  --color-scrollbar-thumb-hover: rgba(190, 169, 255, 0.68);
+  --theme-control-radius: 8px;
+  --theme-panel-radius: 12px;
+  --theme-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+  --theme-transition: 160ms cubic-bezier(.2,.75,.2,1);
+}
+
+/* Geometry is deliberately centralised so existing screens also adopt the
+   selected visual language, including their inline-styled controls. */
+[data-theme] button,
+[data-theme] input,
+[data-theme] textarea,
+[data-theme] select {
+  border-radius: var(--theme-control-radius) !important;
+  transition: background-color var(--theme-transition), border-color var(--theme-transition), box-shadow var(--theme-transition), transform var(--theme-transition);
+}
+
+[data-theme="macos"] button:not(:disabled):hover {
+  box-shadow: 0 5px 14px rgba(31, 45, 67, 0.12);
+  transform: translateY(-1px);
+}
+[data-theme="macos"] .app-shell > [data-tauri-drag-region],
+[data-theme="macos"] .app-shell-content > aside,
+[data-theme="macos"] .app-shell > footer {
+  backdrop-filter: saturate(1.3) blur(20px);
+}
+[data-theme="macos"] .app-shell-content > aside,
+[data-theme="macos"] .settings-panel-scroll {
+  box-shadow: var(--theme-shadow);
+}
+
+[data-theme="minimal"] button:not(:disabled):hover {
+  background-color: var(--color-bg-hover) !important;
+}
+[data-theme="minimal"] .app-shell-content > aside,
+[data-theme="minimal"] .app-shell > [data-tauri-drag-region],
+[data-theme="minimal"] .app-shell > footer {
+  box-shadow: none !important;
+}
+
+[data-theme="studio"] input,
+[data-theme="studio"] textarea,
+[data-theme="studio"] select,
+[data-theme="studio"] option {
+  background-color: var(--color-bg) !important;
+  color: var(--color-text-primary) !important;
+  color-scheme: dark;
+}
+[data-theme="studio"] button:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--color-accent) 70%, var(--color-border)) !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 13%, transparent);
+}
+[data-theme="studio"] button:not(:disabled):active { transform: translateY(1px); }
+
+/* Theme picker previews make the geometry difference visible before applying
+   a style. They intentionally echo each theme's layout language. */
+.theme-choice { position: relative; overflow: hidden; }
+.theme-choice__preview { display: block; position: relative; height: 58px; margin: -3px -3px 13px; overflow: hidden; border-radius: 7px; background: #edf0f5; }
+.theme-choice__preview-bar { position: absolute; inset: 0 0 auto; height: 11px; background: #d9e0ea; }
+.theme-choice__preview-sidebar { position: absolute; inset: 11px auto 0 0; width: 26%; background: #dfe6ef; }
+.theme-choice__preview-card { position: absolute; left: 34%; top: 22px; width: 44%; height: 25px; border-radius: 6px; background: #fff; box-shadow: 0 3px 8px rgba(24, 39, 61, .14); }
+.theme-choice__preview-button { position: absolute; right: 8%; bottom: 9px; width: 19%; height: 9px; border-radius: 99px; background: #007aff; }
+.theme-choice--light .theme-choice__preview { background: #f3f3f3; }
+.theme-choice--light .theme-choice__preview-bar { background: #e5e5e5; }
+.theme-choice--light .theme-choice__preview-sidebar { background: #ececec; }
+.theme-choice--light .theme-choice__preview-button { background: #d4714e; }
+.theme-choice--macos .theme-choice__preview { background: linear-gradient(135deg, #d9e8ff, #f5f7fc); }
+.theme-choice--macos .theme-choice__preview-bar { background: rgba(255,255,255,.75); backdrop-filter: blur(8px); }
+.theme-choice--macos .theme-choice__preview-sidebar { background: rgba(205,220,240,.76); }
+.theme-choice--macos .theme-choice__preview-card { border-radius: 11px; box-shadow: 0 6px 12px rgba(43,72,112,.18); }
+.theme-choice--minimal .theme-choice__preview { background: #fff; border: 1px solid #dedede; border-radius: 1px; }
+.theme-choice--minimal .theme-choice__preview-bar, .theme-choice--minimal .theme-choice__preview-sidebar { background: #fafafa; border-color: #dedede; }
+.theme-choice--minimal .theme-choice__preview-card { border: 1px solid #dedede; border-radius: 1px; box-shadow: none; }
+.theme-choice--minimal .theme-choice__preview-button { border-radius: 1px; background: #1769aa; }
+.theme-choice--studio .theme-choice__preview { background: #0b1020; }
+.theme-choice--studio .theme-choice__preview-bar { background: #171f33; }
+.theme-choice--studio .theme-choice__preview-sidebar { background: #121826; }
+.theme-choice--studio .theme-choice__preview-card { background: #151f33; border: 1px solid #2e3c5b; box-shadow: 0 5px 14px rgba(0,0,0,.32); }
+.theme-choice--studio .theme-choice__preview-button { border-radius: 3px; background: #8b5cf6; box-shadow: 0 0 8px rgba(139,92,246,.65); }
+
+/* Strong, unmistakable component language per style. Never use a global
+   pill shape: large text actions must retain a stable reading width. */
+[data-theme="macos"] button,
+[data-theme="macos"] input,
+[data-theme="macos"] textarea,
+[data-theme="macos"] select { border-radius: 10px !important; }
+[data-theme="macos"] .app-shell-content > aside { border-right: 0 !important; box-shadow: 8px 0 30px rgba(36, 55, 82, .08); }
+[data-theme="macos"] .app-shell-content > aside svg { stroke-width: 1.7; }
+[data-theme="macos"] .app-shell > [data-tauri-drag-region] { border-bottom: 1px solid rgba(91,106,128,.12); }
+[data-theme="macos"] button:not(:disabled):active { transform: scale(.97); box-shadow: none; }
+[data-theme="macos"] .sidebar-nav-button { margin: 1px 5px; padding: 8px 10px !important; }
+[data-theme="macos"] .sidebar-nav-button[data-active="true"] { box-shadow: inset 0 0 0 1px rgba(0,122,255,.15), 0 3px 9px rgba(38,72,120,.10); }
+[data-theme="macos"] .workspace-tab { margin: 4px 3px 3px; border: 1px solid transparent !important; border-radius: 8px !important; }
+[data-theme="macos"] .workspace-tab[data-active="true"] { border-color: rgba(91,106,128,.16) !important; box-shadow: 0 3px 10px rgba(35,52,78,.08); }
+
+[data-theme="minimal"] button,
+[data-theme="minimal"] input,
+[data-theme="minimal"] textarea,
+[data-theme="minimal"] select { border-radius: 0 !important; box-shadow: none !important; }
+[data-theme="minimal"] .app-shell-content > aside svg { stroke-width: 1.25; }
+[data-theme="minimal"] .app-shell > [data-tauri-drag-region] { border-bottom: 2px solid var(--color-text-primary); }
+[data-theme="minimal"] button[aria-pressed="true"],
+[data-theme="minimal"] button[aria-selected="true"] { border-left: 3px solid var(--color-accent) !important; }
+[data-theme="minimal"] button:not(:disabled):hover { transform: translateX(2px); }
+[data-theme="minimal"] .sidebar-nav-button { border-bottom: 1px solid transparent !important; padding: 8px 9px !important; }
+[data-theme="minimal"] .sidebar-nav-button[data-active="true"] {
+  border-left: 4px solid var(--color-accent) !important;
+  border-bottom-color: color-mix(in srgb, var(--color-accent) 32%, var(--color-border)) !important;
+  background: #eaf3fb !important;
+  color: #174a73 !important;
+  font-weight: 700 !important;
+  transform: none !important;
+}
+[data-theme="minimal"] .sidebar-account-button[data-active="true"] {
+  background: #eaf3fb !important;
+  color: #174a73 !important;
+  border-radius: 0 !important;
+  box-shadow: inset 4px 0 0 var(--color-accent);
+}
+.sidebar-account-toggle {
+  display: grid;
+  place-items: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  margin: -6px -10px -6px -10px;
+  border-radius: 6px;
+  color: inherit;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+.sidebar-account-toggle:hover {
+  background: color-mix(in srgb, var(--color-text-primary) 9%, transparent);
+}
+.sidebar-account-toggle:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+[data-theme="minimal"] .workspace-tab { margin: 0 !important; border-bottom: 3px solid transparent !important; }
+[data-theme="minimal"] .workspace-tab[data-active="true"] { border-bottom-color: var(--color-accent) !important; background: #fff !important; }
+
+@keyframes studio-ambient-shift { 0%, 100% { background-position: 0 0, 0 0; } 50% { background-position: 70px -35px, 0 0; } }
+@keyframes studio-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(139,92,246,.0); } 50% { box-shadow: 0 0 0 4px rgba(139,92,246,.12); } }
+[data-theme="studio"] button,
+[data-theme="studio"] input,
+[data-theme="studio"] textarea,
+[data-theme="studio"] select { border-radius: 3px !important; }
+[data-theme="studio"] .app-shell-content > aside { border-right: 1px solid #354363 !important; box-shadow: 8px 0 32px rgba(0,0,0,.22); }
+[data-theme="studio"] .app-shell-content > aside svg { stroke-width: 2.1; filter: drop-shadow(0 0 2px color-mix(in srgb, var(--color-accent) 38%, transparent)); }
+[data-theme="studio"] .app-shell > [data-tauri-drag-region] { border-bottom: 1px solid #354363; letter-spacing: .04em; }
+[data-theme="studio"] .app-main-scroll { background-image: linear-gradient(120deg, rgba(139,92,246,.075), transparent 36%), radial-gradient(circle at 82% 0%, rgba(139,92,246,.12), transparent 34%); background-color: var(--color-main-bg); background-size: 180px 180px, auto; animation: studio-ambient-shift 10s ease-in-out infinite; }
+[data-theme="studio"] button[aria-pressed="true"],
+[data-theme="studio"] button[aria-selected="true"] { animation: studio-pulse 2.2s ease-in-out infinite; }
+[data-theme="studio"] .sidebar-nav-button { margin: 3px 7px; padding: 9px 10px !important; border: 1px solid transparent !important; position: relative; }
+[data-theme="studio"] .sidebar-nav-button[data-active="true"] { border-color: color-mix(in srgb, var(--color-accent) 62%, var(--color-border)) !important; background: linear-gradient(90deg, rgba(139,92,246,.28), rgba(139,92,246,.08)) !important; box-shadow: 0 0 16px rgba(139,92,246,.16); }
+[data-theme="studio"] .sidebar-nav-button[data-active="true"]::before { content: ""; position: absolute; left: -1px; top: 20%; bottom: 20%; width: 3px; background: #c4b5fd; box-shadow: 0 0 10px #a78bfa; }
+[data-theme="studio"] .workspace-tab { margin: 4px 2px 0; border: 1px solid transparent !important; border-bottom: 0 !important; }
+[data-theme="studio"] .workspace-tab[data-active="true"] { border-color: #3c4d76 !important; background: #151f33 !important; box-shadow: inset 0 2px 0 #a78bfa; }
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="studio"] .app-main-scroll,
+  [data-theme="studio"] button[aria-pressed="true"],
+  [data-theme="studio"] button[aria-selected="true"] { animation: none; }
+  [data-theme] button { transition: none; }
 }
 
 html, body, #root {
@@ -386,6 +623,36 @@ option {
   color: var(--color-text-secondary);
 }
 
+/* 进行中图标：只在真实样式表里定义关键帧。
+   旧做法是在点击"收取邮件"时往 head 注入 <style>，没点过就完全没有关键帧，
+   侧边栏所有"XX中…"的图标于是永远静止。类名必须由真实 CSS 提供。 */
+@keyframes app-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.app-spin {
+  animation: app-spin 1s linear infinite;
+  transform-origin: 50% 50%;
+  transform-box: view-box;
+  flex-shrink: 0;
+}
+
+/* 进度图标承载的是"还在跑"这一状态信息，不是装饰。
+   系统关闭动画效果时（prefers-reduced-motion: reduce），全局规则会把所有动画
+   压成 0.01ms / 1 次，转圈图标会变成静止图像，用户以为任务卡死。
+   因此这里按"状态指示器"单独保留循环，只把速度放慢以照顾前庭敏感。 */
+@media (prefers-reduced-motion: reduce) {
+  .app-spin {
+    animation-duration: 1.6s !important;
+    animation-iteration-count: infinite !important;
+  }
+  .spinner {
+    animation-duration: 1.2s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
 .task-progress-steps {
   margin-top: 10px;
   padding: 10px 12px;
@@ -450,6 +717,106 @@ option {
 
 .message-detail-container {
   background-color: var(--color-bg);
+}
+
+/* Mail navigation, list and preview need a visible boundary in every theme,
+   including macOS where ordinary panel borders are intentionally subtle. */
+.app-shell {
+  --mail-pane-border: color-mix(in srgb, var(--color-border) 78%, var(--color-text-secondary));
+}
+
+.app-shell-content > aside.mail-folder-pane {
+  border-right: 1px solid var(--mail-pane-border) !important;
+  box-shadow: none !important;
+}
+
+.mail-list-pane {
+  background-color: var(--color-bg-primary);
+}
+
+.mail-list-pane .message-list-sortbar {
+  flex-wrap: wrap;
+  min-height: 30px;
+  border-bottom: 1px solid var(--mail-pane-border) !important;
+  background-color: var(--color-sidebar-bg) !important;
+}
+
+.mail-pane-divider {
+  position: relative;
+  flex-shrink: 0;
+  z-index: 2;
+  box-sizing: border-box;
+  background: var(--color-bg-primary);
+  border: 0;
+  box-shadow: none;
+}
+
+.mail-pane-divider::before {
+  content: "";
+  position: absolute;
+  background: var(--mail-pane-border);
+  transition: background-color 120ms ease;
+}
+
+.mail-pane-divider::after {
+  content: "";
+  position: absolute;
+  border-radius: 1px;
+  background: var(--color-accent);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.mail-pane-divider--horizontal {
+  height: 7px;
+  cursor: row-resize;
+}
+
+.mail-pane-divider--horizontal::before {
+  left: 0;
+  right: 0;
+  top: 3px;
+  height: 1px;
+}
+
+.mail-pane-divider--horizontal::after {
+  width: 28px;
+  height: 2px;
+  left: calc(50% - 14px);
+  top: 2px;
+}
+
+.mail-pane-divider--vertical {
+  width: 7px;
+  cursor: col-resize;
+}
+
+.mail-pane-divider--vertical::before {
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 1px;
+}
+
+.mail-pane-divider--vertical::after {
+  height: 28px;
+  width: 2px;
+  top: calc(50% - 14px);
+  left: 2px;
+}
+
+.mail-pane-divider:hover::before,
+.mail-pane-divider:active::before {
+  background: var(--color-accent);
+}
+
+.mail-pane-divider:hover::after,
+.mail-pane-divider:active::after {
+  opacity: .8;
+}
+
+.mail-preview-pane {
+  background: var(--color-bg);
 }
 
 .app-shell--with-background .message-detail-container {

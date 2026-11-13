@@ -1,10 +1,10 @@
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { translateText } from "@/lib/api";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
 import type { Message, RenderedHtml, TranslateResult } from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
-import { profileLocalStorage } from "@/lib/profileStorage";
+import { useTranslationTargetLanguage } from "@/lib/translationPreferences";
 
 // Translation cache: avoids re-translating on toggle or revisit (capped at 20 entries)
 const translationCache = new Map<string, TranslateResult & { _isHtml?: boolean }>();
@@ -20,16 +20,26 @@ export function useBilingualTranslation(
   const [bilingualMode, setBilingualMode] = useState(false);
   const [bilingualResult, setBilingualResult] = useState<TranslateResult | null>(null);
   const [bilingualLoading, setBilingualLoading] = useState(false);
+  const targetLanguage = useTranslationTargetLanguage();
+  const requestVersion = useRef(0);
+
+  const resetBilingual = useCallback(() => {
+    requestVersion.current++;
+    setBilingualMode(false);
+    setBilingualResult(null);
+    setBilingualLoading(false);
+  }, []);
+
+  useEffect(resetBilingual, [resetBilingual, targetLanguage]);
 
   async function handleBilingualToggle() {
     if (bilingualMode) {
-      setBilingualMode(false);
+      resetBilingual();
       return;
     }
     if (!message || !messageId) return;
 
-    const uiLang = profileLocalStorage.getItem("pebble-language") || "zh";
-    const cacheKey = `${messageId}:${uiLang}`;
+    const cacheKey = `${messageId}:${targetLanguage}`;
 
     // Check cache first
     const cached = translationCache.get(cacheKey);
@@ -39,6 +49,7 @@ export function useBilingualTranslation(
       return;
     }
 
+    const version = ++requestVersion.current;
     setBilingualMode(true);
     setBilingualLoading(true);
     try {
@@ -61,7 +72,8 @@ export function useBilingualTranslation(
         for (let start = 0; start < textNodes.length; start += CHUNK_SIZE) {
           const chunk = textNodes.slice(start, start + CHUNK_SIZE);
           const batch = chunk.map((nd) => nd.textContent!.trim()).join(SEP);
-          const result = await translateText(batch, "auto", uiLang);
+          const result = await translateText(batch, "auto", targetLanguage);
+          if (requestVersion.current !== version) return;
 
           // Split on separator; if the service preserved it, we get exact mapping
           const parts = result.translated.split("⸻").map((s) => s.trim()).filter(Boolean);
@@ -83,6 +95,9 @@ export function useBilingualTranslation(
           setBilingualResult(partial);
         }
 
+        if (targetLanguage === "ar" || targetLanguage === "he") {
+          doc.body.querySelectorAll("p, li, td, th, blockquote, h1, h2, h3, h4, h5, h6").forEach(element => element.setAttribute("dir", "rtl"));
+        }
         const final_ = { translated: sanitizeHtml(doc.body.innerHTML), segments: [], _isHtml: true } as TranslateResult & { _isHtml?: boolean };
         setBilingualResult(final_);
         if (translationCache.size >= TRANSLATION_CACHE_MAX) {
@@ -94,7 +109,8 @@ export function useBilingualTranslation(
         const textToTranslate = message.body_text
           || new DOMParser().parseFromString(message.body_html_raw || "", "text/html").body.textContent
           || "";
-        const result = { ...await translateText(textToTranslate, "auto", uiLang), _isHtml: false } as TranslateResult & { _isHtml?: boolean };
+        const result = { ...await translateText(textToTranslate, "auto", targetLanguage), _isHtml: false } as TranslateResult & { _isHtml?: boolean };
+        if (requestVersion.current !== version) return;
         setBilingualResult(result);
         if (translationCache.size >= TRANSLATION_CACHE_MAX) {
           translationCache.delete(translationCache.keys().next().value!);
@@ -102,17 +118,12 @@ export function useBilingualTranslation(
         translationCache.set(cacheKey, result);
       }
     } catch (err) {
+      if (requestVersion.current !== version) return;
       console.error("Translation failed:", err);
       addToast({ message: `Translation failed: ${extractErrorMessage(err)}`, type: "error" });
     } finally {
-      setBilingualLoading(false);
+      if (requestVersion.current === version) setBilingualLoading(false);
     }
-  }
-
-  /** Reset bilingual state (call when messageId changes) */
-  function resetBilingual() {
-    setBilingualMode(false);
-    setBilingualResult(null);
   }
 
   return { bilingualMode, bilingualResult, bilingualLoading, handleBilingualToggle, resetBilingual };

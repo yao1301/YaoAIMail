@@ -4,6 +4,7 @@ export type ToastType = "success" | "error" | "info";
 
 export interface Toast {
   id: string;
+  title?: string;
   message: string;
   type: ToastType;
   duration?: number;
@@ -22,9 +23,12 @@ export const useToastStore = create<ToastState>((set) => ({
   toasts: [],
 
   addToast: (toast) => {
+    const existing = useToastStore.getState().toasts.find((t) => t.type === toast.type && t.message === toast.message && t.title === toast.title);
+    if (existing) return;
     const id = String(++nextId);
-    set((s) => ({ toasts: [...s.toasts, { ...toast, id }] }));
+    set((s) => ({ toasts: [...s.toasts.slice(-4), { ...toast, id }] }));
     const duration = toast.duration ?? (toast.type === "error" ? 5000 : 3000);
+    if (duration === 0) return; // Persistent, user-dismissible error/warning.
     setTimeout(() => {
       set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
     }, duration);

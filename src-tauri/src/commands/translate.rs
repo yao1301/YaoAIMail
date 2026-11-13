@@ -146,28 +146,9 @@ fn validate_provider_config(
     }
 }
 
-/// Validate that a translate endpoint URL is safe (HTTPS required, HTTP only for localhost).
+/// Explicitly configured endpoints may use HTTP on trusted local/private IPs.
 fn validate_translate_url(url: &str) -> std::result::Result<(), PebbleError> {
-    if url.starts_with("https://") {
-        return Ok(());
-    }
-    if let Some(after_scheme) = url.strip_prefix("http://") {
-        // Extract host from http://host[:port]/...
-        let host = after_scheme
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .split(':')
-            .next()
-            .unwrap_or("");
-        if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
-            return Ok(());
-        }
-        return Err(PebbleError::Validation(
-            "Only HTTPS URLs are allowed for remote services".into(),
-        ));
-    }
-    Err(PebbleError::Validation("Unsupported URL scheme".into()))
+    pebble_translate::endpoint::validate_service_endpoint(url).map_err(PebbleError::Validation)
 }
 
 #[tauri::command]
@@ -182,13 +163,21 @@ pub async fn test_translate_connection(
     validate_provider_config(&provider_config)?;
 
     let proxy = get_global_proxy_raw(&state.crypto, &state.store)?;
-    let result = TranslateService::translate_with_proxy(
-        &provider_config,
-        proxy.as_ref(),
-        "Hello",
-        "en",
-        "zh",
-    )
-    .await?;
-    Ok(result.translated)
+    TranslateService::test_connection(&provider_config, proxy.as_ref()).await?;
+    Ok("连接成功".into())
+}
+
+#[tauri::command]
+pub async fn list_llm_models(state: State<'_, AppState>, config: String) -> std::result::Result<Vec<String>, PebbleError> {
+    let config: TranslateProviderConfig = serde_json::from_str(&config)
+        .map_err(|_| PebbleError::Validation("模型配置无效，请检查接口地址".into()))?;
+    let TranslateProviderConfig::LLM { providers, active_id } = &config else {
+        return Err(PebbleError::Validation("请选择 AI 模型配置".into()));
+    };
+    let provider = providers.iter().find(|p| &p.id == active_id)
+        .ok_or_else(|| PebbleError::Validation("未选择有效的模型配置".into()))?;
+    validate_translate_url(&provider.base_url)?;
+    let proxy = get_global_proxy_raw(&state.crypto, &state.store)?;
+    let client = TranslateService::http_client_for_config(&config, proxy.as_ref())?;
+    pebble_translate::models::list_models(&client, &provider.base_url, &provider.api_key, &provider.chat_path).await
 }

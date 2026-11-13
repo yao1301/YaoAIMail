@@ -19,7 +19,7 @@ impl ImapMailProvider {
     }
 
     /// Access the underlying ImapProvider for IMAP-specific operations
-    /// (e.g., fetch_messages_raw, fetch_flags, fetch_all_uids used by sync).
+    /// (e.g., fetch_messages_raw, fetch_flags, fetch_uid_inventory used by sync).
     pub fn inner(&self) -> &ImapProvider {
         &self.inner
     }

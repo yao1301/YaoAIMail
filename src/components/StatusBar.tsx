@@ -6,7 +6,8 @@ import { AlertCircle, AppWindow, Clock, Mail, RefreshCw } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useUIStore, type RealtimeStatus } from "../stores/ui.store";
 import { useMailStore } from "@/stores/mail.store";
-import { useToastStore } from "@/stores/toast.store";
+import { mailAccountTitle, safeErrorMessage } from "@/lib/appErrors";
+import { pendingSummaryFailure, reportMailFailure } from "@/lib/mailErrorNotifications";
 import { listFolders, stopSync } from "@/lib/api";
 import { useSyncMutation } from "@/hooks/mutations/useSyncMutation";
 import {
@@ -16,13 +17,14 @@ import {
   usePendingMailOpsSummary,
 } from "@/hooks/queries";
 import { useFolderUnreadCountsForAccounts } from "@/hooks/queries/useFolderUnreadCounts";
-import { allAccountsFolderId, unreadCountForFolder } from "@/lib/folderAggregation";
+import { unreadCountForAllUnread } from "@/lib/folderAggregation";
 import {
   currentFolderCacheRevision,
   setFolderCacheIfCurrent,
 } from "@/lib/folderCache";
 
 interface MailErrorPayload {
+  account_id?: string;
   error_type: string;
   message: string;
   timestamp: number;
@@ -71,7 +73,7 @@ export default function StatusBar() {
   const accountIds = accounts.map((a) => a.id);
   const { data: folders = [] } = useFoldersForAccountsQuery(accountIds);
   const { data: unreadCounts = {} } = useFolderUnreadCountsForAccounts(accountIds);
-  const totalUnread = unreadCountForFolder(allAccountsFolderId("inbox"), folders, unreadCounts);
+  const totalUnread = unreadCountForAllUnread(folders, unreadCounts);
   const [newMailFlash, setNewMailFlash] = useState(0);
   const syncStatusRef = useRef(syncStatus);
   const [syncProgress, setSyncProgress] = useState<{ total: number; received: number } | null>(null);
@@ -88,22 +90,18 @@ export default function StatusBar() {
   // Listen for mail:error events from Rust backend
   useEffect(() => {
     const unlisten = listen<MailErrorPayload>("mail:error", (event) => {
-      setLastMailError(event.payload.message);
-      useToastStore.getState().addToast({
-        message: t("status.mailErrorDetail", {
-          defaultValue: "Mail sync failed: {{message}}",
-          message: event.payload.message,
-        }),
-        type: "error",
-        duration: 12_000,
-      });
-      // Auto-clear error after 10 seconds
-      setTimeout(() => setLastMailError(null), 10_000);
+      setLastMailError(`${mailAccountTitle(event.payload.account_id, accounts)}：${safeErrorMessage(event.payload.message)}`);
     });
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [setLastMailError, t]);
+  }, [setLastMailError, accounts]);
+
+  useEffect(() => {
+    if (!pendingOpsSummary || accounts.length === 0) return;
+    const failure = pendingSummaryFailure(pendingOpsSummary, activeAccountId);
+    if (failure) reportMailFailure(failure, accounts);
+  }, [pendingOpsSummary?.last_error, pendingOpsSummary?.last_error_operation_id, pendingOpsSummary?.last_error_account_id, pendingOpsSummary?.last_error_op_type, activeAccountId, accounts]);
 
   async function refreshFolderCache(accountId?: string | null) {
     const ids = accountId ? [accountId] : accountIds;
@@ -165,21 +163,22 @@ export default function StatusBar() {
       } else if (status === "completed") {
         setSyncProgress(null);
         updateSyncStatus("idle");
+        setLastMailError(null);
         void refreshMailQueries(account_id);
       } else if (status === "error") {
         setSyncProgress(null);
         updateSyncStatus("error");
         if (message) {
-          setLastMailError(message);
+          setLastMailError(`${mailAccountTitle(account_id, accounts)}：${safeErrorMessage(message)}`);
         }
       }
     });
     return () => { unlisten.then((fn) => fn()); };
-  }, [activeAccountId, setLastMailError, setSyncStatus, queryClient]);
+  }, [activeAccountId, setLastMailError, setSyncStatus, queryClient, accounts]);
 
   // Listen for new mail events: incremental data refresh + flash badge
   useEffect(() => {
-    const unlisten = listen<MailNewPayload>("mail:new", (event) => {
+    const refresh = (event: { payload: MailNewPayload }) => {
       queryClient.invalidateQueries({ queryKey: ["messages"] });
       queryClient.invalidateQueries({ queryKey: ["threads"] });
       if (event.payload.account_id) {
@@ -187,9 +186,13 @@ export default function StatusBar() {
         queryClient.invalidateQueries({ queryKey: ["folder-unread-counts", event.payload.account_id] });
       }
       queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
+    };
+    const unlistenNew = listen<MailNewPayload>("mail:new", (event) => {
+      refresh(event);
       setNewMailFlash((n) => n + 1);
     });
-    return () => { unlisten.then((fn) => fn()); };
+    const unlistenChanged = listen<MailNewPayload>("mail:messages-changed", refresh);
+    return () => { void unlistenNew.then((fn) => fn()); void unlistenChanged.then((fn) => fn()); };
   }, [queryClient]);
 
   // Listen for bulk flag changes (mark_all_read etc.) so the UI reflects the
@@ -331,9 +334,7 @@ export default function StatusBar() {
             <RefreshCw
               aria-hidden="true"
               size={13}
-              style={{
-                animation: syncStatus === "syncing" ? "spin 1s linear infinite" : "none",
-              }}
+              className={syncStatus === "syncing" ? "app-spin" : undefined}
             />
           </button>
           {pendingRemoteWrites > 0 && (
@@ -342,12 +343,13 @@ export default function StatusBar() {
               aria-live={failedRemoteWrites > 0 ? "assertive" : "polite"}
               aria-atomic="true"
               className="flex items-center gap-1 truncate"
-              title={pendingOpsSummary?.last_error ?? pendingRemoteText}
+              title={pendingOpsSummary?.last_error ? `${mailAccountTitle(pendingOpsSummary.last_error_account_id ?? activeAccountId, accounts)}：${safeErrorMessage(pendingOpsSummary.last_error)}` : pendingRemoteText}
+              onClick={() => { useUIStore.getState().setSettingsTab("remoteWrites"); useUIStore.getState().setActiveView("settings"); }}
               style={{
                 color: failedRemoteWrites > 0
                   ? "var(--color-warning, #d97706)"
                   : "var(--color-text-secondary)",
-                maxWidth: "220px",
+                maxWidth: "220px", cursor: "pointer",
               }}
             >
               {failedRemoteWrites > 0 ? <AlertCircle aria-hidden="true" size={13} /> : <Clock aria-hidden="true" size={13} />}

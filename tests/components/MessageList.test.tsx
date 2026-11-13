@@ -1,7 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Account, Folder, MessageSummary } from "../../src/lib/api";
 import { useMailStore } from "../../src/stores/mail.store";
+import { MessageDeletionNavigationContext, useMessageDeletionNavigation } from "../../src/hooks/useMessageDeletionNavigation";
+import { useMailSortStore } from "../../src/stores/mailSort.store";
+import { sortMessages } from "../../src/lib/sortMessages";
 
 const mocks = vi.hoisted(() => ({
   accounts: [] as Account[],
@@ -12,11 +15,14 @@ const mocks = vi.hoisted(() => ({
   getMessageLabelsBatch: vi.fn(),
   batchArchive: vi.fn(),
   batchDelete: vi.fn(),
+  deleteMessage: vi.fn(),
   batchMarkRead: vi.fn(),
   batchStar: vi.fn(),
   addToast: vi.fn(),
   confirm: vi.fn(),
+  sendDrafts: vi.fn(),
 }));
+vi.mock('../../src/hooks/useSendDrafts',()=>({useSendDrafts:()=>({sendDrafts:mocks.sendDrafts,sending:false})}));
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -42,6 +48,7 @@ vi.mock("@tanstack/react-virtual", () => ({
         start: index * 76,
       })),
     measureElement: vi.fn(),
+    measure: vi.fn(),
     scrollToIndex: vi.fn(),
   }),
 }));
@@ -57,6 +64,7 @@ vi.mock("../../src/lib/api", () => ({
   getMessageLabelsBatch: mocks.getMessageLabelsBatch,
   batchArchive: mocks.batchArchive,
   batchDelete: mocks.batchDelete,
+  deleteMessage: mocks.deleteMessage,
   batchMarkRead: mocks.batchMarkRead,
   batchStar: mocks.batchStar,
 }));
@@ -126,7 +134,26 @@ function makeMessage(id: string): MessageSummary {
   };
 }
 
+function NavigableList({ messages }: { messages: MessageSummary[] }) {
+  const sort = useMailSortStore(s => s.sort);
+  const prepare = useMessageDeletionNavigation(sortMessages(messages, sort).map(message => message.id));
+  const selectedId = useMailStore(s => s.selectedMessageId);
+  return <MessageDeletionNavigationContext.Provider value={prepare}>
+    <MessageList messages={messages} selectedMessageId={selectedId} onSelectMessage={id => useMailStore.getState().selectMessage(id)} loading={false} />
+  </MessageDeletionNavigationContext.Provider>;
+}
+
 describe("MessageList", () => {
+  it('offers Send in the batch toolbar only when every selected message is a draft',()=>{
+    const drafts=[{...makeMessage('m-1'),is_draft:true},{...makeMessage('m-2'),is_draft:true}];
+    useMailStore.setState({batchMode:true,selectedMessageIds:new Set(['m-1','m-2'])});
+    const view=render(<MessageList messages={drafts} selectedMessageId={null} onSelectMessage={vi.fn()} loading={false}/>);
+    const send=screen.getByRole('button',{name:'发送选中的草稿'});expect(send.textContent).toBe('');
+    expect(send.style.padding).toBe(screen.getByRole('button',{name:'messageActions.archive'}).style.padding);
+    fireEvent.click(send);expect(mocks.sendDrafts).toHaveBeenCalledWith(['m-1','m-2']);
+    view.rerender(<MessageList messages={[drafts[0],{...drafts[1],is_draft:false}]} selectedMessageId={null} onSelectMessage={vi.fn()} loading={false}/>);
+    expect(screen.queryByRole('button',{name:'发送选中的草稿'})).toBeNull();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.accounts = [
@@ -157,6 +184,8 @@ describe("MessageList", () => {
     ];
     mocks.batchArchive.mockResolvedValue(1);
     mocks.batchDelete.mockResolvedValue(1);
+    mocks.deleteMessage.mockReset().mockResolvedValue(undefined);
+    useMailSortStore.setState({ sort: { key: "date", dir: "desc" } });
     mocks.batchMarkRead.mockResolvedValue(1);
     mocks.batchStar.mockResolvedValue(1);
     mocks.confirm.mockResolvedValue(true);
@@ -181,6 +210,65 @@ describe("MessageList", () => {
       selectedMessageIds: new Set(),
       batchMode: false,
     });
+  });
+
+  it("Delete advances to the next preview in the displayed date order", async () => {
+    useMailStore.setState({ selectedMessageId: "b" });
+    const messages = [makeMessage("a"), makeMessage("b"), makeMessage("c")];
+    messages[0].date = 1; messages[1].date = 2; messages[2].date = 3;
+    render(<NavigableList messages={messages} />);
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    await waitFor(() => expect(useMailStore.getState().selectedMessageId).toBe("a"));
+    expect(mocks.deleteMessage).toHaveBeenCalledWith("b");
+  });
+
+  it("batch Delete skips all removed rows and uses subject order", async () => {
+    useMailSortStore.setState({ sort: { key: "subject", dir: "asc" } });
+    useMailStore.setState({ selectedMessageId: "a", selectedMessageIds: new Set(["a", "b"]), batchMode: true });
+    render(<NavigableList messages={[makeMessage("c"), makeMessage("b"), makeMessage("a")]} />);
+    fireEvent.click(screen.getByRole("button", { name: "common.delete" }));
+    await waitFor(() => expect(useMailStore.getState().selectedMessageId).toBe("c"));
+    expect(mocks.deleteMessage.mock.calls).toEqual([["a"], ["b"]]);
+  });
+
+  it("switches preview while the server delete is still pending and rolls back a failure", async () => {
+    let reject!: (reason: Error) => void;
+    mocks.deleteMessage.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
+    useMailStore.setState({ selectedMessageId: "b" });
+    render(<NavigableList messages={[makeMessage("a"), makeMessage("b"), makeMessage("c")]} />);
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    expect(mocks.deleteMessage).toHaveBeenCalledWith("b");
+    expect(useMailStore.getState().selectedMessageId).toBe("c");
+    expect(screen.queryByTestId("message-b")).toBeNull();
+    await act(async () => { reject(new Error("offline")); });
+    expect(useMailStore.getState().selectedMessageId).toBe("b");
+    expect(screen.getByTestId("message-b")).toBeTruthy();
+    expect(mocks.addToast).toHaveBeenCalledWith(expect.objectContaining({ type: "error" }));
+    expect(mocks.addToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: "success" }));
+  });
+
+  it("does not wait for the entire batch before advancing", async () => {
+    let resolve!: () => void;
+    mocks.deleteMessage.mockImplementationOnce(() => new Promise<void>(done => { resolve = done; }));
+    useMailSortStore.setState({ sort: { key: "subject", dir: "asc" } });
+    useMailStore.setState({ selectedMessageId: "a", selectedMessageIds: new Set(["a", "b"]), batchMode: true });
+    render(<NavigableList messages={[makeMessage("a"), makeMessage("b"), makeMessage("c")]} />);
+    fireEvent.click(screen.getByRole("button", { name: "common.delete" }));
+    await waitFor(() => expect(mocks.deleteMessage).toHaveBeenCalledWith("a"));
+    expect(useMailStore.getState().selectedMessageId).toBe("c");
+    expect(mocks.deleteMessage).not.toHaveBeenCalledWith("b");
+    await act(async () => { resolve(); });
+    expect(mocks.deleteMessage).toHaveBeenCalledWith("b");
+  });
+
+  it("keeps a failed selected row visible and selected after Delete", async () => {
+    mocks.deleteMessage.mockRejectedValueOnce(new Error("offline"));
+    useMailStore.setState({ selectedMessageId: "b" });
+    render(<NavigableList messages={[makeMessage("a"), makeMessage("b"), makeMessage("c")]} />);
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    await waitFor(() => expect(mocks.addToast).toHaveBeenCalled());
+    expect(useMailStore.getState().selectedMessageId).toBe("b");
+    expect(screen.getByTestId("message-b")).toBeTruthy();
   });
 
   it("does not show Load more just because the current page has 50 messages", () => {

@@ -71,7 +71,7 @@ fn normalized_account_ids(ids: Option<Vec<String>>, legacy_id: Option<&str>) -> 
     if values.is_empty() { None } else { Some(values) }
 }
 
-fn item_applies_to_account(item: &KnowledgeItem, account_id: &str) -> bool {
+pub(crate) fn item_applies_to_account(item: &KnowledgeItem, account_id: &str) -> bool {
     normalized_account_ids(item.account_ids.clone(), item.account_id.as_deref())
         .is_none_or(|ids| ids.iter().any(|id| id == account_id))
 }
@@ -89,7 +89,7 @@ pub struct KnowledgeSnippet {
     pub section: String,
 }
 
-fn load_items(state: &AppState) -> Result<Vec<KnowledgeItem>, PebbleError> {
+pub(crate) fn load_items(state: &AppState) -> Result<Vec<KnowledgeItem>, PebbleError> {
     let Some(encrypted) = state.store.get_secure_user_data(KNOWLEDGE_BASE_KEY)? else { return Ok(Vec::new()); };
     let decrypted = state.crypto.decrypt(&encrypted)?;
     serde_json::from_slice(&decrypted).map_err(|error| PebbleError::Internal(format!("Invalid local knowledge base: {error}")))

@@ -95,7 +95,7 @@ pub async fn apply_rules_to_folder(
     std::thread::spawn(move || {
         let result = (|| -> std::result::Result<ApplyRulesReport, PebbleError> {
             // 从 folder_id 反查真实所属账号，再加载该账号规则——避免前端选错账号导致
-            // 整个 RSG 规则被 account_id 过滤掉、processed=0 误导用户。如果前端传了
+            // 整个跨账号规则被 account_id 过滤掉、processed=0 误导用户。如果前端传了
             // account_id 但和 folder 所属账号不一致，给出明确警告而非静默 0。
             let folder = store.get_folder(&folder_id)?;
             let resolved_account_id = folder

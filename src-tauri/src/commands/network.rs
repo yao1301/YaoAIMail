@@ -7,6 +7,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tauri::State;
 
 const GLOBAL_PROXY_KEY: &str = "global_network_proxy";
+// Keep the existing key for AI/web access. Mail must never inherit it.
+const MAIL_PROXY_KEY: &str = "mail_network_proxy";
+const MAIL_SHARED_PROXY_KEY: &str = "mail_uses_shared_proxy";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -172,6 +175,43 @@ pub(crate) fn set_global_proxy_raw(
     }
 }
 
+pub(crate) fn get_mail_proxy_raw(
+    crypto: &CryptoService,
+    store: &Store,
+) -> Result<Option<HttpProxyConfig>, PebbleError> {
+    if let Some(enabled) = decrypt_json::<bool>(crypto, store, MAIL_SHARED_PROXY_KEY)? {
+        return if enabled { get_global_proxy_raw(crypto, store) } else { Ok(None) };
+    }
+    // Until the user saves the unified page, retain existing mail behavior.
+    decrypt_json(crypto, store, MAIL_PROXY_KEY)
+}
+
+pub(crate) fn save_shared_proxy_settings_raw(
+    crypto: &CryptoService, store: &Store, proxy: Option<HttpProxyConfig>, mail_use_proxy: bool,
+) -> Result<(), PebbleError> {
+    if mail_use_proxy && proxy.is_none() {
+        return Err(PebbleError::Validation("请先填写统一代理地址和端口".into()));
+    }
+    if let Some(ref proxy) = proxy { proxy.validate().map_err(PebbleError::Network)?; }
+    let encrypted_proxy = proxy.as_ref().map(|p| serde_json::to_vec(p)
+        .map_err(|_| PebbleError::Internal("代理配置序列化失败".into()))
+        .and_then(|bytes| crypto.encrypt(&bytes))).transpose()?;
+    let encrypted_mail_use = crypto.encrypt(if mail_use_proxy { b"true" } else { b"false" })?;
+    store.set_secure_user_data_batch(&[
+        (GLOBAL_PROXY_KEY, encrypted_proxy.as_deref()),
+        (MAIL_SHARED_PROXY_KEY, Some(&encrypted_mail_use)),
+        (MAIL_PROXY_KEY, None),
+    ])
+}
+
+#[tauri::command]
+pub async fn save_shared_proxy_settings(
+    state: State<'_, AppState>, proxy_host: Option<String>, proxy_port: Option<u16>, mail_use_proxy: bool,
+) -> Result<(), PebbleError> {
+    let proxy = proxy_config_from_parts(proxy_host, proxy_port, "Proxy")?;
+    save_shared_proxy_settings_raw(&state.crypto, &state.store, proxy, mail_use_proxy)
+}
+
 pub(crate) fn resolve_mail_proxy_from_mode(
     crypto: &CryptoService,
     store: &Store,
@@ -179,7 +219,7 @@ pub(crate) fn resolve_mail_proxy_from_mode(
     account_proxy: Option<ProxyConfig>,
 ) -> Result<Option<ProxyConfig>, PebbleError> {
     let account_proxy = account_proxy.as_ref().map(http_proxy_from_mail_proxy);
-    let global_proxy = get_global_proxy_raw(crypto, store)?;
+    let global_proxy = get_mail_proxy_raw(crypto, store)?;
     Ok(
         resolve_effective_proxy_setting(mode, account_proxy, global_proxy)
             .map(mail_proxy_from_http),
@@ -208,6 +248,25 @@ pub async fn update_global_proxy(
 ) -> Result<(), PebbleError> {
     let proxy = proxy_config_from_parts(proxy_host, proxy_port, "Global proxy")?;
     set_global_proxy_raw(&state.crypto, &state.store, proxy)
+}
+
+#[tauri::command]
+pub async fn get_mail_proxy(state: State<'_, AppState>) -> Result<Option<HttpProxyConfig>, PebbleError> {
+    get_mail_proxy_raw(&state.crypto, &state.store)
+}
+
+#[tauri::command]
+pub async fn update_mail_proxy(
+    state: State<'_, AppState>,
+    proxy_host: Option<String>,
+    proxy_port: Option<u16>,
+) -> Result<(), PebbleError> {
+    // Validate first, then atomically replace the compatibility setting.
+    let proxy = proxy_config_from_parts(proxy_host, proxy_port, "Mail proxy")?;
+    let encrypted = proxy.as_ref().map(|p| serde_json::to_vec(p)
+        .map_err(|_| PebbleError::Internal("代理配置序列化失败".into()))
+        .and_then(|bytes| state.crypto.encrypt(&bytes))).transpose()?;
+    state.store.set_secure_user_data_batch(&[(MAIL_SHARED_PROXY_KEY, None), (MAIL_PROXY_KEY, encrypted.as_deref())])
 }
 
 #[cfg(test)]
@@ -269,5 +328,51 @@ mod tests {
             resolve_effective_proxy_setting(AccountProxyMode::Disabled, None, global),
             None
         );
+    }
+
+    #[test]
+    fn legacy_mail_settings_are_preserved_then_shared_proxy_requires_explicit_mail_opt_in() {
+        let dir = std::env::temp_dir().join(format!("pebble-proxy-test-{}", pebble_core::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("portable-key"), format!("PEBBLE-PORTABLE-KEY-V1\n{}\n", "00".repeat(32))).unwrap();
+        let crypto = CryptoService::init_for_profile(&dir).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let ai = HttpProxyConfig { host: "127.0.0.1".into(), port: 11001 };
+        set_global_proxy_raw(&crypto, &store, Some(ai.clone())).unwrap();
+        assert_eq!(get_mail_proxy_raw(&crypto, &store).unwrap(), None);
+        assert!(resolve_mail_proxy_from_mode(&crypto, &store, AccountProxyMode::Inherit, None).unwrap().is_none());
+        let mail = HttpProxyConfig { host: "127.0.0.1".into(), port: 11002 };
+        encrypt_json(&crypto, &store, MAIL_PROXY_KEY, &mail).unwrap();
+        assert_eq!(get_global_proxy_raw(&crypto, &store).unwrap(), Some(ai));
+        assert_eq!(resolve_mail_proxy_from_mode(&crypto, &store, AccountProxyMode::Inherit, None).unwrap().unwrap().port, 11002);
+        assert!(resolve_mail_proxy_from_mode(&crypto, &store, AccountProxyMode::Disabled, None).unwrap().is_none());
+        store.delete_secure_user_data(MAIL_PROXY_KEY).unwrap();
+        assert!(get_mail_proxy_raw(&crypto, &store).unwrap().is_none());
+        let shared = HttpProxyConfig { host: "127.0.0.1".into(), port: 11003 };
+        save_shared_proxy_settings_raw(&crypto,&store,Some(shared.clone()),false).unwrap();
+        assert_eq!(get_global_proxy_raw(&crypto,&store).unwrap(),Some(shared.clone()));
+        assert!(get_mail_proxy_raw(&crypto,&store).unwrap().is_none());
+        assert!(save_shared_proxy_settings_raw(&crypto,&store,None,true).is_err());
+        assert_eq!(get_global_proxy_raw(&crypto,&store).unwrap(),Some(shared.clone()));
+        assert!(get_mail_proxy_raw(&crypto,&store).unwrap().is_none());
+        save_shared_proxy_settings_raw(&crypto,&store,Some(shared.clone()),true).unwrap();
+        assert_eq!(get_mail_proxy_raw(&crypto,&store).unwrap(),Some(shared.clone()));
+        assert!(store.get_secure_user_data(MAIL_PROXY_KEY).unwrap().is_none());
+        let custom=ProxyConfig{host:"127.0.0.1".into(),port:11004};
+        assert_eq!(resolve_mail_proxy_from_mode(&crypto,&store,AccountProxyMode::Custom,Some(custom)).unwrap().unwrap().port,11004);
+        shared_encrypted_assertions(&crypto,&store);
+        save_shared_proxy_settings_raw(&crypto,&store,None,false).unwrap();
+        assert!(get_mail_proxy_raw(&crypto,&store).unwrap().is_none());
+        assert!(get_global_proxy_raw(&crypto,&store).unwrap().is_none());
+        std::fs::remove_file(dir.join("portable-key")).unwrap(); std::fs::remove_dir(dir).unwrap();
+    }
+
+    fn shared_encrypted_assertions(crypto: &CryptoService, store: &Store) {
+        let changed=HttpProxyConfig{host:"127.0.0.1".into(),port:11005};
+        set_global_proxy_raw(crypto,store,Some(changed.clone())).unwrap();
+        assert_eq!(get_mail_proxy_raw(crypto,store).unwrap(),Some(changed));
+        assert!(resolve_mail_proxy_from_mode(crypto,store,AccountProxyMode::Disabled,None).unwrap().is_none());
+        assert!(serde_json::from_slice::<serde_json::Value>(&store.get_secure_user_data(GLOBAL_PROXY_KEY).unwrap().unwrap()).is_err());
+        assert!(serde_json::from_slice::<serde_json::Value>(&store.get_secure_user_data(MAIL_SHARED_PROXY_KEY).unwrap().unwrap()).is_err());
     }
 }

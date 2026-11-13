@@ -8,11 +8,16 @@ pub mod folders;
 pub mod kanban;
 pub mod labels;
 pub mod messages;
+pub mod local_messages;
+pub mod remote_history;
+pub mod send_completion;
 pub mod migrations;
 pub mod pending_ops;
 pub mod rules;
 pub mod search_pending;
 pub mod secure_user_data;
+pub mod workbench_drafts;
+pub mod workbench_schedule;
 pub mod snooze;
 pub mod sync_failures;
 pub mod translate_config;
@@ -113,7 +118,8 @@ impl Store {
             .write_pool
             .get()
             .map_err(|e| PebbleError::Internal(format!("Pool error: {e}")))?;
-        migrations::run_migrations(&conn)
+        migrations::run_migrations(&conn)?;
+        remote_history::initialize(&conn)
     }
 
     /// Obtain a read-only connection from the pool.

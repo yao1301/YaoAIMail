@@ -110,6 +110,45 @@ describe("buildComposeEditorContent", () => {
     expect(appendReplyQuoteHtml("<p>Reply</p>", "")).toBe("<p>Reply</p>");
   });
 
+  it("keeps cid: references when the quote is built from the raw stored HTML", () => {
+    const quote = buildReplyQuoteHtml({
+      composeReplyTo: makeMessage({
+        body_html_raw: '<img src="cid:image001.png@example"><p>body</p>',
+      }),
+      t,
+    });
+    expect(quote).toContain('src="cid:image001.png@example"');
+  });
+
+  it("uses the cid-hydrated HTML for the reply quote when provided", () => {
+    const hydrated = '<img src="data:image/png;base64,AAAA"><p>body</p>';
+    const quote = buildReplyQuoteHtml({
+      composeReplyTo: makeMessage({
+        body_html_raw: '<img src="cid:image001.png@example"><p>body</p>',
+      }),
+      t,
+      hydratedBodyHtml: hydrated,
+    });
+    expect(quote).toContain('src="data:image/png;base64,AAAA"');
+    expect(quote).not.toContain("cid:");
+  });
+
+  it("uses the cid-hydrated HTML for forwarded bodies when provided", () => {
+    const hydrated = '<p>fw</p><img src="data:image/png;base64,AAAA">';
+    const content = buildComposeEditorContent({
+      composeMode: "forward",
+      composeReplyTo: makeMessage({
+        body_html_raw: '<p>fw</p><img src="cid:image001.png@example">',
+      }),
+      isReply: false,
+      signatureHtml: "",
+      t,
+      hydratedBodyHtml: hydrated,
+    });
+    expect(content).toContain('src="data:image/png;base64,AAAA"');
+    expect(content).not.toContain("cid:");
+  });
+
   it("keeps a captured reply quote available after the live reply target changes", () => {
     const captured = buildReplyQuoteHtml({
       composeReplyTo: makeMessage({ body_text: "Original incoming message" }),

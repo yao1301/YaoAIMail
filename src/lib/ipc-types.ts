@@ -95,11 +95,18 @@ export interface PendingMailOpsSummary {
   total_active_count: number;
   last_error: string | null;
   updated_at: number | null;
+  last_error_operation_id?: string | null;
+  last_error_account_id?: string | null;
+  last_error_op_type?: string | null;
 }
 
 export type PendingMailOpStatus = "pending" | "in_progress" | "failed";
 
 export interface PendingMailOp {
+  dismissed?: boolean;
+  duplicate_submission?: boolean;
+  server_accepted?: boolean;
+  workbench_schedule?: boolean;
   id: string;
   account_id: string;
   message_id: string;
@@ -179,6 +186,8 @@ export interface AddAccountRequest {
   imap_security: ConnectionSecurity;
   smtp_security: ConnectionSecurity;
   accept_invalid_certs?: boolean;
+  imap_accept_invalid_certs?: boolean;
+  smtp_accept_invalid_certs?: boolean;
   allow_plaintext?: boolean;
   proxy_host?: string;
   proxy_port?: number;

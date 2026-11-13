@@ -4,9 +4,8 @@ import { Copy, Check, X } from "lucide-react";
 import { translateText } from "@/lib/api";
 import { profileLocalStorage } from "@/lib/profileStorage";
 import {
-  getTranslationTargetLanguage,
-  setTranslationTargetLanguage,
   TRANSLATION_TARGET_LANGUAGES,
+  useTranslationTargetLanguage,
 } from "@/lib/translationPreferences";
 
 interface Props {
@@ -21,7 +20,9 @@ export default function TranslatePopover({ text, position, onClose }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
-  const [targetLang, setTargetLang] = useState(getTranslationTargetLanguage);
+  const defaultTarget = useTranslationTargetLanguage();
+  const [targetOverride, setTargetOverride] = useState<string | null>(null);
+  const targetLang = targetOverride ?? defaultTarget;
   const [windowPosition, setWindowPosition] = useState(() => ({
     x: Math.max(8, Math.min(position.x, window.innerWidth - 348)),
     y: Math.max(8, Math.min(position.y + 10, window.innerHeight - 208)),
@@ -128,11 +129,9 @@ export default function TranslatePopover({ text, position, onClose }: Props) {
           {t("translate.title")}
         </span>
         <select
+          aria-label={t("translate.targetLanguage", "Translation language")}
           value={targetLang}
-          onChange={(e) => {
-            setTargetLang(e.target.value);
-            setTranslationTargetLanguage(e.target.value);
-          }}
+          onChange={(e) => setTargetOverride(e.target.value)}
           style={{
             fontSize: "11px",
             padding: "2px 4px",
@@ -197,7 +196,7 @@ export default function TranslatePopover({ text, position, onClose }: Props) {
         </div>
       ) : (
         <div>
-          <div style={{ fontSize: "13px", lineHeight: "1.5", marginBottom: "8px" }}>
+          <div dir="auto" style={{ fontSize: "13px", lineHeight: "1.5", marginBottom: "8px" }}>
             {translated}
           </div>
           <button

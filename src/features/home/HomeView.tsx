@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useWorkspaceState } from '@/lib/workspaceState';
+import { useEffect } from "react";
 import { listAccounts } from "@/lib/api";
 import { useMailStore } from "@/stores/mail.store";
 import HomeAiWorkbench from "./HomeAiWorkbench";
@@ -12,7 +13,7 @@ export default function HomeView() {
   const activeAccountId = useMailStore((state) => state.activeAccountId);
   const setActiveAccountId = useMailStore((state) => state.setActiveAccountId);
   const setSearchScope = useMailStore((state) => state.setSearchScope);
-  const [accounts, setAccounts] = useState<Awaited<ReturnType<typeof listAccounts>>>([]);
+  const [accounts, setAccounts] = useWorkspaceState<Awaited<ReturnType<typeof listAccounts>>>("src/features/home/HomeView.tsx:HomeView:accounts", []);
 
   useEffect(() => {
     let cancelled = false;

@@ -35,6 +35,9 @@ const mocks = vi.hoisted(() => ({
     failed_count: 0,
     in_progress_count: 0,
     last_error: null as string | null,
+    last_error_operation_id: null as string | null,
+    last_error_account_id: null as string | null,
+    last_error_op_type: null as string | null,
   },
 }));
 
@@ -85,7 +88,7 @@ vi.mock("../../src/hooks/mutations/useSyncMutation", () => ({
 }));
 
 vi.mock("../../src/hooks/queries", () => ({
-  useAccountsQuery: () => ({ data: [{ id: "account-1" }] }),
+  useAccountsQuery: () => ({ data: [{ id: "account-1", display_name: 'First', email: 'first@example.test' }, { id: 'account-2', display_name: 'Second', email: 'second@example.test' }] }),
   useFoldersForAccountsQuery: () => ({ data: [] }),
   pendingMailOpsSummaryQueryKey: (accountId: string | null) => ["pending-mail-ops-summary", accountId],
   usePendingMailOpsSummary: () => ({
@@ -102,10 +105,12 @@ vi.mock("../../src/lib/api", () => ({
 }));
 
 import StatusBar from "../../src/components/StatusBar";
+import { useToastStore } from '../../src/stores/toast.store';
 
 describe("StatusBar accessibility", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear(); useToastStore.setState({ toasts: [] });
     mocks.uiState.syncStatus = "idle";
     mocks.uiState.networkStatus = "online";
     mocks.uiState.lastMailError = null;
@@ -117,6 +122,9 @@ describe("StatusBar accessibility", () => {
     mocks.pendingOpsSummary.failed_count = 0;
     mocks.pendingOpsSummary.in_progress_count = 0;
     mocks.pendingOpsSummary.last_error = null;
+    mocks.pendingOpsSummary.last_error_operation_id = null;
+    mocks.pendingOpsSummary.last_error_account_id = null;
+    mocks.pendingOpsSummary.last_error_op_type = null;
   });
 
   it("announces normal status changes politely", () => {
@@ -126,6 +134,19 @@ describe("StatusBar accessibility", () => {
 
     expect(status?.getAttribute("aria-live")).toBe("polite");
     expect(status?.getAttribute("aria-atomic")).toBe("true");
+  });
+
+  it('keeps a reviewed pending failure quiet when switching account scopes and identifies a new failure correctly', () => {
+    Object.assign(mocks.pendingOpsSummary, { last_error: 'Held queue fixture', last_error_operation_id: 'statusbar-op-one', last_error_account_id: 'account-1', last_error_op_type: 'send' });
+    const view = render(<StatusBar />);
+    expect(useToastStore.getState().toasts[0].title).toBe('First · first@example.test');
+    useToastStore.setState({ toasts: [] });
+    mocks.mailState.activeAccountId = null; view.rerender(<StatusBar />);
+    mocks.mailState.activeAccountId = 'account-2'; view.rerender(<StatusBar />);
+    expect(useToastStore.getState().toasts).toHaveLength(0);
+    Object.assign(mocks.pendingOpsSummary, { last_error_operation_id: 'statusbar-op-two', last_error_account_id: 'account-2' });
+    view.rerender(<StatusBar />);
+    expect(useToastStore.getState().toasts[0].title).toBe('Second · second@example.test');
   });
 
   it("announces mail errors assertively", () => {

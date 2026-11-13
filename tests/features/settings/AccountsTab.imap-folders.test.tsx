@@ -2,7 +2,9 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import AccountsTab from "../../../src/features/settings/AccountsTab";
 import {
+  getAccountDetails,
   getImapSyncFolders,
+  testAccountConnection,
   triggerSync,
   updateAccount,
   updateImapSyncFolders,
@@ -48,7 +50,7 @@ vi.mock("../../../src/hooks/queries", () => ({
 vi.mock("../../../src/lib/api", () => ({
   deleteAccount: vi.fn(),
   getImapSyncFolders: vi.fn(),
-  getAccountDetails: vi.fn().mockResolvedValue({ email: "user@example.com", displayName: "User", color: "#22c55e", provider: "imap", imapHost: "imap.example.com", imapPort: 993, imapUsername: "user@example.com", imapSecurity: "tls", imapAcceptInvalidCerts: false, smtpHost: "smtp.example.com", smtpPort: 465, smtpUsername: "user@example.com", smtpSecurity: "tls", smtpAcceptInvalidCerts: false, proxyMode: "inherit", proxyHost: "", proxyPort: 0 }),
+  getAccountDetails: vi.fn().mockResolvedValue({ email: "user@example.com", displayName: "User", color: "#22c55e", provider: "imap", imapHost: "imap.example.com", imapPort: 993, imapUsername: "user@example.com", imapSecurity: "tls", imapAcceptInvalidCerts: false, smtpHost: "smtp.example.com", smtpPort: 465, smtpUsername: "user@example.com", smtpSecurity: "tls", smtpAcceptInvalidCerts: false, proxyMode: "inherit", proxyHost: "", proxyPort: 0, passwordConfigured: true }),
   getOAuthAccountProxySetting: vi.fn(),
   testAccountConnection: vi.fn(),
   triggerSync: vi.fn(),
@@ -175,5 +177,51 @@ describe("AccountsTab IMAP folder selection", () => {
       ]);
     });
     expect(triggerSync).toHaveBeenCalledWith("account-1", "manual");
+  });
+
+  it("shows the persisted connection values when editing an account", async () => {
+    render(<AccountsTab />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit account" }));
+    expect(screen.queryByDisplayValue("imap.example.com")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Advanced connection settings" }));
+
+    expect(await screen.findByDisplayValue("imap.example.com")).toBeTruthy();
+    expect(screen.getByDisplayValue("993")).toBeTruthy();
+    expect((screen.getByRole("textbox", { name: "IMAP host 登录用户名" }) as HTMLInputElement).value).toBe("user@example.com");
+    expect((screen.getByRole("textbox", { name: "accountSetup.smtpHost 登录用户名" }) as HTMLInputElement).value).toBe("user@example.com");
+    expect(screen.getByDisplayValue("smtp.example.com")).toBeTruthy();
+    expect(screen.getByDisplayValue("465")).toBeTruthy();
+    expect(screen.getByPlaceholderText("已保存（如需更改请重新输入）")).toBeTruthy();
+  });
+
+  it("tests a saved certificate exception strictly before restoring only the affected side", async () => {
+    const savedDetails = await getAccountDetails("account-1");
+    vi.mocked(getAccountDetails).mockResolvedValueOnce({ ...savedDetails, smtpAcceptInvalidCerts: true });
+    vi.mocked(testAccountConnection).mockRejectedValueOnce(new Error("收件：失败 — 收件服务器无响应\n发件 SMTP：通过 — SMTP 连接成功"));
+    render(<AccountsTab />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit account" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Test with certificate verification" }));
+    expect(testAccountConnection).toHaveBeenCalledWith("account-1", true);
+    expect(updateAccount).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole("button", { name: "Restore certificate verification" }));
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+    await waitFor(() => expect(vi.mocked(updateAccount).mock.calls[0]?.[17]).toEqual({
+      incoming: undefined, outgoing: false,
+    }));
+  });
+
+  it("edits the private label separately from the outgoing sender name", async () => {
+    render(<AccountsTab />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit account" }));
+    const sender = await screen.findByRole("textbox", { name: "对外发件人名称" });
+    await waitFor(() => expect((sender as HTMLInputElement).disabled).toBe(false));
+    fireEvent.change(screen.getByRole("textbox", { name: "账号昵称（仅自己可见）" }), { target: { value: "Local account label" } });
+    fireEvent.change(sender, { target: { value: "Customer Service" } });
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+    await waitFor(() => expect(updateAccount).toHaveBeenCalled());
+    const args = vi.mocked(updateAccount).mock.calls[0];
+    expect(args[2]).toBe("Local account label");
+    expect(args[16]).toBe("Customer Service");
   });
 });

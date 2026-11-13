@@ -1,8 +1,13 @@
 pub mod deepl;
+pub mod endpoint;
 pub mod deeplx;
 pub mod generic;
 pub mod llm;
+pub mod models;
 pub mod types;
+
+#[cfg(test)]
+mod proxy_tests;
 
 use pebble_core::{HttpProxyConfig, PebbleError, Result};
 use types::{TranslateProviderConfig, TranslateResult};
@@ -12,7 +17,15 @@ pub struct TranslateService;
 
 impl TranslateService {
     pub fn http_client_with_proxy(proxy: Option<&HttpProxyConfig>) -> Result<reqwest::Client> {
-        let mut builder = reqwest::ClientBuilder::new();
+        let mut builder = reqwest::ClientBuilder::new().no_proxy().redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("接口重定向次数过多");
+            }
+            match endpoint::validate_service_endpoint(attempt.url().as_str()) {
+                Ok(()) => attempt.follow(),
+                Err(_) => attempt.error("接口重定向目标不符合 HTTPS/可信局域网策略"),
+            }
+        }));
         if let Some(proxy) = proxy {
             let uri = proxy.socks5h_uri().map_err(PebbleError::Network)?;
             let reqwest_proxy = reqwest::Proxy::all(&uri)
@@ -22,6 +35,36 @@ impl TranslateService {
         builder
             .build()
             .map_err(|e| PebbleError::Network(format!("Failed to build HTTP client: {e}")))
+    }
+
+    /// All model paths, including tools and connection tests, share this policy.
+    pub fn http_client_for_config(config: &TranslateProviderConfig, shared: Option<&HttpProxyConfig>) -> Result<reqwest::Client> {
+        Self::http_client_with_proxy(Self::proxy_for_config(config, shared)?)
+    }
+
+    pub fn proxy_for_config<'a>(config: &TranslateProviderConfig, shared: Option<&'a HttpProxyConfig>) -> Result<Option<&'a HttpProxyConfig>> {
+        match config {
+            TranslateProviderConfig::LLM { providers, active_id } => {
+                let active = providers.iter().find(|p| &p.id == active_id)
+                    .ok_or_else(|| PebbleError::Translate("未选择有效的 AI 模型，请在设置中重新选择".into()))?;
+                match active.use_proxy {
+                    Some(true) => shared.map(Some).ok_or_else(|| PebbleError::Validation("此模型已勾选使用代理，请先在 设置 → 代理 中填写代理地址和端口".into())),
+                    Some(false) => Ok(None),
+                    None => Ok(shared), // Existing profiles retain their previous route.
+                }
+            }
+            _ => Ok(shared),
+        }
+    }
+
+    pub async fn test_connection(config: &TranslateProviderConfig, shared: Option<&HttpProxyConfig>) -> Result<()> {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30),
+            Self::translate_with_proxy(config, shared, "Hello", "en", "zh"))
+            .await.map_err(|_| PebbleError::Network("连接测试超时，请检查接口地址及代理设置".into()))??;
+        if result.translated.trim().is_empty() {
+            return Err(PebbleError::Translate("接口未返回有效内容，请检查模型及接口配置".into()));
+        }
+        Ok(())
     }
 
     pub async fn translate(
@@ -40,7 +83,7 @@ impl TranslateService {
         from: &str,
         to: &str,
     ) -> Result<TranslateResult> {
-        let client = Self::http_client_with_proxy(proxy)?;
+        let client = Self::http_client_for_config(config, proxy)?;
 
         match config {
             TranslateProviderConfig::DeepLX { endpoint } => {
@@ -105,14 +148,14 @@ impl TranslateService {
         Self::complete_with_proxy(config, None, system, user).await
     }
 
-    /// Like [`complete`], but routes through the global SOCKS5 proxy when set.
+    /// Like [`complete`], respecting the active model's proxy opt-in.
     pub async fn complete_with_proxy(
         config: &TranslateProviderConfig,
         proxy: Option<&HttpProxyConfig>,
         system: &str,
         user: &str,
     ) -> Result<String> {
-        let client = Self::http_client_with_proxy(proxy)?;
+        let client = Self::http_client_for_config(config, proxy)?;
 
         match config {
             TranslateProviderConfig::LLM { providers, active_id } => {
@@ -154,7 +197,7 @@ impl TranslateService {
         user: &str,
         max_output_tokens: u32,
     ) -> Result<String> {
-        let client = Self::http_client_with_proxy(proxy)?;
+        let client = Self::http_client_for_config(config, proxy)?;
         match config {
             TranslateProviderConfig::LLM { providers, active_id } => {
                 let active = providers
@@ -188,13 +231,13 @@ impl TranslateService {
         Self::complete_chat_with_proxy(config, None, turns).await
     }
 
-    /// Like [`complete_chat`], but routes through the global SOCKS5 proxy when set.
+    /// Like [`complete_chat`], respecting the active model's proxy opt-in.
     pub async fn complete_chat_with_proxy(
         config: &TranslateProviderConfig,
         proxy: Option<&HttpProxyConfig>,
         turns: &[ChatTurn<'_>],
     ) -> Result<String> {
-        let client = Self::http_client_with_proxy(proxy)?;
+        let client = Self::http_client_for_config(config, proxy)?;
 
         match config {
             TranslateProviderConfig::LLM { providers, active_id } => {

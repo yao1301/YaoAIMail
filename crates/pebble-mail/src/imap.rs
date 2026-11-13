@@ -368,6 +368,9 @@ pub struct ImapMailboxStatus {
 pub struct ImapProvider {
     config: ImapConfig,
     session: Arc<Mutex<Option<ImapSession>>>,
+    /// Valid only within uninterrupted body-fetch calls. Every other session
+    /// user invalidates this cache while holding the session lock, including
+    /// reconnect, IDLE, failed SELECT and arbitrary mailbox operations.
     /// 最近一次 SELECT 的 mailbox。同一文件夹连续 FETCH 时跳过重复 SELECT
     /// （一次 SELECT 是一次完整网络往返，逐封拉取时会显著拖慢）。
     last_selected: Arc<tokio::sync::Mutex<Option<String>>>,
@@ -861,6 +864,7 @@ impl ImapProvider {
         };
 
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         *guard = Some(session);
         debug!(
             "IMAP connected to {} ({:?})",
@@ -1190,6 +1194,7 @@ impl ImapProvider {
     /// List folders for the given account, returning `Folder` structs.
     pub async fn list_folders(&self, account_id: &str) -> Result<Vec<Folder>> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -1252,6 +1257,7 @@ impl ImapProvider {
     /// must never hard-code "/" or the server and local tree can diverge.
     pub async fn hierarchy_delimiter(&self) -> Result<String> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -1280,6 +1286,7 @@ impl ImapProvider {
         limit: u32,
     ) -> Result<Vec<(u32, Vec<u8>)>> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -1376,6 +1383,7 @@ impl ImapProvider {
         limit: u32,
     ) -> Result<Vec<(u32, Vec<u8>)>> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -1455,6 +1463,7 @@ impl ImapProvider {
             return Ok(Vec::new());
         }
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -1500,14 +1509,45 @@ impl ImapProvider {
                         );
                     }
                 }
-                Ok(fetches
-                    .into_iter()
-                    .filter_map(|f| f.uid.zip(f.header().map(Vec::from)))
-                    .collect())
+                let rows = fetches.into_iter().map(|f| f.uid.zip(f.header().map(Vec::from))
+                    .ok_or_else(|| PebbleError::Sync("IMAP history response omitted UID or header".into())))
+                    .collect::<Result<Vec<_>>>()?;
+                if rows.len() != (end - start_seq + 1) as usize {
+                    return Err(PebbleError::Sync("IMAP history page was incomplete; cursor not advanced".into()));
+                }
+                Ok(rows)
             }};
         }
 
         do_fetch!(sess)
+    }
+
+    /// Repair concrete history holes without walking sequence ranges again.
+    pub async fn fetch_headers_by_uids(&self, mailbox: &str, expected_epoch: u32, uids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>> {
+        if uids.is_empty() { return Ok(Vec::new()); }
+        let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
+        let sess = guard.as_mut().ok_or_else(|| PebbleError::Network("Not connected".into()))?;
+        let selected = with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
+        let epoch = match selected.uid_validity {
+            Some(epoch) => Some(epoch),
+            None => with_imap_timeout("STATUS UIDVALIDITY", IMAP_STATUS_PROBE_TIMEOUT_SECS,
+                sess.status(mailbox, "(UIDVALIDITY)")).await?.uid_validity,
+        };
+        if epoch != Some(expected_epoch) {
+            return Err(PebbleError::Sync("IMAP UIDVALIDITY changed during header repair; retry next pass".into()));
+        }
+        *self.last_selected.lock().await = Some(mailbox.to_string());
+        let set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let stream = with_imap_timeout("UID FETCH headers", IMAP_COMMAND_TIMEOUT_SECS,
+            sess.uid_fetch(&set, "(UID BODY.PEEK[HEADER])")).await?;
+        let fetched: Vec<async_imap::types::Fetch> = with_imap_timeout("UID FETCH headers collect",
+            IMAP_BODY_FETCH_TIMEOUT_SECS, stream.try_collect()).await?;
+        // The caller persists valid rows and records every omitted requested UID
+        // as a retryable failure; one malformed message must not starve the rest.
+        let rows = fetched.into_iter().filter_map(|f|f.uid.zip(f.header().map(Vec::from)))
+            .filter(|(uid,_)|uids.contains(uid)).collect();
+        Ok(rows)
     }
 
     /// Fetch one complete MIME message by UID when a header-only message is opened.
@@ -1528,15 +1568,23 @@ impl ImapProvider {
         // 逐封拉取几百封时每封都 SELECT 会拖慢数倍）。
         let mut last = self.last_selected.lock().await;
         if last.as_deref() != Some(mailbox) {
+            *last = None;
             with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
             *last = Some(mailbox.to_string());
         }
         drop(last);
 
         let mut result = Vec::new();
+        let mut expected_size: Option<usize> = None;
         let mut offset: u64 = 0;
         loop {
-            let query = format!("(UID BODY.PEEK[]<{offset}.{CHUNK}>)");
+            // mail-parser can parse a valid text body from a truncated MIME
+            // prefix, so always compare the fetched bytes with RFC822.SIZE.
+            let query = if expected_size.is_none() {
+                format!("(UID RFC822.SIZE BODY.PEEK[]<{offset}.{CHUNK}>)")
+            } else {
+                format!("(UID BODY.PEEK[]<{offset}.{CHUNK}>)")
+            };
             let fetches = with_imap_timeout(
                 "UID FETCH message chunk",
                 IMAP_COMMAND_TIMEOUT_SECS,
@@ -1549,21 +1597,58 @@ impl ImapProvider {
                 fetches.try_collect(),
             )
             .await?;
-            let chunk = fetches.into_iter().find_map(|f| {
-                (f.uid == Some(uid)).then(|| f.body().map(Vec::from)).flatten()
-            });
+            let fetch = fetches.into_iter().find(|f| f.uid == Some(uid));
+            if expected_size.is_none() {
+                expected_size = fetch.as_ref().and_then(|f| f.size).map(|size| size as usize);
+            }
+            let chunk = fetch.and_then(|f| f.body().map(Vec::from));
             match chunk {
                 Some(bytes) if !bytes.is_empty() => {
+                    if let Some(expected) = expected_size {
+                        if result.len().saturating_add(bytes.len()) > expected {
+                            return Err(PebbleError::Sync(format!(
+                                "IMAP message UID {uid} exceeded RFC822.SIZE: received at least {} of {expected} bytes",
+                                result.len().saturating_add(bytes.len())
+                            )));
+                        }
+                    }
                     offset += bytes.len() as u64;
                     result.extend_from_slice(&bytes);
+                    if let Some(expected) = expected_size {
+                        if result.len() == expected {
+                            break;
+                        }
+                    }
                     // A chunk shorter than CHUNK means we reached the end of
-                    // the message (server returns only the remaining bytes).
+                    // the message when no total size is available. If the
+                    // server did advertise RFC822.SIZE, keep asking: some
+                    // servers cap literals below the requested chunk size.
                     if bytes.len() < CHUNK {
-                        break;
+                        if expected_size.is_none() {
+                            break;
+                        }
                     }
                 }
-                // Empty body at a valid offset means the message ended.
-                _ => break,
+                // An empty chunk is only an end marker when no size was
+                // advertised (or the advertised size has already arrived).
+                _ => {
+                    // Keep the legacy non-partial fallback available when a
+                    // server omits the literal for the very first partial
+                    // request. Once progress has been made, an empty chunk
+                    // before RFC822.SIZE is a real truncation.
+                    if result.is_empty() {
+                        break;
+                    }
+                    if let Some(expected) = expected_size {
+                        if result.len() < expected {
+                            return Err(PebbleError::Sync(format!(
+                                "IMAP message UID {uid} incomplete: received {} of {expected} bytes",
+                                result.len()
+                            )));
+                        }
+                    }
+                    break;
+                }
             }
         }
 
@@ -1575,7 +1660,7 @@ impl ImapProvider {
             let fetches = with_imap_timeout(
                 "UID FETCH message compatibility fallback",
                 IMAP_COMMAND_TIMEOUT_SECS,
-                sess.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])"),
+                sess.uid_fetch(uid.to_string(), "(UID RFC822.SIZE BODY.PEEK[])"),
             )
             .await?;
             let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
@@ -1584,15 +1669,32 @@ impl ImapProvider {
                 fetches.try_collect(),
             )
             .await?;
-            if let Some(body) = fetches.into_iter().find_map(|fetch| {
-                (fetch.uid == Some(uid)).then(|| fetch.body().map(Vec::from)).flatten()
-            }) {
-                result = body;
+            if let Some(fetch) = fetches.into_iter().find(|fetch| fetch.uid == Some(uid)) {
+                let fallback_size = fetch.size.map(|size| size as usize).or(expected_size);
+                if let Some(body) = fetch.body().map(Vec::from) {
+                    if let Some(expected) = fallback_size {
+                        if body.len() != expected {
+                            return Err(PebbleError::Sync(format!(
+                                "IMAP message UID {uid} incomplete: received {} of {expected} bytes",
+                                body.len()
+                            )));
+                        }
+                    }
+                    result = body;
+                }
             }
         }
 
         if result.is_empty() {
             return Err(PebbleError::Sync(format!("IMAP message UID {uid} has no body")));
+        }
+        if let Some(expected) = expected_size {
+            if result.len() != expected {
+                return Err(PebbleError::Sync(format!(
+                    "IMAP message UID {uid} incomplete: received {} of {expected} bytes",
+                    result.len()
+                )));
+            }
         }
         Ok(result)
     }
@@ -1608,6 +1710,17 @@ impl ImapProvider {
         mailbox: &str,
         uids: &[u32],
     ) -> Result<Vec<(u32, Vec<u8>)>> {
+        Ok(self.fetch_messages_raw_by_uids_with_sizes(mailbox, uids).await?
+            .into_iter().map(|(uid, raw, _)| (uid, raw)).collect())
+    }
+
+    /// Keep the size advertised with each body. A separate size-only FETCH
+    /// can describe a different MIME representation on some servers.
+    pub async fn fetch_messages_raw_by_uids_with_sizes(
+        &self,
+        mailbox: &str,
+        uids: &[u32],
+    ) -> Result<Vec<(u32, Vec<u8>, Option<u32>)>> {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
@@ -1617,6 +1730,7 @@ impl ImapProvider {
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
         let mut last = self.last_selected.lock().await;
         if last.as_deref() != Some(mailbox) {
+            *last = None;
             with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
             *last = Some(mailbox.to_string());
         }
@@ -1630,7 +1744,7 @@ impl ImapProvider {
         let fetches = with_imap_timeout(
             "UID FETCH batch",
             IMAP_COMMAND_TIMEOUT_SECS,
-            sess.uid_fetch(&uid_set, "(UID BODY.PEEK[])"),
+            sess.uid_fetch(&uid_set, "(UID RFC822.SIZE BODY.PEEK[])"),
         )
         .await?;
         // 批量拉取本来就是为提速：若服务器（如 Zoho）对批量支持差、5 封也要
@@ -1646,7 +1760,7 @@ impl ImapProvider {
         for fetch in fetches {
             if let Some(uid) = fetch.uid {
                 if let Some(body) = fetch.body() {
-                    results.push((uid, Vec::from(body)));
+                    results.push((uid, Vec::from(body), fetch.size));
                 }
             }
         }
@@ -1671,6 +1785,7 @@ impl ImapProvider {
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
         let mut last = self.last_selected.lock().await;
         if last.as_deref() != Some(mailbox) {
+            *last = None;
             with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
             *last = Some(mailbox.to_string());
         }
@@ -1698,6 +1813,12 @@ impl ImapProvider {
             if let Some(uid) = fetch.uid {
                 if let Some(size) = fetch.size {
                     results.push((uid, size));
+                } else {
+                    // A returned UID without SIZE is not evidence that this
+                    // UID vanished. Let the caller use a full-body fetch.
+                    return Err(PebbleError::Sync(
+                        "IMAP size response omitted RFC822.SIZE for an existing UID".into(),
+                    ));
                 }
             }
         }
@@ -1721,6 +1842,7 @@ impl ImapProvider {
             return Ok(Vec::new());
         }
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -1794,6 +1916,7 @@ impl ImapProvider {
             .join(",");
 
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -1847,6 +1970,7 @@ impl ImapProvider {
         let uid_str = uid.to_string();
 
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -1933,6 +2057,7 @@ impl ImapProvider {
         let uid_str = uid.to_string();
 
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -2069,6 +2194,7 @@ impl ImapProvider {
             return Ok(None);
         }
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -2093,6 +2219,7 @@ impl ImapProvider {
         let uid_str = uid.to_string();
 
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -2135,6 +2262,7 @@ impl ImapProvider {
     /// Create a new mailbox on the server.
     pub async fn create_folder(&self, name: &str) -> Result<()> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -2145,6 +2273,7 @@ impl ImapProvider {
     /// Rename an existing mailbox on the server.
     pub async fn rename_folder(&self, old_name: &str, new_name: &str) -> Result<()> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -2160,6 +2289,7 @@ impl ImapProvider {
     /// Delete an existing mailbox on the server.
     pub async fn delete_folder(&self, name: &str) -> Result<()> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -2167,50 +2297,36 @@ impl ImapProvider {
         Ok(())
     }
 
-    /// Fetch all UIDs in a mailbox via UID SEARCH ALL.
-    pub async fn fetch_all_uids(&self, mailbox: &str) -> Result<Vec<u32>> {
+    /// Keep the selected mailbox status and UID search on the same session.
+    pub async fn fetch_uid_inventory(&self, mailbox: &str) -> Result<(ImapMailboxStatus, Vec<u32>)> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
 
-        macro_rules! do_search {
-            ($s:expr) => {{
-                with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, $s.select(mailbox)).await?;
-
-                let uids: Vec<u32> = with_imap_timeout(
-                    "UID SEARCH ALL",
-                    IMAP_COMMAND_TIMEOUT_SECS,
-                    $s.uid_search("ALL"),
-                )
-                .await?
-                .into_iter()
-                .collect();
-                uids
-            }};
-        }
-
-        let results = do_search!(sess);
-
-        Ok(results)
-    }
-
-    /// SELECT a mailbox and return the EXISTS count without fetching UIDs.
-    pub async fn select_exists(&self, mailbox: &str) -> Result<u32> {
-        let mut guard = self.session.lock().await;
-        let sess = guard
-            .as_mut()
-            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
-
-        let mbox =
-            with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
-
-        Ok(mbox.exists)
+        let selected = with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, sess.select(mailbox)).await?;
+        let uids = with_imap_timeout("UID SEARCH ALL", IMAP_COMMAND_TIMEOUT_SECS, sess.uid_search("ALL"))
+            .await?.into_iter().collect();
+        let epoch = match selected.uid_validity {
+            Some(epoch) => Some(epoch),
+            None => {
+                let status = with_imap_timeout("STATUS UIDVALIDITY", IMAP_STATUS_PROBE_TIMEOUT_SECS,
+                    sess.status(mailbox, "(MESSAGES UIDNEXT UIDVALIDITY)")).await?;
+                if status.exists != selected.exists || matches!((status.uid_next, selected.uid_next), (Some(a), Some(b)) if a != b) {
+                    return Err(PebbleError::Sync("IMAP inventory changed while reading UIDVALIDITY; retry next pass".into()));
+                }
+                status.uid_validity
+            }
+        };
+        Ok((ImapMailboxStatus { uid_validity: epoch, uid_next: selected.uid_next,
+            highest_modseq: selected.highest_modseq, exists: selected.exists }, uids))
     }
 
     /// Check if the server advertises the CONDSTORE capability (RFC 4551).
     pub async fn supports_condstore(&self) -> bool {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = match guard.as_mut() {
             Some(s) => s,
             None => return false,
@@ -2232,6 +2348,7 @@ impl ImapProvider {
     /// SELECT a mailbox and return the UIDVALIDITY/HIGHESTMODSEQ values advertised by the server.
     pub async fn get_mailbox_status(&self, mailbox: &str) -> Result<ImapMailboxStatus> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -2250,8 +2367,24 @@ impl ImapProvider {
             }};
         }
 
-        let result = do_select!(sess);
-
+        let mut result = do_select!(sess);
+        // Some servers omit the response code on repeated SELECT. Obtain a
+        // fresh epoch from the same mailbox, never from an old local cursor.
+        if result.uid_validity.is_none() {
+            let status = with_imap_timeout(
+                "STATUS UIDVALIDITY", IMAP_STATUS_PROBE_TIMEOUT_SECS,
+                sess.status(mailbox, "(MESSAGES UIDNEXT UIDVALIDITY)"),
+            ).await.map_err(|error| PebbleError::Network(format!(
+                "IMAP UIDVALIDITY unavailable; local history unchanged: {error}"
+            )))?;
+            result.uid_validity = status.uid_validity;
+            result.uid_next = result.uid_next.or(status.uid_next);
+            if result.uid_validity.is_none() {
+                return Err(PebbleError::Network(
+                    "IMAP UIDVALIDITY unavailable after SELECT and STATUS; local history unchanged".into()
+                ));
+            }
+        }
         Ok(result)
     }
 
@@ -2260,6 +2393,7 @@ impl ImapProvider {
     /// work every few seconds.
     pub async fn probe_mailbox_status(&self, mailbox: &str) -> Result<ImapMailboxStatus> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -2296,6 +2430,7 @@ impl ImapProvider {
             .join(",");
 
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = guard
             .as_mut()
             .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
@@ -2350,6 +2485,7 @@ impl ImapProvider {
     /// Check if the server advertises the IDLE capability (RFC 2177).
     pub async fn supports_idle(&self) -> bool {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         let sess = match guard.as_mut() {
             Some(s) => s,
             None => return false,
@@ -2375,6 +2511,7 @@ impl ImapProvider {
         // Take the session out so we can pass ownership to the idle handle.
         let sess = {
             let mut guard = self.session.lock().await;
+            *self.last_selected.lock().await = None;
             guard
                 .take()
                 .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?
@@ -2387,6 +2524,7 @@ impl ImapProvider {
         {
             // Restore session before returning error.
             let mut guard = self.session.lock().await;
+            *self.last_selected.lock().await = None;
             *guard = Some(session);
             return Err(e);
         }
@@ -2400,6 +2538,7 @@ impl ImapProvider {
             match idle_handle.done().await {
                 Ok(recovered) => {
                     let mut guard = self.session.lock().await;
+                    *self.last_selected.lock().await = None;
                     *guard = Some(recovered);
                 }
                 Err(_) => {
@@ -2428,6 +2567,7 @@ impl ImapProvider {
         match idle_handle.done().await {
             Ok(recovered) => {
                 let mut guard = self.session.lock().await;
+                *self.last_selected.lock().await = None;
                 *guard = Some(recovered);
             }
             Err(_) => {
@@ -2442,6 +2582,7 @@ impl ImapProvider {
     /// Disconnect from the IMAP server.
     pub async fn disconnect(&self) -> Result<()> {
         let mut guard = self.session.lock().await;
+        *self.last_selected.lock().await = None;
         if let Some(sess) = guard.as_mut() {
             let _ = sess.logout().await;
             *guard = None;
@@ -2527,6 +2668,91 @@ pub fn folder_sort_order(role: &Option<FolderRole>) -> i32 {
         Some(FolderRole::Spam) => 4,
         Some(FolderRole::Trash) => 5,
         None => 100,
+    }
+}
+
+#[cfg(test)]
+mod mailbox_session_regression_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn fixture(status_epoch: bool, omit_size: bool) -> (ImapProvider, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            write.write_all(b"* OK fixture ready\r\n").await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            let mut selected_a = false;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let (tag, cmd) = line.split_once(' ').unwrap();
+                let cmd = cmd.to_ascii_uppercase();
+                let data = if cmd.starts_with("LOGIN") { String::new() }
+                else if cmd.starts_with("SELECT") {
+                    selected_a = cmd.contains("FOLDER_A");
+                    format!("* 1 EXISTS\r\n{}", if selected_a { "* OK [UIDVALIDITY 7] epoch\r\n" } else { "" })
+                } else if cmd.starts_with("STATUS") {
+                    format!("* STATUS FOLDER_B (MESSAGES 1 UIDNEXT 2{})\r\n", if status_epoch { " UIDVALIDITY 9" } else { "" })
+                } else if cmd.starts_with("UID FETCH") {
+                    let body = if selected_a { "abcdefghij" } else { "WRONG" };
+                    if cmd.contains("BODY") {
+                        format!("* 1 FETCH (UID 1 RFC822.SIZE {} BODY[] {{{}}}\r\n{})\r\n",body.len(),body.len(),body)
+                    } else if omit_size {
+                        "* 1 FETCH (UID 1)\r\n".into()
+                    } else { "* 1 FETCH (UID 1 RFC822.SIZE 5)\r\n".into() }
+                } else if cmd.starts_with("LOGOUT") { break }
+                else { panic!("unexpected fixture command") };
+                write.write_all(format!("{data}{tag} OK complete\r\n").as_bytes()).await.unwrap();
+            }
+        });
+        let provider = ImapProvider::new(serde_json::from_value(serde_json::json!({
+            "host":"127.0.0.1","port":port,"username":"fixture","password":"fixture","security":"plain"
+        })).unwrap());
+        provider.connect().await.unwrap();
+        (provider, server)
+    }
+
+    #[tokio::test]
+    async fn status_switch_cannot_redirect_cached_body_fetch() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (p, server) = fixture(true, false).await;
+            assert_eq!(p.fetch_message_sizes_by_uids("FOLDER_A", &[1]).await.unwrap(), vec![(1,5)]);
+            assert_eq!(p.get_mailbox_status("FOLDER_B").await.unwrap().uid_validity, Some(9));
+            assert_eq!(p.fetch_messages_raw_by_uids("FOLDER_A", &[1]).await.unwrap(), vec![(1,b"abcdefghij".to_vec())]);
+            server.abort();
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn absent_epoch_after_select_and_status_remains_retryable_error() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (p, server) = fixture(false, false).await;
+            let error = p.get_mailbox_status("FOLDER_B").await.unwrap_err();
+            assert!(matches!(error, PebbleError::Network(ref message) if message.contains("IMAP UIDVALIDITY unavailable")));
+            server.abort();
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_body_keeps_its_own_size_instead_of_the_old_estimate() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (p, server) = fixture(true, false).await;
+            assert_eq!(p.fetch_message_sizes_by_uids("FOLDER_A", &[1]).await.unwrap(), vec![(1,5)]);
+            let fetched = p.fetch_messages_raw_by_uids_with_sizes("FOLDER_A", &[1]).await.unwrap();
+            assert_eq!(fetched, vec![(1,b"abcdefghij".to_vec(),Some(10))]);
+            assert_eq!(fetched[0].1.len(), fetched[0].2.unwrap() as usize);
+            server.abort();
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn existing_uid_without_size_is_not_reported_as_missing() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (p, server) = fixture(true, true).await;
+            assert!(p.fetch_message_sizes_by_uids("FOLDER_A", &[1]).await.is_err());
+            server.abort();
+        }).await.unwrap();
     }
 }
 

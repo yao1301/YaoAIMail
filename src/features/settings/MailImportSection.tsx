@@ -1,10 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useWorkspaceState, useWorkspaceInitEffect } from '@/lib/workspaceState';
+import { useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { FolderInput, Loader2, Upload, X } from "lucide-react";
 import { listFolders, type Folder } from "@/lib/api";
 import { useAccountsQuery } from "@/hooks/queries";
 import { useToastStore } from "@/stores/toast.store";
+import { extractErrorMessage } from "@/lib/extractErrorMessage";
+import { SettingsFeedback, type SettingsNotice } from "./SettingsFeedback";
 import { queryClient } from "@/lib/query-client";
 
 interface ImportProgress {
@@ -27,20 +30,22 @@ function makeTaskId() {
 
 export default function MailImportSection() {
   const { data: accounts = [] } = useAccountsQuery();
-  const [accountId, setAccountId] = useState("");
-  const [folders, setFolders] = useState<Folder[]>([]);
-  const [folderId, setFolderId] = useState("");
-  const [paths, setPaths] = useState<string[]>([]);
-  const [taskId, setTaskId] = useState<string | null>(null);
-  const [progress, setProgress] = useState<ImportProgress | null>(null);
-  const [lastReport, setLastReport] = useState<ImportReport | null>(null);
+  const [accountId, setAccountId] = useWorkspaceState("src/features/settings/MailImportSection.tsx:MailImportSection:accountId", "");
+  const [folders, setFolders] = useWorkspaceState<Folder[]>("src/features/settings/MailImportSection.tsx:MailImportSection:folders", []);
+  const [folderId, setFolderId] = useWorkspaceState("src/features/settings/MailImportSection.tsx:MailImportSection:folderId", "");
+  const [paths, setPaths] = useWorkspaceState<string[]>("src/features/settings/MailImportSection.tsx:MailImportSection:paths", []);
+  const [taskId, setTaskId] = useWorkspaceState<string | null>("src/features/settings/MailImportSection.tsx:MailImportSection:taskId", null);
+  const [progress, setProgress] = useWorkspaceState<ImportProgress | null>("src/features/settings/MailImportSection.tsx:MailImportSection:progress", null);
+  const [lastReport, setLastReport] = useWorkspaceState<ImportReport | null>("src/features/settings/MailImportSection.tsx:MailImportSection:lastReport", null);
+  const [sourceError, setSourceError] = useWorkspaceState<SettingsNotice | null>("src/features/settings/MailImportSection.tsx:MailImportSection:sourceError", null);
+  const [importError, setImportError] = useWorkspaceState<SettingsNotice | null>("src/features/settings/MailImportSection.tsx:MailImportSection:importError", null);
   const addToast = useToastStore((state) => state.addToast);
 
   useEffect(() => {
     if (!accountId && accounts[0]) setAccountId(accounts[0].id);
   }, [accountId, accounts]);
 
-  useEffect(() => {
+  useWorkspaceInitEffect("src/features/settings/MailImportSection.tsx:", () => {
     if (!accountId) {
       setFolders([]);
       setFolderId("");
@@ -74,17 +79,28 @@ export default function MailImportSection() {
   }, [paths]);
 
   async function chooseFiles() {
-    const selected = await invoke<string[]>("choose_mail_import_files");
-    if (selected.length) setPaths(selected);
+    setSourceError(null);
+    try {
+      const selected = await invoke<string[]>("choose_mail_import_files");
+      if (selected.length) setPaths(selected);
+    } catch (error) {
+      setSourceError({ message: `无法选择导入文件：${extractErrorMessage(error)}`, kind: "error" });
+    }
   }
 
   async function chooseFolder() {
-    const selected = await invoke<string | null>("choose_eml_import_folder");
-    if (selected) setPaths([selected]);
+    setSourceError(null);
+    try {
+      const selected = await invoke<string | null>("choose_eml_import_folder");
+      if (selected) setPaths([selected]);
+    } catch (error) {
+      setSourceError({ message: `无法选择导入文件夹：${extractErrorMessage(error)}`, kind: "error" });
+    }
   }
 
   async function startImport() {
     if (!accountId || !folderId || paths.length === 0 || taskId) return;
+    setImportError(null);
     const nextTaskId = makeTaskId();
     setTaskId(nextTaskId);
     setLastReport(null);
@@ -111,7 +127,9 @@ export default function MailImportSection() {
           : `导入完成：成功 ${report.imported} 封，跳过重复 ${report.skipped} 封，失败 ${report.failed} 封`,
       });
     } catch (error) {
-      addToast({ type: "error", duration: 10_000, message: `邮件导入失败：${String(error)}` });
+      const message = `邮件导入失败：${extractErrorMessage(error)}`;
+      setImportError({ message, kind: "error" });
+      addToast({ type: "error", duration: 10_000, message });
     } finally {
       setTaskId(null);
     }
@@ -141,11 +159,12 @@ export default function MailImportSection() {
         <button type="button" disabled={Boolean(taskId)} onClick={() => void chooseFiles()} style={{ display: "flex", alignItems: "center", gap: "6px", padding: "8px 12px", border: "1px solid var(--color-border)", borderRadius: "6px", background: "var(--color-bg)", color: "var(--color-text-primary)", cursor: taskId ? "not-allowed" : "pointer" }}><Upload size={14} />选择 EML / MBOX 文件</button>
         <button type="button" disabled={Boolean(taskId)} onClick={() => void chooseFolder()} style={{ display: "flex", alignItems: "center", gap: "6px", padding: "8px 12px", border: "1px solid var(--color-border)", borderRadius: "6px", background: "var(--color-bg)", color: "var(--color-text-primary)", cursor: taskId ? "not-allowed" : "pointer" }}><FolderInput size={14} />选择 EML 文件夹</button>
       </div>
+      <SettingsFeedback notice={sourceError} />
       <div title={selectedLabel} style={{ marginTop: "9px", padding: "8px 10px", borderRadius: "6px", background: "var(--color-bg-secondary)", color: "var(--color-text-secondary)", fontSize: "12px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{selectedLabel}</div>
 
       {taskId && progress && (
         <div role="status" style={{ marginTop: "12px", padding: "11px", border: "1px solid var(--color-border)", borderRadius: "7px", background: "var(--color-bg-secondary)" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "12px" }}><Loader2 size={14} className="spin" />正在导入：{progress.currentFile}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "12px" }}><Loader2 size={14} className="app-spin" />正在导入：{progress.currentFile}</div>
           <div style={{ marginTop: "6px", fontSize: "12px", color: "var(--color-text-secondary)" }}>已处理 {progress.processed} 封 · 成功 {progress.imported} · 重复 {progress.skipped} · 失败 {progress.failed}</div>
           <button type="button" onClick={() => void invoke("cancel_mail_import", { taskId })} style={{ display: "flex", alignItems: "center", gap: "5px", marginTop: "9px", padding: "6px 11px", border: "1px solid var(--color-error, #dc2626)", borderRadius: "6px", background: "transparent", color: "var(--color-error, #dc2626)", cursor: "pointer" }}><X size={13} />取消导入</button>
         </div>
@@ -154,6 +173,7 @@ export default function MailImportSection() {
       {!taskId && paths.length > 0 && (
         <button type="button" disabled={!accountId || !folderId} onClick={() => void startImport()} style={{ marginTop: "12px", padding: "8px 18px", border: "none", borderRadius: "6px", background: "var(--color-accent)", color: "#fff", cursor: accountId && folderId ? "pointer" : "not-allowed" }}>开始批量导入</button>
       )}
+      <SettingsFeedback notice={importError} />
       {lastReport && lastReport.errors.length > 0 && (
         <details style={{ marginTop: "10px", fontSize: "12px", color: "var(--color-text-secondary)" }}>
           <summary>查看失败清单（最多显示 100 条）</summary>

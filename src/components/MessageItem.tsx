@@ -24,6 +24,7 @@ import {
   Printer,
   Paperclip as AttachForward,
   Bot,
+  Send,
 } from "lucide-react";
 import type { EmailAddress, Folder, Label, MessageSummary } from "@/lib/api";
 import {
@@ -44,7 +45,12 @@ import { useConfirmStore } from "@/stores/confirm.store";
 import { useUIStore } from "@/stores/ui.store";
 import { patchMessagesCache, restoreMessagesCache, snapshotMessagesCache } from "@/hooks/queries";
 import ContextMenu, { type ContextMenuItem } from "./ContextMenu";
-import { originalRecipientAddresses } from "@/lib/messageRecipients";
+import { originalRecipientFields } from "@/lib/messageRecipients";
+import { normalizeAiEmailDraft } from "@/features/compose/aiEmailDraft";
+import { loadMessageForEditing } from "@/features/compose/reopenMessage";
+import { useSendDrafts } from '@/hooks/useSendDrafts';
+import DraftStatusIcon from './DraftStatusIcon';
+import { usePrepareMessageDeletion } from "@/hooks/useMessageDeletionNavigation";
 
 interface Props {
   message: MessageSummary;
@@ -63,6 +69,7 @@ interface Props {
   activeFolderId?: string | null;
   accountColor?: string;
   accountLabel?: string;
+  draftSendIds?: string[];
 }
 
 function formatDate(timestamp: number): string {
@@ -92,9 +99,11 @@ function recipientLabel(addresses: EmailAddress[]): string {
   return addresses.map(addressLabel).filter(Boolean).join(", ");
 }
 
-function MessageItem({ message, labels = [], isSelected, onClick, onDoubleClick, onOpenFullscreen, onToggleStar, batchMode, batchSelected, spamFolderId, folderRole, activeFolderId, accountColor, accountLabel }: Props) {
+function MessageItem({ message, labels = [], isSelected, onClick, onDoubleClick, onOpenFullscreen, onToggleStar, batchMode, batchSelected, spamFolderId, folderRole, activeFolderId, accountColor, accountLabel, draftSendIds }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const prepareDeletion = usePrepareMessageDeletion();
+  const { sendDrafts, sending } = useSendDrafts();
   const [showActions, setShowActions] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [showMoveFolders, setShowMoveFolders] = useState(false);
@@ -114,7 +123,7 @@ function MessageItem({ message, labels = [], isSelected, onClick, onDoubleClick,
     ? t("messageActions.unarchive", "Unarchive")
     : t("messageActions.archive", "Archive");
   const ArchiveActionIcon = folderRole === "archive" ? RotateCcw : Archive;
-  const primaryContact = folderRole === "sent" && message.to_list.length > 0
+  const primaryContact = message.is_draft ? `收件人：${recipientLabel(message.to_list) || '未填写'}` : folderRole === "sent" && message.to_list.length > 0
     ? recipientLabel(message.to_list)
     : message.from_name || message.from_address;
   // In batch mode the row highlight is the selection control. The ordinary
@@ -164,8 +173,8 @@ function MessageItem({ message, labels = [], isSelected, onClick, onDoubleClick,
       const user =
         `【原始邮件】\n发件人：${sender}\n主题：${subject}\n\n${bodyText}\n\n` +
         `请生成回复草稿（直接输出正文，不需要主题行）。`;
-      const draft = await aiPrompt(system, user);
-      useComposeStore.getState().openCompose("reply", full, { body: draft.trim() });
+      const draft = normalizeAiEmailDraft(await aiPrompt(system, user), true);
+      useComposeStore.getState().openCompose("reply", full, { body: draft.body, aiGenerated: true });
       useToastStore.getState().addToast({ message: "AI 已生成回复草稿，请检查后发送。", type: "success" });
     } catch (error) {
       useToastStore.getState().addToast({ message: `AI 回复生成失败：${String(error)}`, type: "error" });
@@ -196,30 +205,31 @@ function MessageItem({ message, labels = [], isSelected, onClick, onDoubleClick,
       destructive: true,
     });
     if (!ok) return;
+    const completeDeletion = prepareDeletion([message.id]);
     const previousLists = snapshotMessagesCache(queryClient);
     patchMessagesCache(queryClient, (page) => page.filter((item) => item.id !== message.id));
-    // 本地列表先完成删除；远程移动/删除在后台继续，失败由待重试队列处理。
-    useToastStore.getState().addToast({ message: t("messageActions.deleteSuccess", "Message deleted"), type: "success" });
+    // 先切换预览；成功提示必须等待后端确认。
     void deleteMessage(message.id)
-      .then(() => invalidateMessageViews(true))
+      .then(() => {
+        completeDeletion([message.id]);
+        invalidateMessageViews(true);
+        useToastStore.getState().addToast({ message: t("messageActions.deleteSuccess", "Message deleted"), type: "success" });
+      })
       .catch(() => {
-        // 普通删除已在后端进入重试队列，不把邮件重新塞回当前列表。
-        restoreMessagesCache(queryClient, previousLists);
+        restoreMessagesCache(queryClient, previousLists, [message.id]);
+        completeDeletion([]);
         invalidateMessageViews(true);
         useToastStore.getState().addToast({ message: t("messageActions.deleteFailed", "Failed to delete message"), type: "error" });
       });
   }
 
   async function handleEditDraft() {
-    const full = await getMessage(message.id);
-    if (!full) return;
-    useComposeStore.getState().openCompose("new", null, {
-      to: full.to_list.map((address) => address.address),
-      cc: full.cc_list.map((address) => address.address),
-      bcc: full.bcc_list.map((address) => address.address),
-      subject: full.subject,
-      body: full.body_text,
-    });
+    try {
+      const snapshot = await loadMessageForEditing(message.id);
+      useComposeStore.getState().openDraft(snapshot);
+    } catch {
+      useToastStore.getState().addToast({ message: "无法完整载入邮件正文或附件，请先重新下载原邮件后再编辑", type: "error" });
+    }
   }
 
   function handleMarkRead(isRead: boolean) {
@@ -300,14 +310,12 @@ hr{border:none;border-top:1px solid #ddd;margin:16px 0}</style></head><body>
   }
 
   function handleNewToSender() {
-    // 这个命令的语义是“相同接收人”，无论邮件位于哪个文件夹，都应
-    // 读取原邮件 To，而不是把收到的邮件错误地改发给原发件人。
-    const targets = originalRecipientAddresses(message.to_list);
-    if (targets.length === 0) {
+    const recipients = originalRecipientFields(message.to_list, message.cc_list, message.bcc_list);
+    if (recipients.to.length + recipients.cc.length + recipients.bcc.length === 0) {
       useToastStore.getState().addToast({ message: "原邮件没有可用的收件人地址", type: "error" });
       return;
     }
-    useComposeStore.getState().openCompose("new", null, { to: targets });
+    useComposeStore.getState().openCompose("new", null, recipients);
   }
 
   const moveItems: ContextMenuItem[] = showMoveFolders
@@ -340,6 +348,7 @@ hr{border:none;border-top:1px solid #ddd;margin:16px 0}</style></head><body>
     ? moveItems
     : [
         { label: "打开", icon: <MailOpen size={14} />, onClick: () => (onOpenFullscreen ? onOpenFullscreen() : onClick()) },
+        ...(message.is_draft && (!batchMode || draftSendIds?.length) ? [{ label: '发送', icon: <Send size={14} />, disabled: sending, onClick: () => void sendDrafts(draftSendIds?.length ? draftSendIds : [message.id]) }] : []),
         {
           label: aiReplying ? "AI 回复生成中…" : "AI 回复",
           icon: <Sparkles size={14} />,
@@ -363,7 +372,7 @@ hr{border:none;border-top:1px solid #ddd;margin:16px 0}</style></head><body>
         {
           label: "发送新邮件给相同接收人",
           icon: <Mail size={14} />,
-          disabled: message.to_list.length === 0,
+          disabled: message.to_list.length + message.cc_list.length + message.bcc_list.length === 0,
           onClick: () => handleNewToSender(),
         },
         { separator: true },
@@ -524,6 +533,7 @@ hr{border:none;border-top:1px solid #ddd;margin:16px 0}</style></head><body>
       }}
       onContextMenu={(event) => {
         event.preventDefault();
+        if (!rowSelected) onClick();
         setShowMoveFolders(false);
         setContextMenu({ x: event.clientX, y: event.clientY });
       }}
@@ -557,9 +567,10 @@ hr{border:none;border-top:1px solid #ddd;margin:16px 0}</style></head><body>
             minWidth: 0,
           }}
         >
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", fontWeight: message.is_read ? 600 : 700 }}>
             {primaryContact}
           </span>
+          {message.is_draft && <DraftStatusIcon />}
           {message.has_replies && (
             <span
               title="已回复"

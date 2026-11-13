@@ -1,19 +1,18 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { AlertTriangle, ArrowLeft, ContactRound, Copy, Filter, Languages, Mail, Search, Sparkles } from "lucide-react";
 import { listAddressBookContacts, saveAddressBookContact, trustSender } from "@/lib/api";
 import { useTranslation } from "react-i18next";
 import type { PrivacyMode, TranslateResult } from "@/lib/api";
-import { useClickOutside } from "@/hooks/useClickOutside";import { MessageDetailSkeleton } from "./Skeleton";
+import { MessageDetailSkeleton } from "./Skeleton";
 import PrivacyBanner from "./PrivacyBanner";
 import AttachmentList from "./AttachmentList";
 import { ShadowDomEmail } from "./ShadowDomEmail";
-import TranslatePopover from "../features/translate/TranslatePopover";
+import { plainTextEmailToHtml } from "@/lib/historicalQuoteCards";
 import MessageActionToolbar from "./MessageActionToolbar";
 import { useMessageLoader } from "@/hooks/useMessageLoader";
 import { useBilingualTranslation } from "@/hooks/useBilingualTranslation";
-import { defaultPrivacyMode } from "@/lib/privacyMode";
+import { privacyModeToApi, useStoredPrivacyMode, type StoredPrivacyMode } from "@/lib/privacyMode";
 import { useUIStore } from "@/stores/ui.store";
-import SelectionActionPopover from "./SelectionActionPopover";
 import type { EmailAddress } from "@/lib/api";
 import type { AddressBookContact } from "@/lib/api";
 import ContextMenu, { type ContextMenuItem } from "./ContextMenu";
@@ -46,25 +45,22 @@ function formatRecipient(address: EmailAddress): string {
 
 export default function MessageDetail({ messageId, onBack, folderRole }: Props) {
   const { t } = useTranslation();
-  const [privacyMode, setPrivacyMode] = useState<PrivacyMode>(() => defaultPrivacyMode());
-  const [showSelectionActions, setShowSelectionActions] = useState<{ text: string; position: { x: number; y: number } } | null>(null);
-  const [showTranslate, setShowTranslate] = useState<{ text: string; position: { x: number; y: number } } | null>(null);
+  const storedMode = useStoredPrivacyMode();
+  const [privacyOverride, setPrivacyOverride] = useState<{ messageId: string; storedMode: StoredPrivacyMode; mode: PrivacyMode } | null>(null);
+  const privacyMode = privacyOverride?.messageId === messageId && privacyOverride.storedMode === storedMode
+    ? privacyOverride.mode : privacyModeToApi(storedMode);
+  const setPrivacyMode = (mode: PrivacyMode) => setPrivacyOverride({ messageId, storedMode, mode });
   const [addressMenu, setAddressMenu] = useState<{ x: number; y: number; address: EmailAddress; field: "from" | "to" } | null>(null);
   const [contactEditor, setContactEditor] = useState<AddressBookContact | null>(null);
 
-  const selectionActionsRef = useRef<HTMLDivElement>(null);
-  const translateRef = useRef<HTMLDivElement>(null);
-
   const { message, setMessage, rendered, loading, error, hydrateFailed } = useMessageLoader(messageId, privacyMode);
   const { bilingualMode, bilingualResult, bilingualLoading, handleBilingualToggle, resetBilingual } = useBilingualTranslation(messageId, rendered, message);
-
-  useClickOutside(selectionActionsRef, !!showSelectionActions, () => setShowSelectionActions(null));
-  useClickOutside(translateRef, !!showTranslate, () => setShowTranslate(null));
 
   // Reset bilingual state when messageId changes
   useEffect(() => {
     resetBilingual();
   }, [messageId]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setPrivacyOverride(null); }, [messageId, storedMode]);
 
   function handleLoadImages() {
     setPrivacyMode("LoadOnce");
@@ -85,70 +81,10 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
     }
   }
 
-  function getCurrentSelectedText() {
-    const selection = window.getSelection();
-    return selection?.toString().trim() || "";
-  }
-
-  function getCurrentSelectionPosition() {
-    const selection = window.getSelection();
-    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
-    const rect = range?.getBoundingClientRect();
-    const x = rect && rect.width > 0 ? rect.left + rect.width / 2 : window.innerWidth / 2;
-    const y = rect && rect.height > 0 ? rect.bottom : window.innerHeight / 2;
-    return { x, y };
-  }
-
-  function openSelectionActionsForSelection(position?: { x: number; y: number }, selectedText = getCurrentSelectedText()) {
-    if (selectedText.length <= 5) return false;
-    setShowTranslate(null);
-    setShowSelectionActions({
-      text: selectedText,
-      position: position ?? getCurrentSelectionPosition(),
-    });
-    return true;
-  }
-
-  function openTranslateForSelection(position?: { x: number; y: number }) {
-    const selectedText = getCurrentSelectedText();
-    if (selectedText.length <= 5) return;
-    setShowSelectionActions(null);
-    setShowTranslate({ text: selectedText, position: position ?? getCurrentSelectionPosition() });
-  }
-
-  function handleTranslateSelectedText(text: string, position: { x: number; y: number }) {
-    setShowSelectionActions(null);
-    setShowTranslate({ text, position });
-  }
-
-  function handleSearchSelectedText(text: string) {
-    useUIStore.getState().setSearchQuery(text);
-    useUIStore.getState().setActiveView("search");
-    setShowSelectionActions(null);
-  }
-
-  function handleCreateRuleFromSelection(text: string) {
-    const ui = useUIStore.getState();
-    ui.setPendingRuleDraftText(text);
-    ui.setSettingsTab("rules");
-    ui.setActiveView("settings");
-    setShowSelectionActions(null);
-  }
-
-  function handleContextMenu(e: React.MouseEvent) {
-    const selectedText = getCurrentSelectedText();
-    if (selectedText.length <= 5) return;
-    e.preventDefault();
-    openSelectionActionsForSelection({ x: e.clientX, y: e.clientY }, selectedText);
-  }
-
   useEffect(() => {
-    const onTranslate = () => openTranslateForSelection();
     const onBilingual = () => handleBilingualToggle();
-    document.addEventListener("pebble:translate-selection", onTranslate);
     document.addEventListener("pebble:toggle-bilingual", onBilingual);
     return () => {
-      document.removeEventListener("pebble:translate-selection", onTranslate);
       document.removeEventListener("pebble:toggle-bilingual", onBilingual);
     };
   });
@@ -405,7 +341,7 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
           }}
         >
           <AlertTriangle size={13} />
-          <span>正文下载暂时失败（网络/服务器波动），已显示邮件头部。网络恢复后重新打开该邮件即可自动补全。</span>
+          <span>邮件内容下载暂时失败（网络/服务器波动），已显示现有内容。可点击上方“重新下载邮件”重试。</span>
         </div>
       )}
 
@@ -417,7 +353,6 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
         role="region"
         aria-label={t("messageDetail.body", "Message body")}
         style={{ flex: 1, overflow: "auto", padding: "16px" }}
-        onContextMenu={handleContextMenu}
       >
         {bilingualMode && bilingualLoading ? (
             <div style={{ fontSize: "13px", color: "var(--color-text-secondary)" }}>{t("common.translating", "Translating...")}</div>
@@ -426,6 +361,7 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
             <ShadowDomEmail html={bilingualResult.translated} />
           ) : (
             <pre
+              dir="auto"
               style={{
                 fontSize: "14px",
                 color: "var(--color-text-primary)",
@@ -441,49 +377,13 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
           )
         ) : bilingualMode && !bilingualLoading ? (
             <div style={{ fontSize: "13px", color: "var(--color-text-secondary)" }}>{t("common.translationFailed", "Translation failed")}</div>
-        ) : rendered && rendered.html ? (
-          <ShadowDomEmail html={rendered.html} />
         ) : (
-          <pre
-            style={{
-              fontSize: "13px",
-              color: "var(--color-text-primary)",
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              margin: 0,
-              fontFamily: "inherit",
-            }}
-          >
-            {message.body_text}
-          </pre>
+          <ShadowDomEmail html={rendered?.html || plainTextEmailToHtml(message.body_text || "")} />
         )}
       </div>
 
       {/* Attachments */}
       {message.has_attachments && <AttachmentList messageId={message.id} />}
-
-      {showTranslate && (
-        <div ref={translateRef}>
-          <TranslatePopover
-            text={showTranslate.text}
-            position={showTranslate.position}
-            onClose={() => setShowTranslate(null)}
-          />
-        </div>
-      )}
-
-      {showSelectionActions && (
-        <div ref={selectionActionsRef}>
-          <SelectionActionPopover
-            text={showSelectionActions.text}
-            position={showSelectionActions.position}
-            onTranslate={handleTranslateSelectedText}
-            onSearch={handleSearchSelectedText}
-            onCreateRule={handleCreateRuleFromSelection}
-            onClose={() => setShowSelectionActions(null)}
-          />
-        </div>
-      )}
 
       {addressMenu && (
         <ContextMenu x={addressMenu.x} y={addressMenu.y} items={addressMenuItems()} onClose={() => setAddressMenu(null)} />

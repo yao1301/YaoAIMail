@@ -37,7 +37,8 @@ const DEFAULT_BINDINGS: Record<string, string> = {
   "toggle-bilingual": "Ctrl+Shift+T",
 };
 
-const STORAGE_KEY = "pebble-shortcuts";
+export const SHORTCUT_STORAGE_KEY = "pebble-shortcuts";
+const STORAGE_KEY = SHORTCUT_STORAGE_KEY;
 
 function loadBindings(): Record<string, string> {
   try {
@@ -75,3 +76,7 @@ export const useShortcutStore = create<ShortcutState>((set, get) => ({
 }));
 
 export { DEFAULT_BINDINGS };
+
+export function refreshProfileShortcuts() {
+  useShortcutStore.setState({ bindings: loadBindings() });
+}

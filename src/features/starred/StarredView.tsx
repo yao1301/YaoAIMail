@@ -4,17 +4,20 @@ import { useTranslation } from "react-i18next";
 import { Star } from "lucide-react";
 import { useStarredMessagesQuery } from "@/hooks/queries";
 import { useMailStore } from "@/stores/mail.store";
+import { useUIStore } from "@/stores/ui.store";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import MessageItem from "@/components/MessageItem";
 import MessageDetail from "@/components/MessageDetail";
 import { deleteMessage } from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
+import { MessageDeletionNavigationContext, useMessageDeletionNavigation } from "@/hooks/useMessageDeletionNavigation";
 
 const EMPTY_REMOVED_IDS = new Set<string>();
 
 export default function StarredView() {
   const { t } = useTranslation();
   const activeAccountId = useMailStore((s) => s.activeAccountId);
+  const registerMessage = useMailStore((s) => s.setSelectedMessage);
   const addToast = useToastStore((s) => s.addToast);
   const [stateAccountId, setStateAccountId] = useState(activeAccountId);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -40,6 +43,9 @@ export default function StarredView() {
       return true;
     });
   }, [messages, scopedRemovedIds]);
+  const prepareDeletion = useMessageDeletionNavigation(visibleMessages.map(message => message.id), {
+    selectedId: scopedSelectedId, scopeKey: `starred:${activeAccountId}`, onSelect: setSelectedId,
+  });
 
   const parentRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
@@ -56,6 +62,14 @@ export default function StarredView() {
 
   function handleOpen(messageId: string) {
     setSelectedId(messageId);
+    registerMessage(messageId);
+  }
+
+  function handleOpenFullscreen(messageId: string) {
+    handleOpen(messageId);
+    const ui = useUIStore.getState();
+    ui.setMessageDetailId(messageId);
+    ui.setActiveView("messageDetail");
   }
 
   useEffect(() => {
@@ -95,15 +109,19 @@ export default function StarredView() {
       if (target?.closest("input, textarea, [contenteditable='true'], select")) return;
       event.preventDefault();
       const id = scopedSelectedId;
+      const completeDeletion = prepareDeletion([id]);
       void deleteMessage(id).then(() => {
         setRemovedIds((old) => new Set(old).add(id));
-        setSelectedId(null);
+        completeDeletion([id]);
         addToast({ message: "邮件已移到废纸篓", type: "success" });
-      }).catch((error) => addToast({ message: `删除失败：${extractErrorMessage(error)}`, type: "error" }));
+      }).catch((error) => {
+        completeDeletion([]);
+        addToast({ message: `删除失败：${extractErrorMessage(error)}`, type: "error" });
+      });
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [addToast, scopedSelectedId]);
+  }, [addToast, scopedSelectedId, prepareDeletion]);
 
   if (error && messages.length === 0) {
     return (
@@ -157,6 +175,7 @@ export default function StarredView() {
   }
 
   return (
+    <MessageDeletionNavigationContext.Provider value={prepareDeletion}>
     <div className="fade-in" style={{ display: "flex", height: "100%" }}>
       <div style={{
         width: scopedSelectedId ? "340px" : "100%",
@@ -203,6 +222,8 @@ export default function StarredView() {
                     message={msg}
                     isSelected={msg.id === scopedSelectedId}
                     onClick={() => handleOpen(msg.id)}
+                      onDoubleClick={() => handleOpenFullscreen(msg.id)}
+                      onOpenFullscreen={() => handleOpenFullscreen(msg.id)}
                     onToggleStar={handleToggleStar}
                   />
                 </div>
@@ -234,5 +255,6 @@ export default function StarredView() {
         </div>
       )}
     </div>
+    </MessageDeletionNavigationContext.Provider>
   );
 }

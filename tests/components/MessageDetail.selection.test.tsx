@@ -1,6 +1,7 @@
 import { createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import MessageDetail from "../../src/components/MessageDetail";
+import SelectionTranslateOverlay from "../../src/features/translate/SelectionTranslateOverlay";
 import type { Message } from "../../src/lib/api";
 
 const mockMessage: Message = {
@@ -118,8 +119,8 @@ describe("MessageDetail selected-text context actions", () => {
     setSelectedText("");
   });
 
-  it("opens selected-text actions from right click, not from selection alone", () => {
-    render(<MessageDetail messageId="message-1" onBack={vi.fn()} />);
+  it("uses one shared toolbar when selected text is right clicked", () => {
+    render(<><MessageDetail messageId="message-1" onBack={vi.fn()} /><SelectionTranslateOverlay /></>);
     setSelectedText("selected email text");
     const body = screen.getByRole("region", { name: "Message body" });
 
@@ -133,6 +134,11 @@ describe("MessageDetail selected-text context actions", () => {
 
     expect(preventDefault).toHaveBeenCalled();
     expect(screen.getByRole("toolbar", { name: "Selected text actions" })).toBeTruthy();
+    expect(screen.getAllByRole("toolbar")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Translate selected text" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Translate selected text" }));
+    expect(screen.queryByRole("toolbar")).toBeNull();
+    expect(screen.getAllByText("translate popover")).toHaveLength(1);
   });
 
   it("does not suppress the keyboard focus outline on the message body", () => {
